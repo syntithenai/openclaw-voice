@@ -1,0 +1,1 @@
+# Optional dependencies for wake word and emotion detection

@@ -1,0 +1,11 @@
+numpy
+sounddevice
+requests
+websockets
+pydantic
+python-dotenv
+onnxruntime
+webrtcvad
+openwakeword
+funasr
+webrtc-audio-processing

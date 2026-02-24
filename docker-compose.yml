@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  whisper:
+    build:
+      context: ./docker/whisper
+      dockerfile: Dockerfile
+    ports:
+      - "10000:10000"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./docker/whisper-models:/root/.cache/whisper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10000/docs"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  piper:
+    build:
+      context: ./docker/piper
+      dockerfile: Dockerfile
+    ports:
+      - "10001:10001"
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./docker/piper-data:/root/.local/share/piper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:10001/docs"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
