@@ -1,6 +1,10 @@
 .env
 docker/whisper-models/
-orchestrator/__pycache__/
 docker/piper-data/
-orchestrator/wakeword/__pycache__/
-orchestrator/tools/__pycache__/
+docker/emotion-models/
+.venv311/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo

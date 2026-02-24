@@ -19,7 +19,13 @@ class SenseVoice:
         if AutoModel:
             try:
                 model_name = self._resolve_model_name(model_path)
-                self._model = AutoModel(model=model_name, trust_remote_code=True)
+                self._model = AutoModel(
+                    model=model_name,
+                    trust_remote_code=True,
+                    disable_update=True,
+                    disable_pbar=True,  # Disable progress bar
+                    log_level="ERROR",  # Suppress verbose logs
+                )
             except Exception as exc:  # pragma: no cover
                 logger.warning("SenseVoice model load failed: %s", exc)
 
@@ -31,7 +37,11 @@ class SenseVoice:
             return ""
 
         try:
-            result = self._model.generate(input=wav_bytes)
+            result = self._model.generate(
+                input=wav_bytes,
+                batch_size_s=300,  # Process in chunks
+                disable_pbar=True,  # Disable progress bar during inference
+            )
         except Exception as exc:  # pragma: no cover
             logger.warning("SenseVoice inference failed: %s", exc)
             return ""

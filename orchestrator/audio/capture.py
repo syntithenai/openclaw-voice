@@ -1,8 +1,12 @@
 import queue
 from typing import Optional
+import logging
+import time
 
 import numpy as np
 import sounddevice as sd
+
+logger = logging.getLogger("orchestrator.audio.capture")
 
 
 class AudioCapture:
@@ -12,11 +16,13 @@ class AudioCapture:
         self.device = device
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
         self._stream: Optional[sd.InputStream] = None
+        self._warned_status = False
 
     def _callback(self, indata: np.ndarray, frames: int, time, status) -> None:
         if status:
-            # Drop frames on overflow to keep capture real-time
-            return
+            if not self._warned_status:
+                logger.warning("Audio capture status: %s", status)
+                self._warned_status = True
         pcm = (indata[:, 0] * 32767).astype(np.int16).tobytes()
         try:
             self._queue.put_nowait(pcm)
@@ -39,6 +45,15 @@ class AudioCapture:
             self._stream.stop()
             self._stream.close()
             self._stream = None
+
+    def restart(self) -> None:
+        try:
+            self.stop()
+            time.sleep(0.05)
+            self.start()
+            logger.info("Audio capture restarted")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Audio capture restart failed: %s", exc)
 
     def read_frame(self, timeout: float = 0.0) -> Optional[bytes]:
         try:

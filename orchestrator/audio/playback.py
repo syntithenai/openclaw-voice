@@ -23,5 +23,12 @@ class AudioPlayback:
         data = data.reshape(-1, 1)
         if self._on_playback_frame:
             self._on_playback_frame(pcm)
-        sd.play(data, samplerate=self.sample_rate, device=None if self.device == "default" else self.device)
-        sd.wait()
+        if self._stream is None:
+            self._stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                dtype="float32",
+                device=None if self.device == "default" else self.device,
+            )
+            self._stream.start()
+        self._stream.write(data)

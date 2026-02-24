@@ -1,51 +1,103 @@
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import Field, ConfigDict, AliasChoices
+from pydantic_settings import BaseSettings
+from pathlib import Path
+from dotenv import load_dotenv
+
+# Load .env file, overriding any existing environment variables
+load_dotenv(str(Path(__file__).resolve().parent.parent / ".env"), override=True)
 
 
-class VoiceConfig(BaseModel):
-    model_config = ConfigDict(env_file=".env", case_sensitive=False)
+class VoiceConfig(BaseSettings):
+    model_config = ConfigDict(env_file=".env", case_sensitive=False, extra="ignore")
 
     # Audio
-    audio_sample_rate: int = Field(16000, env="AUDIO_SAMPLE_RATE")
-    audio_frame_ms: int = Field(20, env="AUDIO_FRAME_MS")
-    audio_capture_device: str = Field("default", env="AUDIO_CAPTURE_DEVICE")
-    audio_playback_device: str = Field("default", env="AUDIO_PLAYBACK_DEVICE")
-    audio_backend: str = Field("portaudio", env="AUDIO_BACKEND")
+    audio_sample_rate: int = Field(16000)
+    audio_frame_ms: int = Field(20)
+    audio_capture_device: str = Field("default")
+    audio_playback_device: str = Field("default")
+    audio_backend: str = Field("portaudio")
 
     # VAD
-    vad_type: str = Field("silero", env="VAD_TYPE")
-    vad_confidence: float = Field(0.5, env="VAD_CONFIDENCE")
-    vad_min_speech_ms: int = Field(50, env="VAD_MIN_SPEECH_MS")
-    vad_min_silence_ms: int = Field(800, env="VAD_MIN_SILENCE_MS")
-    silero_model_path: str = Field("", env="SILERO_MODEL_PATH")
-    silero_auto_download: bool = Field(False, env="SILERO_AUTO_DOWNLOAD")
-    silero_model_url: str = Field(
-        "https://repo.dialogflow.cloud/public/silero_vad.onnx",
-        env="SILERO_MODEL_URL",
-    )
-    silero_model_cache_dir: str = Field("models", env="SILERO_MODEL_CACHE_DIR")
+    vad_type: str = Field("webrtc")
+    vad_confidence: float = Field(0.5)
+    vad_min_speech_ms: int = Field(50)
+    vad_min_silence_ms: int = Field(800)
+    vad_min_rms: float = Field(0.002)
+    silero_model_path: str = Field("")
+    silero_auto_download: bool = Field(True)
+    silero_model_url: str = Field("https://repo.dialogflow.cloud/public/silero_vad.onnx")
+    silero_model_cache_dir: str = Field("docker/silero-models")
+
+    # Wakeword models
+    openwakeword_models_dir: str = Field("docker/wakeword-models")
+    openwakeword_auto_download: bool = Field(True)
+
+    # Emotion models
+    emotion_models_dir: str = Field("docker/emotion-models")
+    emotion_auto_download: bool = Field(True)
 
     # AEC
-    echo_cancel: bool = Field(True, env="ECHO_CANCEL")
-    echo_cancel_strength: str = Field("strong", env="ECHO_CANCEL_WEBRTC_AEC_STRENGTH")
+    echo_cancel: bool = Field(True)
+    echo_cancel_strength: str = Field("strong")
 
     # Wake word
-    wake_word_enabled: bool = Field(False, env="WAKE_WORD_ENABLED")
-    wake_word_engine: str = Field("openwakeword", env="WAKE_WORD_ENGINE")
-    wake_word_timeout_ms: int = Field(120000, env="WAKE_WORD_TIMEOUT_MS")
-    wake_word_confidence: float = Field(0.5, env="WAKE_WORD_CONFIDENCE")
-    openwakeword_model_path: str = Field("", env="OPENWAKEWORD_MODEL_PATH")
+    wake_word_enabled: bool = Field(False)
+    wake_word_engine: str = Field("openwakeword")
+    wake_word_timeout_ms: int = Field(120000)
+    wake_word_confidence: float = Field(0.5)
+    openwakeword_model_path: str = Field("")
 
     # Chunking
-    chunk_max_ms: int = Field(10000, env="CHUNK_MAX_MS")
-    pre_roll_ms: int = Field(2000, env="PRE_ROLL_MS")
+    chunk_max_ms: int = Field(10000)
+    pre_roll_ms: int = Field(2000)
 
     # Services
-    whisper_url: str = Field("http://localhost:10000", env="WHISPER_URL")
-    piper_url: str = Field("http://localhost:10001", env="PIPER_URL")
-    gateway_ws_url: str = Field("ws://localhost:18900", env="GATEWAY_WS_URL")
+    whisper_url: str = Field("http://localhost:10000")
+    piper_url: str = Field("http://localhost:10001")
+    gateway_ws_url: str = Field("", validation_alias=AliasChoices("GATEWAY_WS_URL"))
+    gateway_http_url: str = Field("", validation_alias=AliasChoices("GATEWAY_HTTP_URL", "OPENCLAW_GATEWAY_URL"))
+    gateway_http_endpoint: str = Field("/api/short", validation_alias=AliasChoices("GATEWAY_HTTP_ENDPOINT"))
+    gateway_provider: str = Field("openclaw", validation_alias=AliasChoices("VOICE_CLAW_PROVIDER", "GATEWAY_PROVIDER"))
+    gateway_agent_id: str = Field("", validation_alias=AliasChoices("GATEWAY_AGENT_ID", "OPENCLAW_AGENT_ID"))
+    gateway_auth_token: str = Field("", validation_alias=AliasChoices("GATEWAY_AUTH_TOKEN", "OPENCLAW_GATEWAY_TOKEN"))
+    openclaw_gateway_url: str = Field("", validation_alias=AliasChoices("OPENCLAW_GATEWAY_URL"))
+    gateway_timeout_ms: int = Field(30000, validation_alias=AliasChoices("VOICE_GATEWAY_TIMEOUT", "GATEWAY_TIMEOUT_MS"))
+    gateway_session_prefix: str = Field("voice", validation_alias=AliasChoices("VOICE_SESSION_PREFIX"))
+
+    # ZeroClaw
+    zeroclaw_gateway_url: str = Field("http://localhost:3000", validation_alias=AliasChoices("ZEROCLAW_GATEWAY_URL"))
+    zeroclaw_webhook_token: str = Field("", validation_alias=AliasChoices("ZEROCLAW_WEBHOOK_TOKEN"))
+    zeroclaw_channel: str = Field("voice", validation_alias=AliasChoices("ZEROCLAW_CHANNEL"))
+
+    # TinyClaw
+    tinyclaw_home: str = Field("", validation_alias=AliasChoices("TINYCLAW_HOME"))
+    tinyclaw_agent_id: str = Field("", validation_alias=AliasChoices("TINYCLAW_AGENT_ID"))
+
+    # IronClaw
+    ironclaw_gateway_url: str = Field("http://localhost:8888", validation_alias=AliasChoices("IRONCLAW_GATEWAY_URL"))
+    ironclaw_gateway_token: str = Field("", validation_alias=AliasChoices("IRONCLAW_GATEWAY_TOKEN"))
+    ironclaw_use_websocket: bool = Field(True, validation_alias=AliasChoices("IRONCLAW_USE_WEBSOCKET"))
+    ironclaw_agent_id: str = Field("", validation_alias=AliasChoices("IRONCLAW_AGENT_ID"))
+
+    # MimiClaw
+    mimiclaw_device_host: str = Field("localhost", validation_alias=AliasChoices("MIMICLAW_DEVICE_HOST"))
+    mimiclaw_device_port: int = Field(18789, validation_alias=AliasChoices("MIMICLAW_DEVICE_PORT"))
+    mimiclaw_use_websocket: bool = Field(True, validation_alias=AliasChoices("MIMICLAW_USE_WEBSOCKET"))
+    mimiclaw_telegram_bot_token: str = Field("", validation_alias=AliasChoices("MIMICLAW_TELEGRAM_BOT_TOKEN"))
+    mimiclaw_telegram_chat_id: str = Field("", validation_alias=AliasChoices("MIMICLAW_TELEGRAM_CHAT_ID"))
+
+    # PicoClaw
+    picoclaw_home: str = Field("", validation_alias=AliasChoices("PICOCLAW_HOME"))
+    picoclaw_gateway_url: str = Field("", validation_alias=AliasChoices("PICOCLAW_GATEWAY_URL"))
+    picoclaw_agent_id: str = Field("", validation_alias=AliasChoices("PICOCLAW_AGENT_ID"))
+
+    # NanoBot
+    nanobot_home: str = Field("", validation_alias=AliasChoices("NANOBOT_HOME"))
+    nanobot_gateway_url: str = Field("http://localhost:18790", validation_alias=AliasChoices("NANOBOT_GATEWAY_URL"))
+    nanobot_agent_id: str = Field("", validation_alias=AliasChoices("NANOBOT_AGENT_ID"))
 
     # Emotion
-    emotion_enabled: bool = Field(True, env="EMOTION_ENABLED")
-    emotion_model: str = Field("sensevoice-small", env="EMOTION_MODEL")
-    emotion_timeout_ms: int = Field(300, env="EMOTION_TIMEOUT_MS")
-    sensevoice_model_path: str = Field("", env="SENSEVOICE_MODEL_PATH")
+    emotion_enabled: bool = Field(True)
+    emotion_model: str = Field("sensevoice-small")
+    emotion_timeout_ms: int = Field(300)
+    sensevoice_model_path: str = Field("")

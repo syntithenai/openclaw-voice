@@ -4,7 +4,7 @@ from typing import Optional
 import numpy as np
 
 try:
-    from webrtc_audio_processing import AudioProcessing
+    from webrtc_audio_processing import AudioProcessingModule as AudioProcessing
 except ImportError:  # pragma: no cover
     AudioProcessing = None
 
@@ -23,29 +23,32 @@ class WebRTCAEC:
         if not AudioProcessing:
             return
 
+        # AudioProcessingModule(aec_type=0, enable_ns=False, agc_type=0, enable_vad=False)
+        # aec_type: 0=disabled, 1=moderate, 2=high suppression
+        # agc_type: 0=disabled, 1=adaptive analog, 2=adaptive digital, 3=fixed digital
+        aec_level = 2 if strength == "strong" else 1
         self._ap = AudioProcessing(
-            echo_cancellation=True,
-            noise_suppression=True,
-            gain_control=True,
-            high_pass_filter=True,
+            aec_type=aec_level,
+            enable_ns=True,  # noise suppression
+            agc_type=2,      # adaptive digital gain control
+            enable_vad=False,
         )
 
-        if hasattr(self._ap, "set_stream_format"):
-            try:
-                self._ap.set_stream_format(
-                    self.sample_rate,
-                    1,
-                    self.sample_rate,
-                    1,
-                )
-            except Exception as exc:  # pragma: no cover
-                logger.warning("WebRTC AEC set_stream_format failed: %s", exc)
+        # Configure stream formats for input and output
+        try:
+            self._ap.set_stream_format(
+                self.sample_rate,
+                1,  # channels
+                self.sample_rate,
+                1,  # channels
+            )
+        except Exception as exc:  # pragma: no cover
+            logger.warning("WebRTC AEC set_stream_format failed: %s", exc)
 
-        if hasattr(self._ap, "set_reverse_stream_format"):
-            try:
-                self._ap.set_reverse_stream_format(self.sample_rate, 1)
-            except Exception as exc:  # pragma: no cover
-                logger.warning("WebRTC AEC set_reverse_stream_format failed: %s", exc)
+        try:
+            self._ap.set_reverse_stream_format(self.sample_rate, 1)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("WebRTC AEC set_reverse_stream_format failed: %s", exc)
 
     def _frame_samples(self) -> int:
         return int(self.sample_rate * (self.frame_ms / 1000))
@@ -68,12 +71,14 @@ class WebRTCAEC:
 
         mic_samples = self._normalize_frame(mic_pcm)
         pb_samples = self._normalize_frame(playback_pcm)
+        mic_bytes = mic_samples.astype(np.int16).tobytes()
+        pb_bytes = pb_samples.astype(np.int16).tobytes()
 
         try:
             if hasattr(self._ap, "process_reverse_stream"):
-                self._ap.process_reverse_stream(pb_samples)
+                self._ap.process_reverse_stream(pb_bytes)
             if hasattr(self._ap, "process_stream"):
-                processed = self._ap.process_stream(mic_samples)
+                processed = self._ap.process_stream(mic_bytes)
                 if isinstance(processed, np.ndarray):
                     return processed.astype(np.int16).tobytes()
                 if isinstance(processed, (bytes, bytearray)):
