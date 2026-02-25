@@ -8,3 +8,4 @@ docker/emotion-models/
 __pycache__/
 *.pyc
 *.pyo
+orchestrator_output.log
