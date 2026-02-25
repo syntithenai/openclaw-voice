@@ -46,13 +46,27 @@ def health():
 def synthesize(payload: dict):
     text = payload.get("text", "")
     voice = payload.get("voice", VOICE_ID)
+    length_scale = payload.get("length_scale", 1.0)
+    
+    # Load requested voice if different from default
+    current_voice = VOICE
     if voice != VOICE_ID:
-        # TODO: load alternate voices from models folder
-        voice = VOICE_ID
+        # Load alternate voice from models folder
+        try:
+            alt_voice_path = Path("/root/.local/share/piper") / f"{voice}.onnx"
+            if alt_voice_path.exists():
+                current_voice = PiperVoice.load(str(alt_voice_path))
+            else:
+                # Try loading from Piper (will auto-download if available)
+                current_voice = PiperVoice.load(voice)
+        except Exception as e:
+            print(f"Failed to load voice {voice}: {e}; using default {VOICE_ID}")
+            current_voice = VOICE
+    
     if not text:
         return Response(content=b"", media_type="audio/wav")
 
-    wav_result = VOICE.synthesize(text)
+    wav_result = current_voice.synthesize(text, length_scale=length_scale)
     if isinstance(wav_result, (bytes, bytearray)):
         wav_bytes = bytes(wav_result)
     else:

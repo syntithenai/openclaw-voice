@@ -76,7 +76,31 @@ export LOG_LEVEL=DEBUG
 tail -f orchestrator_output.log
 ```
 
-## 📁 Key Files
+## � Development Workflow
+
+### After Code Changes
+
+**Always restart the orchestrator after making code changes:**
+```bash
+./run_voice_demo.sh
+```
+
+### After Container Changes
+
+**If changes are made to Piper or Whisper containers, rebuild them:**
+```bash
+# Rebuild specific container
+docker-compose build piper
+docker-compose build whisper
+
+# Or rebuild all containers
+docker-compose build
+
+# Then restart services
+docker-compose up -d
+```
+
+## �📁 Key Files
 
 | File | Purpose |
 |------|---------|

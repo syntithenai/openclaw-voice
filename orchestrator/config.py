@@ -23,9 +23,14 @@ class VoiceConfig(BaseSettings):
     vad_min_speech_ms: int = Field(50)
     vad_min_silence_ms: int = Field(800)
     vad_min_rms: float = Field(0.002)
+    vad_cut_in_rms: float = Field(0.0025)
+    vad_cut_in_min_ms: int = Field(150)
+    vad_cut_in_frames: int = Field(3)
+    vad_cut_in_use_silero: bool = Field(False)
+    vad_cut_in_silero_confidence: float = Field(0.3)
     silero_model_path: str = Field("")
     silero_auto_download: bool = Field(True)
-    silero_model_url: str = Field("https://repo.dialogflow.cloud/public/silero_vad.onnx")
+    silero_model_url: str = Field("https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx")
     silero_model_cache_dir: str = Field("docker/silero-models")
 
     # Wakeword models
@@ -50,10 +55,13 @@ class VoiceConfig(BaseSettings):
     # Chunking
     chunk_max_ms: int = Field(10000)
     pre_roll_ms: int = Field(2000)
+    cut_in_pre_roll_ms: int = Field(100)
 
     # Services
     whisper_url: str = Field("http://localhost:10000")
     piper_url: str = Field("http://localhost:10001")
+    piper_voice_id: str = Field("en_US-amy-medium")
+    piper_speed: float = Field(1.0)
     gateway_ws_url: str = Field("", validation_alias=AliasChoices("GATEWAY_WS_URL"))
     gateway_http_url: str = Field("", validation_alias=AliasChoices("GATEWAY_HTTP_URL", "OPENCLAW_GATEWAY_URL"))
     gateway_http_endpoint: str = Field("/api/short", validation_alias=AliasChoices("GATEWAY_HTTP_ENDPOINT"))
@@ -63,6 +71,7 @@ class VoiceConfig(BaseSettings):
     openclaw_gateway_url: str = Field("", validation_alias=AliasChoices("OPENCLAW_GATEWAY_URL"))
     gateway_timeout_ms: int = Field(30000, validation_alias=AliasChoices("VOICE_GATEWAY_TIMEOUT", "GATEWAY_TIMEOUT_MS"))
     gateway_session_prefix: str = Field("voice", validation_alias=AliasChoices("VOICE_SESSION_PREFIX"))
+    gateway_debounce_ms: int = Field(2000, validation_alias=AliasChoices("GATEWAY_DEBOUNCE_MS"))
 
     # ZeroClaw
     zeroclaw_gateway_url: str = Field("http://localhost:3000", validation_alias=AliasChoices("ZEROCLAW_GATEWAY_URL"))

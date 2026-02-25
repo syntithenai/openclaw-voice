@@ -1,5 +1,6 @@
 from typing import Optional
 import logging
+import re
 
 try:
     from funasr import AutoModel
@@ -53,13 +54,55 @@ class SenseVoice:
                     value = item.get(key)
                     if value:
                         return str(value).strip().lower()
+                text_value = item.get("text")
+                if text_value:
+                    extracted = self._extract_emotion_from_text(str(text_value))
+                    if extracted:
+                        return extracted
+                    logger.info("← EMOTION: Text preview='%s'", str(text_value)[:120])
 
         if isinstance(result, dict):
             for key in ("emotion", "emo", "emotion_label", "emotion_type"):
                 value = result.get(key)
                 if value:
                     return str(value).strip().lower()
+            text_value = result.get("text")
+            if text_value:
+                extracted = self._extract_emotion_from_text(str(text_value))
+                if extracted:
+                    return extracted
+                logger.info("← EMOTION: Text preview='%s'", str(text_value)[:120])
 
+        logger.info("← EMOTION: No emotion field found (result_type=%s)", type(result).__name__)
+        if isinstance(result, dict):
+            logger.info("← EMOTION: Result keys=%s", sorted(result.keys()))
+        elif isinstance(result, list) and result and isinstance(result[0], dict):
+            logger.info("← EMOTION: Result[0] keys=%s", sorted(result[0].keys()))
+
+        return ""
+
+    @staticmethod
+    def _extract_emotion_from_text(text: str) -> str:
+        lowered = text.lower()
+        # Common emotion tokens found in model outputs
+        candidates = (
+            "neutral",
+            "happy",
+            "sad",
+            "angry",
+            "fear",
+            "surprise",
+            "disgust",
+            "calm",
+        )
+        # Match tags like <|happy|> or <|emotion:happy|>
+        tag_pattern = re.compile(r"<\|(?:emotion:)?(?P<emo>neutral|happy|sad|angry|fear|surprise|disgust|calm)\|>")
+        match = tag_pattern.search(lowered)
+        if match:
+            return match.group("emo")
+        for emotion in candidates:
+            if emotion in lowered:
+                return emotion
         return ""
 
     @staticmethod

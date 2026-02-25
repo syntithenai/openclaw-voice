@@ -26,7 +26,12 @@ services:
       - "10001:10001"
     environment:
       - PYTHONUNBUFFERED=1
+      # Voice options (uncomment one):
       - PIPER_VOICE_ID=${PIPER_VOICE_ID:-en_US-amy-medium}
+      # - PIPER_VOICE_ID=en_US-lessac-medium     # Male voice, clear
+      # - PIPER_VOICE_ID=en_GB-alan-medium       # British male
+      # - PIPER_VOICE_ID=en_GB-jenny_dioco-medium # British female
+      # - PIPER_VOICE_ID=en_US-libritts-high      # High quality (slower)
     volumes:
       - ./docker/piper-data:/root/.local/share/piper
     healthcheck:
