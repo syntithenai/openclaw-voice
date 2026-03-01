@@ -6,5 +6,6 @@ cryptography
 pydantic
 pydantic-settings
 python-dotenv
+setuptools<76
 webrtcvad
 webrtc-audio-processing
