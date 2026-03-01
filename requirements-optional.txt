@@ -1,4 +1,9 @@
-# Optional dependencies for wake word, emotion detection, and improved VAD
+# Optional dependencies for emotion detection, PyTorch, and improved VAD
+
+# Emotion detection (SenseVoice)
+# Only required if EMOTION_ENABLED=true
+onnxruntime
+funasr
 
 # PyTorch and Silero VAD for TTS cut-in detection
 # NOTE: 5.2.0 is no longer published on PyPI; 5.1.2 is the latest compatible 5.x release.

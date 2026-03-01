@@ -6,8 +6,6 @@ cryptography
 pydantic
 pydantic-settings
 python-dotenv
-onnxruntime
 webrtcvad
 openwakeword
-funasr
 webrtc-audio-processing

@@ -107,7 +107,7 @@ class VoiceConfig(BaseSettings):
     nanobot_agent_id: str = Field("", validation_alias=AliasChoices("NANOBOT_AGENT_ID"))
 
     # Emotion
-    emotion_enabled: bool = Field(True)
+    emotion_enabled: bool = Field(False)
     emotion_model: str = Field("sensevoice-small")
     emotion_timeout_ms: int = Field(300)
     sensevoice_model_path: str = Field("")
