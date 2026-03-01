@@ -2,7 +2,6 @@
 
 # Emotion detection (SenseVoice)
 # Only required if EMOTION_ENABLED=true
-onnxruntime
 funasr
 
 # PyTorch and Silero VAD for TTS cut-in detection
