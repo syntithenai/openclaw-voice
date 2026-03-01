@@ -2,7 +2,9 @@ numpy
 sounddevice
 requests
 websockets
+cryptography
 pydantic
+pydantic-settings
 python-dotenv
 onnxruntime
 webrtcvad

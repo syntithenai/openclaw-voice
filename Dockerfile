@@ -1,12 +1,21 @@
-FROM python:3.12-slim
+FROM python:3.11-slim
 
 WORKDIR /app
 
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    swig \
+    curl \
+    ca-certificates \
+    libasound2 \
+    libasound2-dev \
     libportaudio2 \
     portaudio19-dev \
-    curl \
+    libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-optional.txt ./
@@ -14,11 +23,5 @@ RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -r requirements-optional.txt
 
 COPY orchestrator ./orchestrator
-COPY .env .env
-
-EXPOSE 18901
-
-HEALTHCHECK --interval=10s --timeout=5s --retries=3 --start-period=10s \
-    CMD curl -f http://localhost:18901/health || exit 1
 
 CMD ["python", "-m", "orchestrator.main"]

@@ -1,5 +1,8 @@
 # Optional dependencies for wake word, emotion detection, and improved VAD
 
 # PyTorch and Silero VAD for TTS cut-in detection
+# NOTE: 5.2.0 is no longer published on PyPI; 5.1.2 is the latest compatible 5.x release.
+# Keep torchaudio pinned to the torch major/minor to avoid long resolver backtracking during Docker builds.
 torch==2.1.0
-silero-vad==5.2.0
+torchaudio==2.1.0
+silero-vad==5.1.2

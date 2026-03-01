@@ -1,7 +1,39 @@
-version: '3.8'
+x-orchestrator-common: &orchestrator-common
+  restart: unless-stopped
+  build:
+    context: .
+    dockerfile: Dockerfile
+  depends_on:
+    - whisper
+    - piper
+  env_file:
+    - .env
+  environment:
+    - PYTHONUNBUFFERED=1
+    # Internal service DNS for compose network
+    - WHISPER_URL=http://whisper:10000
+    - PIPER_URL=http://piper:10001
+    # Model/cache paths inside container
+    - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
+    - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
+    - EMOTION_MODELS_DIR=/app/docker/emotion-models
+    - MODELSCOPE_CACHE=/app/.cache/modelscope
+  extra_hosts:
+    # Allows container -> host access (Linux compatible with Docker 20.10+)
+    - "host.docker.internal:host-gateway"
+  volumes:
+    - ./docker/silero-models:/app/docker/silero-models
+    - ./docker/wakeword-models:/app/docker/wakeword-models
+    - ./docker/emotion-models:/app/docker/emotion-models
+    - ./docker/whisper-models:/app/docker/whisper-models
+    - ./docker/piper-data:/app/docker/piper-data
+    - ./.env:/app/.env:ro
+    # Persist OpenClaw device identity for websocket auth signatures
+    - ${HOME}/.openclaw:/root/.openclaw
 
 services:
   whisper:
+    restart: unless-stopped
     build:
       context: ./docker/whisper
       dockerfile: Dockerfile
@@ -11,14 +43,9 @@ services:
       - PYTHONUNBUFFERED=1
     volumes:
       - ./docker/whisper-models:/root/.cache/whisper
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10000/docs')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
 
   piper:
+    restart: unless-stopped
     build:
       context: ./docker/piper
       dockerfile: Dockerfile
@@ -26,19 +53,47 @@ services:
       - "10001:10001"
     environment:
       - PYTHONUNBUFFERED=1
-      # Voice options (uncomment one):
       - PIPER_VOICE_ID=${PIPER_VOICE_ID:-en_US-amy-medium}
-      # - PIPER_VOICE_ID=en_US-lessac-medium     # Male voice, clear
-      # - PIPER_VOICE_ID=en_GB-alan-medium       # British male
-      # - PIPER_VOICE_ID=en_GB-jenny_dioco-medium # British female
-      # - PIPER_VOICE_ID=en_US-libritts-high      # High quality (slower)
     volumes:
       - ./docker/piper-data:/root/.local/share/piper
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:10001/docs')"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
-      start_period: 30s
+
+  # Cross-platform-safe default orchestrator container.
+  # Works on Linux/macOS/Windows, but direct host microphone/speaker mapping
+  # requires one of the Linux audio profile services below.
+  orchestrator:
+    <<: *orchestrator-common
+
+  # Linux ALSA hardware pass-through profile (direct /dev/snd access)
+  orchestrator-linux-alsa:
+    <<: *orchestrator-common
+    profiles: ["linux-audio"]
+    devices:
+      - "/dev/snd:/dev/snd"
+    group_add:
+      - "audio"
+
+  # Linux PulseAudio/PipeWire socket profile (desktop-friendly)
+  orchestrator-linux-pulse:
+    <<: *orchestrator-common
+    profiles: ["linux-pulse"]
+    environment:
+      - PYTHONUNBUFFERED=1
+      - WHISPER_URL=http://whisper:10000
+      - PIPER_URL=http://piper:10001
+      - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
+      - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
+      - EMOTION_MODELS_DIR=/app/docker/emotion-models
+      - MODELSCOPE_CACHE=/app/.cache/modelscope
+      - PULSE_SERVER=unix:/tmp/pulse/native
+    volumes:
+      - ./docker/silero-models:/app/docker/silero-models
+      - ./docker/wakeword-models:/app/docker/wakeword-models
+      - ./docker/emotion-models:/app/docker/emotion-models
+      - ./docker/whisper-models:/app/docker/whisper-models
+      - ./docker/piper-data:/app/docker/piper-data
+      - ./.env:/app/.env:ro
+      - ${HOME}/.openclaw:/root/.openclaw
+      - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
+      - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
 
 

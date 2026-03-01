@@ -22,6 +22,7 @@ import math
 import re
 import threading
 import time
+import unicodedata
 import wave
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -192,11 +193,17 @@ def ensure_silero_model(config: VoiceConfig) -> str | None:
 
 
 def extract_text_from_gateway_message(message: str) -> str:
+    """Extract text from gateway message. Handles JSON payloads or plain text."""
     try:
         payload = json.loads(message)
     except json.JSONDecodeError:
         return message.strip()
 
+    # If JSON parsed to a primitive (string, number, bool), return it as string
+    if isinstance(payload, (str, int, float, bool)):
+        return str(payload).strip()
+    
+    # Handle dict payloads
     if isinstance(payload, dict):
         if "text" in payload:
             return str(payload["text"]).strip()
@@ -308,6 +315,9 @@ async def run_orchestrator() -> None:
     last_tts_text = ""
     last_tts_ts = 0.0
     tts_dedupe_window_ms = 800
+    current_request_id = 0  # Incremented on each user message
+    current_tts_request_id = 0  # Tracks which request is currently playing
+    latest_tts_request_id = 0  # Request ID of the text waiting to be played
     warned_wake_resample = False
     warned_aec_stub = False
     wake_sleep_ts: float | None = None
@@ -425,29 +435,82 @@ async def run_orchestrator() -> None:
     pending_transcripts: list[tuple[str, str]] = []  # (transcript, emotion_tag)
     debounce_task: asyncio.Task | None = None
 
-    async def submit_tts(text: str) -> None:
-        nonlocal last_tts_text, last_tts_ts, latest_tts_text
+    def clean_text_for_tts(text: str) -> str:
+        """Remove punctuation and icon symbols that should not be spoken by TTS.
+        
+        Removes: colons, semicolons, quotes, brackets, parentheses
+        Removes: emoji/icon symbol characters
+        Keeps: periods, commas, dashes (natural for pacing/reading)
+        """
+        # Remove punctuation that would be read aloud
+        text = text.replace(":", "")  # colon
+        text = text.replace(";", "")  # semicolon
+        text = text.replace('"', "")  # quote
+        text = text.replace("'", "")  # apostrophe (but keeps contractions)
+        text = text.replace("(", "")  # open paren
+        text = text.replace(")", "")  # close paren
+        text = text.replace("[", "")  # open bracket
+        text = text.replace("]", "")  # close bracket
+        text = text.replace("{", "")  # open brace
+        text = text.replace("}", "")  # close brace
+        text = text.replace("/", " ")  # slash -> space
+
+        # Remove emoji/icon symbols and emoji formatting code points.
+        # So = Symbol, Other (emoji/pictographs), plus variation selector/joiner helpers.
+        text = "".join(
+            ch
+            for ch in text
+            if unicodedata.category(ch) != "So" and ch not in {"\ufe0f", "\u200d"}
+        )
+
+        # Clean up multiple spaces
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # If nothing speakable remains, skip TTS for this chunk.
+        if not any(ch.isalnum() for ch in text):
+            return ""
+
+        return text
+
+    async def submit_tts(text: str, request_id: int = 0) -> None:
+        nonlocal last_tts_text, last_tts_ts, latest_tts_text, latest_tts_request_id
         nonlocal current_tts_text, current_tts_duration_s, tts_playback_start_ts
+        nonlocal tts_playing, current_tts_request_id
+        
+        # Filter out NO_REPLY markers (final safeguard)
+        if "NO_REPLY" in text or "NO_RE" in text or text.strip() in ["NO", "_RE", "NO _RE"]:
+            logger.info("🚫 Filtered NO_REPLY from TTS: '%s'", text)
+            return
+        
         now = time.monotonic()
         if text == last_tts_text and (now - last_tts_ts) * 1000 < tts_dedupe_window_ms:
             return
 
-        if tts_playing and current_tts_text and tts_playback_start_ts is not None:
+        # Only interrupt if this is a new request (different from currently playing)
+        if request_id and request_id != current_tts_request_id and tts_playing and current_tts_text and tts_playback_start_ts is not None:
+            logger.info("🔄 TTS [req#%d→%d]: New user message arrived; stopping current playback", current_tts_request_id, request_id)
+            tts_stop_event.set()
+        elif tts_playing and current_tts_text and tts_playback_start_ts is not None and (not request_id or request_id == current_tts_request_id):
+            # Same request, so strip prefix to avoid re-speaking already played content
             elapsed = now - tts_playback_start_ts
             trimmed = strip_spoken_prefix(text, current_tts_text, elapsed, current_tts_duration_s)
             if trimmed != text:
-                logger.info("✂️ TTS: Stripped spoken prefix (%d→%d chars)", len(text), len(trimmed))
+                logger.info("✂️ TTS [req#%d]: Stripped spoken prefix (%d→%d chars)", request_id, len(text), len(trimmed))
             text = trimmed
-            if text:
-                logger.info("🛑 TTS: New reply arrived; stopping current playback")
-                tts_stop_event.set()
 
         if not text:
+            return
+
+        # Clean punctuation that would be spoken as words
+        text = clean_text_for_tts(text)
+        if not text:
+            logger.info("🚫 Text became empty after punctuation/icon cleanup")
             return
 
         last_tts_text = text
         last_tts_ts = now
         latest_tts_text = text
+        latest_tts_request_id = request_id if request_id else current_request_id
         tts_update_event.set()
 
     async def send_debounced_transcripts() -> None:
@@ -469,10 +532,15 @@ async def run_orchestrator() -> None:
         
         pending_transcripts.clear()
         
+        # Increment request ID for new user message
+        nonlocal current_request_id
+        current_request_id += 1
+        logger.info("📍 New user message [req#%d]", current_request_id)
+        
         # Gateway submission
         final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
         print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
-        logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s", transcript_count, gateway.provider)
+        logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
         gw_start = time.monotonic()
         try:
             response_text = await gateway.send_message(
@@ -485,14 +553,33 @@ async def run_orchestrator() -> None:
             logger.info("← GATEWAY: Response received in %dms", gw_elapsed)
             if response_text:
                 print(f"\033[94m← ASSISTANT: {response_text}\033[0m", flush=True)
-                logger.info("→ TTS QUEUE: Enqueuing response: '%s'", response_text[:80])
+                logger.info("→ TTS QUEUE [req#%d]: Enqueuing response: '%s'", current_request_id, response_text[:80])
                 # Update activity timestamp to keep system awake during TTS synthesis
                 last_activity_ts = time.monotonic()
-                await submit_tts(response_text)
+                await submit_tts(response_text, request_id=current_request_id)
         except Exception as exc:
             logger.warning("Gateway send failed (%s); continuing", exc)
 
-    async def process_chunk(pcm: bytes) -> None:
+    def count_syllables(word: str) -> int:
+        """Estimate syllable count based on vowel groups."""
+        word = word.lower()
+        if not word:
+            return 0
+        vowels = "aeiouy"
+        syllable_count = 0
+        previous_was_vowel = False
+        for char in word:
+            is_vowel = char in vowels
+            if is_vowel and not previous_was_vowel:
+                syllable_count += 1
+            previous_was_vowel = is_vowel
+        return max(1, syllable_count)
+
+    async def process_chunk(
+        pcm: bytes,
+        cut_in_ts: float | None = None,
+        chunk_started_ts: float | None = None,
+    ) -> None:
         nonlocal active_transcriptions, state, pending_transcripts, debounce_task
         active_transcriptions += 1
         state = VoiceState.SENDING
@@ -512,6 +599,11 @@ async def run_orchestrator() -> None:
                 
             transcript = transcript.strip()
             
+            # Filter out transcripts containing [inaudible]
+            if "[inaudible]" in transcript.lower():
+                logger.warning("⊘ Transcript filtered out: contains [inaudible]")
+                return
+            
             # Filter out transcripts that are only punctuation/silence markers
             # Keep only if there are actual words (letters/numbers)
             import re
@@ -524,6 +616,21 @@ async def run_orchestrator() -> None:
                     transcript if transcript else "[EMPTY]"
                 )
                 return
+            
+            # Filter single-syllable words during cut-in
+            if cut_in_ts is not None:
+                reference_ts = chunk_started_ts if chunk_started_ts is not None else time.monotonic()
+                elapsed_ms = int((reference_ts - cut_in_ts) * 1000)
+                words = transcript.split()
+                # Only apply filter if: single word AND within 500ms of cut-in
+                if len(words) == 1 and elapsed_ms <= 500:
+                    if count_syllables(words[0]) == 1:
+                        logger.warning(
+                            "⊘ Cut-in: Filtered out single-syllable word '%s' (elapsed=%dms)",
+                            words[0],
+                            elapsed_ms
+                        )
+                        return
 
             # Emotion detection phase
             emotion_tag = ""
@@ -558,23 +665,28 @@ async def run_orchestrator() -> None:
 
     async def tts_loop() -> None:
         nonlocal tts_playing, tts_gain, last_playback_frame, tts_playback_start_ts
-        nonlocal latest_tts_text, current_tts_text, current_tts_duration_s
+        nonlocal latest_tts_text, latest_tts_request_id, current_tts_text, current_tts_duration_s
+        nonlocal current_tts_request_id, last_activity_ts
         while True:
             await tts_update_event.wait()
             text = latest_tts_text
+            request_id = latest_tts_request_id
             latest_tts_text = ""  # Clear after consuming
+            latest_tts_request_id = 0
             tts_update_event.clear()
             if not text:
                 continue
             tts_playing = True
             current_tts_text = text
+            current_tts_request_id = request_id  # Track which request is now playing
             current_tts_duration_s = 0.0
+            logger.info("▶️ TTS PLAY: Starting playback for [req#%d] (gain=%.1f)", request_id, tts_gain)
             # Reset wake timeout when TTS starts to keep conversation alive
             last_activity_ts = time.monotonic()
             try:
                 try:
                     # TTS synthesis phase
-                    logger.info("→ TTS SYNTH: Generating speech for: '%s'", text[:80])
+                    logger.info("→ TTS SYNTH [req#%d]: Generating speech for: '%s'", request_id, text[:80])
                     synth_start = time.monotonic()
                     wav_bytes = await asyncio.to_thread(piper.synthesize, text, config.piper_voice_id, config.piper_speed)
                     synth_elapsed = int((time.monotonic() - synth_start) * 1000)
@@ -595,7 +707,8 @@ async def run_orchestrator() -> None:
                     tts_stop_event.clear()
                     await asyncio.to_thread(playback.play_pcm, pcm, tts_gain, tts_stop_event)
                     play_elapsed = int((time.monotonic() - play_start) * 1000)
-                    if tts_stop_event.is_set():
+                    interrupted = tts_stop_event.is_set()
+                    if interrupted:
                         logger.info("⏹️ TTS PLAY: Interrupted by mic speech (%dms)", play_elapsed)
                     else:
                         logger.info("← TTS PLAY: Playback complete in %dms", play_elapsed)
@@ -603,11 +716,14 @@ async def run_orchestrator() -> None:
                         last_activity_ts = time.monotonic()
                     last_playback_frame = None
                     tts_playback_start_ts = None
-                    logger.info("↻ Restarting audio capture after TTS playback")
-                    try:
-                        capture.restart()
-                    except Exception as exc:  # pragma: no cover
-                        logger.warning("Audio capture restart failed: %s", exc)
+                    if not interrupted:
+                        logger.info("↻ Restarting audio capture after TTS playback")
+                        try:
+                            capture.restart()
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning("Audio capture restart failed: %s", exc)
+                    else:
+                        logger.info("↻ Skipping capture restart after cut-in interruption")
                 except Exception as exc:
                     logger.error("Piper TTS failed: %s", exc)
             finally:
@@ -617,42 +733,133 @@ async def run_orchestrator() -> None:
                 current_tts_duration_s = 0.0
 
     async def gateway_listener() -> None:
+        nonlocal current_request_id
         buffer = ""
         flush_task: asyncio.Task | None = None
+        first_chunk_word_threshold = max(0, config.gateway_tts_fast_start_words)
+        active_buffer_request_id = 0
+        kickoff_sent_request_id = 0
+        reconnect_delay_s = 1.0
+        reconnect_delay_max_s = 8.0
+
+        def split_first_n_words(text: str, n: int) -> tuple[str, str]:
+            """Split text into first n tokens and remainder, preserving punctuation in tokens."""
+            if n <= 0:
+                return "", text
+            tokens = list(re.finditer(r"\S+", text))
+            if len(tokens) < n:
+                return "", text
+            cutoff = tokens[n - 1].end()
+            return text[:cutoff].strip(), text[cutoff:].strip()
 
         async def flush_buffer() -> None:
             nonlocal buffer
             if not buffer.strip():
                 buffer = ""
                 return
-            await submit_tts(buffer.strip())
+            
+            # Filter out NO_REPLY markers
+            text_to_send = buffer.strip()
+            if "NO_REPLY" in text_to_send or "NO_RE" in text_to_send or text_to_send in ["NO", "_RE", "NO _RE"]:
+                logger.info("🚫 Filtered NO_REPLY from flush: '%s'", text_to_send)
+                buffer = ""
+                return
+                
+            await submit_tts(text_to_send, request_id=current_request_id)
             buffer = ""
 
-        try:
-            async for message in gateway.listen():
-                text = extract_text_from_gateway_message(message)
-                if not text:
-                    continue
+        while True:
+            try:
+                async for message in gateway.listen():
+                    # If we receive any frame, connection is healthy again.
+                    reconnect_delay_s = 1.0
 
-                buffer += (" " if buffer else "") + text
+                    if current_request_id != active_buffer_request_id:
+                        # New user request boundary: reset sentence buffer state.
+                        buffer = ""
+                        active_buffer_request_id = current_request_id
+                        if flush_task and not flush_task.done():
+                            flush_task.cancel()
 
-                match = re.search(r"(.+?[.!?])\s*$", buffer)
-                if match:
-                    sentence = match.group(1).strip()
-                    buffer = buffer[len(sentence):].strip()
-                    await submit_tts(sentence)
+                    text = extract_text_from_gateway_message(message)
+                    if not text:
+                        continue
+
+                    logger.info("🔤 Received: '%s'", text)
+
+                    # Smart concatenation: determine if space is needed
+                    needs_space = False
+                    if buffer:
+                        last_char = buffer[-1]
+                        first_char = text[0]
+                        
+                        # No space before punctuation or closing brackets
+                        if first_char in ",.!?;:)]}":
+                            needs_space = False
+                        # No space for ordinal suffix after digit (1st, 2nd, etc.)
+                        elif last_char.isdigit() and len(text) >= 2 and text[:2] in ["st", "nd", "rd", "th"]:
+                            needs_space = False
+                        # No space between consecutive digits (for numbers like 2026)
+                        elif last_char.isdigit() and first_char.isdigit():
+                            needs_space = False
+                        # No space after opening brackets
+                        elif last_char in "([{":
+                            needs_space = False
+                        # No space before/after colons in times (1:28)
+                        elif last_char == ":" or first_char == ":":
+                            needs_space = False
+                        else:
+                            needs_space = True
+                    
+                    buffer += (" " if needs_space else "") + text
+                    logger.info("📝 Buffer: '%s'", buffer[:100])
+
+                    # Fast-start policy: emit first chunk once threshold words are available for this request.
+                    if first_chunk_word_threshold > 0 and kickoff_sent_request_id != current_request_id:
+                        kickoff_text, remainder = split_first_n_words(buffer, first_chunk_word_threshold)
+                        if kickoff_text:
+                            buffer = remainder
+                            kickoff_sent_request_id = current_request_id
+                            logger.info("🚀 Fast-start chunk [req#%d]: '%s'", current_request_id, kickoff_text)
+                            await submit_tts(kickoff_text, request_id=current_request_id)
+                            if flush_task and not flush_task.done():
+                                flush_task.cancel()
+                            continue
+
+                    match = re.search(r"(.+?[.!?])\s*$", buffer)
+                    if match:
+                        sentence = match.group(1).strip()
+                        buffer = buffer[len(sentence):].strip()
+                        
+                        # Filter out NO_REPLY markers and other special tokens
+                        if "NO_REPLY" in sentence or "NO_RE" in sentence or sentence.strip() in ["NO", "_RE", "NO _RE"]:
+                            logger.info("🚫 Filtered NO_REPLY marker: '%s'", sentence)
+                            if flush_task and not flush_task.done():
+                                flush_task.cancel()
+                            continue
+                        
+                        logger.info("✅ Complete sentence: '%s'", sentence)
+                        await submit_tts(sentence, request_id=current_request_id)
+                        if flush_task and not flush_task.done():
+                            flush_task.cancel()
+                        continue
+
                     if flush_task and not flush_task.done():
                         flush_task.cancel()
-                    continue
+                    flush_task = asyncio.create_task(asyncio.sleep(5))
+                    flush_task.add_done_callback(lambda task: asyncio.create_task(flush_buffer()) if not task.cancelled() else None)
 
-                if flush_task and not flush_task.done():
-                    flush_task.cancel()
-                flush_task = asyncio.create_task(asyncio.sleep(5))
-                flush_task.add_done_callback(lambda task: asyncio.create_task(flush_buffer()) if not task.cancelled() else None)
-        except (ConnectionRefusedError, OSError) as exc:
-            logger.warning("Gateway unavailable (%s); proceeding without gateway responses", exc)
-        except Exception as exc:
-            logger.error("Gateway listener error: %s", exc)
+                # Stream ended cleanly (e.g., websocket dropped) — reconnect.
+                logger.warning("Gateway listen stream ended; reconnecting in %.1fs", reconnect_delay_s)
+            except (ConnectionRefusedError, OSError) as exc:
+                logger.warning("Gateway unavailable (%s); retrying listener in %.1fs", exc, reconnect_delay_s)
+            except Exception as exc:
+                logger.error("Gateway listener error: %s (retrying in %.1fs)", exc, reconnect_delay_s)
+
+            if flush_task and not flush_task.done():
+                flush_task.cancel()
+            await asyncio.sleep(reconnect_delay_s)
+            reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
 
     print("🎤 Audio capture starting. Press Ctrl+C to stop.", flush=True)
     logger.info("🎤 Audio capture starting. Press Ctrl+C to stop.")
@@ -788,7 +995,8 @@ async def run_orchestrator() -> None:
                             last_activity_ts = now
                             state = VoiceState.LISTENING
                             chunk_start_ts = now
-                            wake_pre_roll_ms = min(200, config.pre_roll_ms)
+                            # Reduced prebuffer from 200ms to 80ms to avoid capturing the hotword itself being spoken
+                            wake_pre_roll_ms = min(80, config.pre_roll_ms)
                             wake_pre_roll_frames = max(0, int(wake_pre_roll_ms / config.audio_frame_ms))
                             prebuffer = ring_buffer.get_frames()
                             if wake_pre_roll_frames > 0 and len(prebuffer) > wake_pre_roll_frames:
@@ -948,6 +1156,8 @@ async def run_orchestrator() -> None:
                     chunk_frames.append(processed_frame)
                     last_speech_ts = now
                     last_activity_ts = now  # Reset wake timeout to keep listening after cut-in
+                    wake_state = WakeState.AWAKE
+                    last_wake_detected_ts = now
                     if tts_gain != 0.5:
                         tts_gain = 0.5
                     logger.info(
@@ -982,7 +1192,7 @@ async def run_orchestrator() -> None:
                         len(chunk_frames),
                         latency_ms,
                     )
-                    asyncio.create_task(process_chunk(pcm))
+                    asyncio.create_task(process_chunk(pcm, cut_in_triggered_ts, chunk_start_ts))
                     ring_buffer.clear()
                     chunk_frames = []
                     chunk_start_ts = None
@@ -998,7 +1208,16 @@ async def run_orchestrator() -> None:
                 inactive_ms = int((now - last_activity_ts) * 1000)
                 if config.wake_word_timeout_ms > 0 and inactive_ms >= config.wake_word_timeout_ms:
                     # Don't timeout if TTS is playing, queued, or we're actively processing
-                    if state in (VoiceState.IDLE, VoiceState.LISTENING) and not tts_playing and not latest_tts_text:
+                    debounce_pending = debounce_task is not None and not debounce_task.done()
+                    has_pending_transcripts = bool(pending_transcripts)
+                    if (
+                        state in (VoiceState.IDLE, VoiceState.LISTENING)
+                        and not tts_playing
+                        and not latest_tts_text
+                        and not debounce_pending
+                        and not has_pending_transcripts
+                        and active_transcriptions == 0
+                    ):
                         wake_state = WakeState.ASLEEP
                         wake_sleep_ts = now
                         last_wake_detected_ts = None
