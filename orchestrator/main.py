@@ -927,6 +927,20 @@ async def run_orchestrator() -> None:
     session_id = f"{config.gateway_session_prefix}-{int(time.time())}"
     agent_id = config.gateway_agent_id or "assistant"
     
+    # Quick Answer LLM (optional)
+    quick_answer_client = None
+    if config.quick_answer_enabled:
+        print("→ Initializing Quick Answer LLM...", flush=True)
+        logger.info("→ Initializing Quick Answer LLM (%s)...", config.quick_answer_llm_url)
+        from orchestrator.gateway.quick_answer import QuickAnswerClient
+        quick_answer_client = QuickAnswerClient(
+            llm_url=config.quick_answer_llm_url,
+            api_key=config.quick_answer_api_key if config.quick_answer_api_key else None,
+            timeout_ms=config.quick_answer_timeout_ms,
+        )
+        logger.info("✓ Quick Answer LLM ready")
+        print("✓ Quick Answer LLM ready", flush=True)
+    
     # TTS client
     print("→ Initializing Piper TTS client...", flush=True)
     logger.info("→ Initializing Piper TTS client (%s)...", config.piper_url)
@@ -1096,10 +1110,27 @@ async def run_orchestrator() -> None:
         nonlocal current_request_id
         current_request_id += 1
         logger.info("📍 New user message [req#%d]", current_request_id)
-        
-        # Gateway submission
-        final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
         print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
+        
+        # Try quick answer first if enabled
+        if quick_answer_client:
+            try:
+                should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
+                if not should_use_upstream and quick_response:
+                    # Quick answer provided - use it and skip gateway
+                    logger.info("✓ QUICK ANSWER: Using LLM response instead of gateway")
+                    print(f"\033[94m← QUICK ANSWER: {quick_response}\033[0m", flush=True)
+                    logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
+                    last_activity_ts = time.monotonic()
+                    await submit_tts(quick_response, request_id=current_request_id)
+                    return  # Skip gateway
+                # If should_use_upstream is True, fall through to gateway below
+            except Exception as exc:
+                logger.error("Quick answer failed: %s; falling back to gateway", exc)
+                # Fall through to gateway
+        
+        # Gateway submission (normal flow or fallback from quick answer)
+        final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
         logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
         gw_start = time.monotonic()
         try:

@@ -1,6 +1,7 @@
 numpy
 sounddevice
 requests
+httpx
 websockets
 cryptography
 pydantic

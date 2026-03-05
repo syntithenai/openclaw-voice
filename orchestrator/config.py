@@ -153,6 +153,12 @@ class VoiceConfig(BaseSettings):
     emotion_timeout_ms: int = Field(300)
     sensevoice_model_path: str = Field("")
 
+    # Quick Answer LLM
+    quick_answer_enabled: bool = Field(False)
+    quick_answer_llm_url: str = Field("")  # OpenAI-compatible endpoint (e.g., http://localhost:8080/v1/chat/completions)
+    quick_answer_api_key: str = Field("")  # Optional API key for authentication
+    quick_answer_timeout_ms: int = Field(5000)  # Timeout for quick answer requests
+
     @model_validator(mode='after')
     def validate_critical_config(self):
         """Validate that configuration is sensible and log errors for bad settings."""
@@ -234,6 +240,15 @@ class VoiceConfig(BaseSettings):
         # Validate TTS speed
         if self.piper_speed < 0.5 or self.piper_speed > 5.0:
             errors.append(f"PIPER_SPEED={self.piper_speed} is unusual (typical range: 0.5-5.0)")
+
+        # Validate quick answer configuration
+        if self.quick_answer_enabled:
+            if not self.quick_answer_llm_url:
+                errors.append("QUICK_ANSWER_ENABLED=true but QUICK_ANSWER_LLM_URL is empty")
+            elif not (self.quick_answer_llm_url.startswith("http://") or self.quick_answer_llm_url.startswith("https://")):
+                errors.append(f"Invalid QUICK_ANSWER_LLM_URL format: {self.quick_answer_llm_url}")
+            if self.quick_answer_timeout_ms <= 0:
+                errors.append(f"QUICK_ANSWER_TIMEOUT_MS={self.quick_answer_timeout_ms} must be > 0")
 
         # Log and exit if critical errors found
         if errors:
