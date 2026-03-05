@@ -61,8 +61,9 @@ echo "  Output gain: ${AUDIO_OUTPUT_GAIN}x"
 echo "  Piper URL: $PIPER_URL"
 
 "$PYTHON_BIN" - <<PY
+import io
 import json
-import math
+import wave
 import time
 import urllib.request
 import urllib.error
@@ -110,7 +111,7 @@ if working_rate != sample_rate:
 sample_rate = working_rate
 
 
-def tone(freq: float, duration: float, volume: float = 0.25):
+def tone(freq: float, duration: float, volume: float = 0.75):
     """Generate test tone with output gain applied"""
     t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
     env = np.minimum(1.0, np.minimum(t * 80.0, (duration - t) * 80.0))
@@ -142,7 +143,7 @@ start_f = 300.0
 end_f = 1200.0
 freq = start_f + (end_f - start_f) * (t / duration)
 phase = 2 * np.pi * np.cumsum(freq) / sample_rate
-sweep = (0.2 * np.sin(phase)).astype(np.float32)
+sweep = (0.6 * np.sin(phase)).astype(np.float32)
 # Apply output gain
 sweep = (sweep * output_gain).astype(np.float32)
 sweep = np.clip(sweep, -1.0, 1.0)
@@ -154,12 +155,12 @@ print(f"\\nGenerating TTS test from {piper_url}...")
 test_text = "This is a speaker test. You should hear this at the configured volume with output gain applied."
 
 try:
-    # Generate TTS audio from Piper
+    # Generate TTS audio from Piper via /synthesize endpoint
     req = urllib.request.Request(
-        f"{piper_url}/tts",
+        f"{piper_url}/synthesize",
         data=json.dumps({
             "text": test_text,
-            "voice_id": piper_voice_id
+            "voice": piper_voice_id
         }).encode('utf-8'),
         headers={'Content-Type': 'application/json'}
     )
@@ -168,11 +169,19 @@ try:
         if response.status != 200:
             print(f"TTS generation failed: HTTP {response.status}")
         else:
-            # Read PCM audio from response
-            pcm_data = response.read()
+            # Read WAV audio from response
+            wav_data = response.read()
             
-            # Convert bytes to numpy array (16-bit PCM)
-            audio_int16 = np.frombuffer(pcm_data, dtype=np.int16)
+            # Parse WAV file
+            with wave.open(io.BytesIO(wav_data), 'rb') as wav_file:
+                n_channels = wav_file.getnchannels()
+                sample_width = wav_file.getsampwidth()
+                wav_sample_rate = wav_file.getframerate()
+                n_frames = wav_file.getnframes()
+                audio_data = wav_file.readframes(n_frames)
+            
+            # Convert bytes to numpy array (16-bit PCM, assume mono)
+            audio_int16 = np.frombuffer(audio_data, dtype=np.int16)
             
             # Convert to float32 [-1.0, 1.0]
             audio_float = audio_int16.astype(np.float32) / 32768.0
@@ -181,8 +190,8 @@ try:
             audio_float = (audio_float * output_gain).astype(np.float32)
             audio_float = np.clip(audio_float, -1.0, 1.0)
             
-            print(f"Playing TTS audio ({len(audio_float)} samples, {len(audio_float)/sample_rate:.2f}s) with {output_gain:.2f}x gain...")
-            sd.play(audio_float, samplerate=sample_rate, device=device)
+            print(f"Playing TTS audio ({len(audio_float)} samples, {len(audio_float)/wav_sample_rate:.2f}s) with {output_gain:.2f}x gain...")
+            sd.play(audio_float, samplerate=wav_sample_rate, device=device)
             sd.wait()
             
             print("\\n✓ TTS test complete!")
@@ -190,6 +199,9 @@ try:
 except urllib.error.URLError as e:
     print(f"Could not connect to Piper at {piper_url}: {e}")
     print("Skipping TTS test. Make sure Piper is running.")
+except urllib.error.HTTPError as e:
+    print(f"TTS request failed: HTTP {e.code} - {e.reason}")
+    print("Skipping TTS test. Check Piper API endpoint and configuration.")
 except Exception as e:
     print(f"TTS test failed: {e}")
     print("Skipping TTS test.")
