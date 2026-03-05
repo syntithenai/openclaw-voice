@@ -43,6 +43,17 @@ echo "Target Pi IP: $PI_IP"
 echo "Current host IP: $LOCAL_HOST_IP"
 echo "SSH alias: $PI_SSH_ALIAS"
 echo ""
+echo -e "${YELLOW}Prerequisites:${NC}"
+echo "  • Raspberry Pi with Raspbian/Raspberry Pi OS"
+echo "  • Network connectivity to Pi"
+echo "  • USB audio devices connected to Pi"
+echo "  • Services running on this host ($LOCAL_HOST_IP):"
+echo "    - Whisper STT on port 10000"
+echo "    - Piper TTS on port 10001"
+echo "    - OpenClaw Gateway on port 18789"
+echo ""
+read -p "Press Enter to continue or Ctrl+C to abort..."
+echo ""
 
 # Step 1: Setup SSH autologin
 echo -e "${YELLOW}Step 1: Setting up SSH autologin...${NC}"
@@ -95,6 +106,21 @@ else \
     cd ~/openclaw-voice && git pull; \
 fi"
 
+# Step 2b: Sync artifacts (models and binaries)
+echo ""
+echo -e "${YELLOW}Step 2b: Syncing artifacts to Pi...${NC}"
+if [ -f "./sync_artifacts_to_pi.sh" ]; then
+    bash ./sync_artifacts_to_pi.sh "$PI_SSH_ALIAS" auto || {
+        echo -e "${RED}  ✗ Artifact sync failed${NC}"
+        echo -e "${YELLOW}  → You may need to build artifacts first:${NC}"
+        echo -e "${YELLOW}     ./build_precise_engine_armv7.sh (for ARMv7)${NC}"
+        exit 1
+    }
+else
+    echo -e "${YELLOW}  ⚠ sync_artifacts_to_pi.sh not found, skipping artifact sync${NC}"
+    echo -e "${YELLOW}  → You may need to manually sync artifacts later${NC}"
+fi
+
 # Step 3: Run installation script on Pi
 echo ""
 echo -e "${YELLOW}Step 3: Installing dependencies on Pi...${NC}"
@@ -120,15 +146,26 @@ USB_MIC_NAME=$(ssh "$PI_SSH_ALIAS" "arecord -l | grep -E 'USB Camera|USB Audio' 
 USB_SPEAKER_NAME=$(ssh "$PI_SSH_ALIAS" "aplay -l | grep -E 'CD002|USB Audio' | grep -m1 'card' | sed -E 's/.*\[(.*)\].*/\1/'" || echo "default")
 
 if [[ "$PI_ARCH" == "armv7l" || "$PI_ARCH" == "armv6l" ]]; then
-    WAKE_WORD_ENGINE_DEFAULT="precise"
-    WAKE_WORD_MODEL_DEFAULT="docker/wakeword-models/hey-mycroft.pb"
-    WAKE_WORD_CONF_DEFAULT="0.5"
+    # ARMv7: Use Precise engine (Mycroft)
+    PRECISE_ENABLED="true"
+    PRECISE_MODEL_PATH="docker/wakeword-models/hey-mycroft.pb"
+    PRECISE_WAKE_WORD="hey-mycroft"
+    PRECISE_CONFIDENCE="0.15"
+    OPENWAKEWORD_MODEL_PATH=""
+    echo -e "${GREEN}  ✓ ARMv7 detected: Using Precise engine${NC}"
+    echo -e "${GREEN}    - Model: hey-mycroft.pb${NC}"
+    echo -e "${GREEN}    - Confidence: 0.15 (0.1-0.2 range, lower=more sensitive)${NC}"
 else
-    WAKE_WORD_ENGINE_DEFAULT="openwakeword"
-    WAKE_WORD_MODEL_DEFAULT="hey_mycroft"
-    WAKE_WORD_CONF_DEFAULT="0.95"
+    # ARMv8/ARM64: Use OpenWakeWord (TFLite)
+    PRECISE_ENABLED="false"
+    PRECISE_MODEL_PATH=""
+    PRECISE_WAKE_WORD=""
+    PRECISE_CONFIDENCE=""
+    OPENWAKEWORD_MODEL_PATH="hey_mycroft"
+    echo -e "${GREEN}  ✓ $PI_ARCH detected: Using OpenWakeWord${NC}"
+    echo -e "${GREEN}    - Model: hey_mycroft (auto-download)${NC}"
+    echo -e "${GREEN}    - Confidence: 0.50-0.95 (higher=more sensitive)${NC}"
 fi
-echo -e "${GREEN}  ✓ Wakeword defaults for $PI_ARCH: engine=$WAKE_WORD_ENGINE_DEFAULT, model=$WAKE_WORD_MODEL_DEFAULT${NC}"
 
 if [ "$USB_MIC" != "default" ]; then
     echo -e "${GREEN}  ✓ USB Microphone detected: $USB_MIC_NAME ($USB_MIC)${NC}"
@@ -150,22 +187,26 @@ fi
 echo ""
 echo -e "${YELLOW}Step 5: Configuring .env for remote services...${NC}"
 ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && cat > .env << 'ENVEOF'
-# Core
+# ==============================================================================
+# AUDIO CONFIGURATION
+# ==============================================================================
 AUDIO_SAMPLE_RATE=16000
+AUDIO_PLAYBACK_SAMPLE_RATE=48000
 AUDIO_FRAME_MS=20
-AUDIO_CAPTURE_DEVICE=$USB_MIC_NAME: Audio ($USB_MIC)
-AUDIO_PLAYBACK_DEVICE=$USB_SPEAKER_NAME: USB Audio ($USB_SPEAKER)
+AUDIO_CAPTURE_DEVICE=$USB_MIC
+AUDIO_PLAYBACK_DEVICE=$USB_SPEAKER
 AUDIO_BACKEND=portaudio
-AUDIO_INPUT_GAIN=50.0
 
-# VAD
+# ==============================================================================
+# VOICE ACTIVITY DETECTION (VAD)
+# ==============================================================================
 VAD_TYPE=webrtc
 VAD_CONFIDENCE=0.6
 VAD_MIN_SPEECH_MS=100
 VAD_MIN_SILENCE_MS=800
 VAD_MIN_RMS=0.002
 VAD_CUT_IN_RMS=0.008
-VAD_CUT_IN_MIN_MS=1200
+VAD_CUT_IN_MIN_MS=100
 VAD_CUT_IN_FRAMES=2
 VAD_CUT_IN_USE_SILERO=false
 VAD_CUT_IN_SILERO_CONFIDENCE=0.01
@@ -174,41 +215,77 @@ SILERO_AUTO_DOWNLOAD=true
 SILERO_MODEL_URL=https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx
 SILERO_MODEL_CACHE_DIR=/home/stever/.cache/openclaw/silero-models
 
-# Emotion detection (disabled on Pi due to ARM limitations)
+# ==============================================================================
+# WAKE WORD DETECTION
+# ==============================================================================
+WAKE_WORD_ENABLED=true
+WAKE_WORD_TIMEOUT_MS=6000
+
+# ARMv7: Precise engine (configured above based on arch detection)
+PRECISE_ENABLED=$PRECISE_ENABLED
+PRECISE_MODEL_PATH=$PRECISE_MODEL_PATH
+PRECISE_WAKE_WORD=$PRECISE_WAKE_WORD
+PRECISE_CONFIDENCE=$PRECISE_CONFIDENCE
+
+# ARMv8/ARM64: OpenWakeWord (configured above based on arch detection)
+OPENWAKEWORD_MODEL_PATH=$OPENWAKEWORD_MODEL_PATH
+OPENWAKEWORD_AUTO_DOWNLOAD=true
+OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
+
+# Wake word advanced settings
+WAKE_SLEEP_COOLDOWN_MS=3000
+WAKE_MIN_DETECT_RMS=0.0020
+WAKE_CLEAR_RING_BUFFER=false
+
+# ==============================================================================
+# ACOUSTIC ECHO CANCELLATION (AEC)
+# ==============================================================================
+ECHO_CANCEL=true
+ECHO_CANCEL_WEBRTC_AEC_STRENGTH=strong
+
+# ==============================================================================
+# SPEECH CHUNKING
+# ==============================================================================
+CHUNK_MAX_MS=10000
+PRE_ROLL_MS=1500
+CUT_IN_PRE_ROLL_MS=100
+
+# ==============================================================================
+# TEXT-TO-SPEECH (PIPER)
+# ==============================================================================
+PIPER_URL=http://$LOCAL_HOST_IP:10001
+PIPER_VOICE_ID=en_US-amy-medium
+PIPER_SPEED=1.2
+GATEWAY_TTS_FAST_START_WORDS=0
+AUDIO_PLAYBACK_LEAD_IN_MS=700
+AUDIO_PLAYBACK_KEEPALIVE_ENABLED=true
+AUDIO_PLAYBACK_KEEPALIVE_INTERVAL_MS=250
+
+# ==============================================================================
+# SPEECH-TO-TEXT (WHISPER)
+# ==============================================================================
+WHISPER_URL=http://$LOCAL_HOST_IP:10000
+
+# ==============================================================================
+# OPENCLAW GATEWAY
+# ==============================================================================
+OPENCLAW_GATEWAY_URL=http://$LOCAL_HOST_IP:18789
+GATEWAY_DEBOUNCE_MS=2000
+VOICE_CLAW_PROVIDER=openclaw
+GATEWAY_AUTH_TOKEN=153c732bd3b98e9525600393b0a6554557027ba4aac11085fbe1fd3dea001aa5
+GATEWAY_AGENT_ID=voice
+VOICE_SESSION_PREFIX=voiceorch
+
+# ==============================================================================
+# EMOTION DETECTION (OPTIONAL)
+# ==============================================================================
 EMOTION_ENABLED=false
 EMOTION_MODEL=sensevoice-small
 EMOTION_TIMEOUT_MS=300
 EMOTION_AUTO_DOWNLOAD=true
 MODELSCOPE_CACHE=/home/stever/.cache/modelscope
 EMOTION_MODELS_DIR=docker/emotion-models
-
-# Wake word detection (disabled - openwakeword not compatible with ARMv7)
-WAKE_WORD_ENABLED=true
-WAKE_WORD_ENGINE=$WAKE_WORD_ENGINE_DEFAULT
-WAKE_WORD_TIMEOUT_MS=10000
-WAKE_WORD_CONFIDENCE=$WAKE_WORD_CONF_DEFAULT
-OPENWAKEWORD_MODEL_PATH=$WAKE_WORD_MODEL_DEFAULT
-OPENWAKEWORD_AUTO_DOWNLOAD=true
-OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
-
-# AEC
-ECHO_CANCEL=true
-ECHO_CANCEL_WEBRTC_AEC_STRENGTH=strong
-
-# Chunking
-CHUNK_MAX_MS=10000
-PRE_ROLL_MS=1500
-CUT_IN_PRE_ROLL_MS=100
-
-# Services (point to host machine)
-WHISPER_URL=http://$LOCAL_HOST_IP:10000
-PIPER_URL=http://$LOCAL_HOST_IP:10001
-PIPER_VOICE_ID=en_US-amy-medium
-PIPER_SPEED=1.0
-GATEWAY_TTS_FAST_START_WORDS=3
-
-# OpenClaw Gateway
-OPENCLAW_GATEWAY_URL=http://$LOCAL_HOST_IP:18789
+SENSEVOICE_MODEL_PATH=iic/SenseVoiceSmall
 ENVEOF
 echo '  ✓ .env configured with host IP: $LOCAL_HOST_IP'"
 
