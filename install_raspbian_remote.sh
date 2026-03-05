@@ -43,7 +43,7 @@ echo "Target Pi IP: $PI_IP"
 echo "Current host IP: $LOCAL_HOST_IP"
 echo "SSH alias: $PI_SSH_ALIAS"
 echo ""
-echo -e "${YELLOW}Prerequisites:${NC}"
+echo -e "${YELLOW}Prerequisites Check:${NC}"
 echo "  • Raspberry Pi with Raspbian/Raspberry Pi OS"
 echo "  • Network connectivity to Pi"
 echo "  • USB audio devices connected to Pi"
@@ -52,7 +52,7 @@ echo "    - Whisper STT on port 10000"
 echo "    - Piper TTS on port 10001"
 echo "    - OpenClaw Gateway on port 18789"
 echo ""
-read -p "Press Enter to continue or Ctrl+C to abort..."
+echo -e "${GREEN}Proceeding with deployment...${NC}"
 echo ""
 
 # Step 1: Setup SSH autologin
@@ -64,8 +64,8 @@ else
     echo "  ✓ SSH key already exists"
 fi
 
-# Add host to ~/.ssh/config if not present
-if ! grep -q "^Host $PI_SSH_ALIAS" ~/.ssh/config 2>/dev/null; then
+# Add/update host in ~/.ssh/config
+if ! grep -q "^Host $PI_SSH_ALIAS$" ~/.ssh/config 2>/dev/null; then
     echo "  → Adding SSH config entry..."
     cat >> ~/.ssh/config << EOF
 
@@ -77,21 +77,64 @@ Host $PI_SSH_ALIAS
     ConnectTimeout 5
 EOF
 else
-    echo "  ✓ SSH config entry already exists"
+    CURRENT_ALIAS_IP=$(ssh -G "$PI_SSH_ALIAS" 2>/dev/null | awk '/^hostname / {print $2; exit}')
+    if [ "$CURRENT_ALIAS_IP" != "$PI_IP" ]; then
+        echo "  → Updating SSH alias '$PI_SSH_ALIAS' HostName: $CURRENT_ALIAS_IP → $PI_IP"
+        if [ -f ~/.ssh/config ]; then
+            awk -v host="$PI_SSH_ALIAS" -v ip="$PI_IP" '
+                BEGIN { in_host=0 }
+                {
+                    if ($1 == "Host") {
+                        in_host = 0
+                        for (i = 2; i <= NF; i++) {
+                            if ($i == host) {
+                                in_host = 1
+                            }
+                        }
+                    }
+
+                    if (in_host && $1 == "HostName") {
+                        print "    HostName " ip
+                        next
+                    }
+
+                    print
+                }
+            ' ~/.ssh/config > ~/.ssh/config.tmp && mv ~/.ssh/config.tmp ~/.ssh/config
+            chmod 600 ~/.ssh/config 2>/dev/null || true
+        fi
+    else
+        echo "  ✓ SSH config entry already exists"
+    fi
 fi
 
-# Copy SSH key to Pi
-echo "  → Copying SSH key to Pi (you may be prompted for password)..."
-ssh-copy-id -i ~/.ssh/id_ed25519.pub -o ConnectTimeout=5 "$PI_USER@$PI_IP" 2>/dev/null || {
-    echo -e "${YELLOW}Note: SSH key copy may have failed. Trying alternative method...${NC}"
+# Copy SSH key to Pi (only if key auth is not already working)
+if timeout 5 ssh -o BatchMode=yes "$PI_SSH_ALIAS" "echo ok" >/dev/null 2>&1; then
+    echo "  ✓ SSH key auth already working"
+else
+    echo "  → Copying SSH key to Pi (password may be required once)..."
     ssh-keyscan -t ed25519 "$PI_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
-}
+    ssh-copy-id -i ~/.ssh/id_ed25519.pub -o ConnectTimeout=5 "$PI_USER@$PI_IP" || {
+        echo -e "${RED}  ✗ SSH key installation failed.${NC}"
+        echo -e "${YELLOW}  → If prompted, enter the Pi user's password once to enable autologin.${NC}"
+        echo -e "${YELLOW}  → You can also run manually: ssh-copy-id -i ~/.ssh/id_ed25519.pub $PI_USER@$PI_IP${NC}"
+    }
+fi
 
-# Test SSH connection
-if timeout 5 ssh -i ~/.ssh/id_ed25519 "$PI_USER@$PI_IP" "echo 'SSH connection successful'" >/dev/null 2>&1; then
+# Test SSH connection (retry for transient network/auth delays)
+SSH_OK=false
+for attempt in 1 2 3 4 5; do
+    if timeout 10 ssh "$PI_SSH_ALIAS" "echo 'SSH connection successful'" >/dev/null 2>&1; then
+        SSH_OK=true
+        break
+    fi
+    sleep 1
+done
+
+if [ "$SSH_OK" = true ]; then
     echo -e "${GREEN}  ✓ SSH autologin configured${NC}"
 else
-    echo -e "${RED}  ✗ SSH connection failed. Please check the IP address and Pi connectivity.${NC}"
+    echo -e "${RED}  ✗ SSH connection failed after retries. Please check credentials and connectivity.${NC}"
     exit 1
 fi
 
@@ -125,16 +168,23 @@ fi
 echo ""
 echo -e "${YELLOW}Step 3: Installing dependencies on Pi...${NC}"
 ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && bash install_raspbian.sh << EOF
-$LOCAL_HOST_IP
-$LOCAL_HOST_IP
-$LOCAL_HOST_IP
-1.0
-0.95
-hey_mycroft
-webrtc
 y
+default
+default
+ws://$LOCAL_HOST_IP:18789
+
+http://$LOCAL_HOST_IP:10000
+http://$LOCAL_HOST_IP:10001
+en_US-amy-medium
+1.2
+0.15
+docker/wakeword-models/hey-mycroft.pb
+webrtc
+1
+INFO
+n
 EOF
-" || echo -e "${YELLOW}Note: Install script completed (some prompts may have timed out)${NC}"
+" || echo -e "${YELLOW}Note: Install script completed with warnings${NC}"
 
 # Step 4: Detect and configure audio devices
 echo ""
