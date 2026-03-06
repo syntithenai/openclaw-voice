@@ -1009,6 +1009,7 @@ async def run_orchestrator() -> None:
     # Debounce state for transcript aggregation
     pending_transcripts: list[tuple[str, str]] = []  # (transcript, emotion_tag)
     debounce_task: asyncio.Task | None = None
+    processing_request = False  # Flag to prevent concurrent gateway requests
 
     def clean_text_for_tts(text: str) -> str:
         """Remove punctuation and icon symbols that should not be spoken by TTS.
@@ -1089,7 +1090,13 @@ async def run_orchestrator() -> None:
 
     async def send_debounced_transcripts() -> None:
         """Send accumulated transcripts after debounce period."""
-        nonlocal pending_transcripts
+        nonlocal pending_transcripts, processing_request, debounce_task
+        
+        # If already processing, let that task handle everything
+        if processing_request:
+            logger.info("⏱️ Debounce timer skipped - already processing a request")
+            return
+        
         logger.info("⏱️ Debounce timer started (will fire in %dms)", config.gateway_debounce_ms)
         await asyncio.sleep(config.gateway_debounce_ms / 1000)
         
@@ -1098,58 +1105,96 @@ async def run_orchestrator() -> None:
             logger.info("⏱️ No transcripts to send (pending_transcripts is empty)")
             return
         
-        # Combine all pending transcripts
-        combined_transcript = " ".join(t[0] for t in pending_transcripts)
-        # Use emotion from first transcript (or combine if needed)
-        emotion_tag = pending_transcripts[0][1] if pending_transcripts else ""
-        transcript_count = len(pending_transcripts)
+        # Set flag to prevent concurrent processing
+        processing_request = True
         
-        pending_transcripts.clear()
-        
-        # Increment request ID for new user message
-        nonlocal current_request_id
-        current_request_id += 1
-        logger.info("📍 New user message [req#%d]", current_request_id)
-        print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
-        
-        # Try quick answer first if enabled
-        if quick_answer_client:
-            try:
-                should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
-                if not should_use_upstream and quick_response:
-                    # Quick answer provided - use it and skip gateway
-                    logger.info("✓ QUICK ANSWER: Using LLM response instead of gateway")
-                    print(f"\033[94m← QUICK ANSWER: {quick_response}\033[0m", flush=True)
-                    logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
-                    last_activity_ts = time.monotonic()
-                    await submit_tts(quick_response, request_id=current_request_id)
-                    return  # Skip gateway
-                # If should_use_upstream is True, fall through to gateway below
-            except Exception as exc:
-                logger.error("Quick answer failed: %s; falling back to gateway", exc)
-                # Fall through to gateway
-        
-        # Gateway submission (normal flow or fallback from quick answer)
-        final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
-        logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
-        gw_start = time.monotonic()
         try:
-            response_text = await gateway.send_message(
-                final_text,
-                session_id=session_id,
-                agent_id=agent_id,
-                metadata={"emotion": emotion_tag} if emotion_tag else {},
-            )
-            gw_elapsed = int((time.monotonic() - gw_start) * 1000)
-            logger.info("← GATEWAY: Response received in %dms", gw_elapsed)
-            if response_text:
-                print(f"\033[94m← ASSISTANT: {response_text}\033[0m", flush=True)
-                logger.info("→ TTS QUEUE [req#%d]: Enqueuing response: '%s'", current_request_id, response_text[:80])
-                # Update activity timestamp to keep system awake during TTS synthesis
-                last_activity_ts = time.monotonic()
-                await submit_tts(response_text, request_id=current_request_id)
-        except Exception as exc:
-            logger.warning("Gateway send failed (%s); continuing", exc)
+            # Save current transcripts but don't clear yet (more may arrive during LLM call)
+            initial_transcripts = list(pending_transcripts)
+            initial_count = len(initial_transcripts)
+            
+            # Combine initial transcripts
+            combined_transcript = " ".join(t[0] for t in initial_transcripts)
+            # Use emotion from first transcript (or combine if needed)
+            emotion_tag = initial_transcripts[0][1] if initial_transcripts else ""
+            
+            # Increment request ID for new user message
+            nonlocal current_request_id
+            current_request_id += 1
+            logger.info("📍 New user message [req#%d]", current_request_id)
+            print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
+            
+            # Try quick answer first if enabled
+            should_send_to_gateway = True
+            if quick_answer_client:
+                try:
+                    should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
+                    if not should_use_upstream and quick_response:
+                        # Quick answer provided - use it and skip gateway
+                        logger.info("✓ QUICK ANSWER: Using LLM response instead of gateway")
+                        print(f"\033[94m← QUICK ANSWER: {quick_response}\033[0m", flush=True)
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
+                        last_activity_ts = time.monotonic()
+                        await submit_tts(quick_response, request_id=current_request_id)
+                        should_send_to_gateway = False
+                        # Clear all transcripts processed (including any that arrived during LLM call)
+                        pending_transcripts.clear()
+                    else:
+                        # Need to escalate to gateway - check for additional transcripts
+                        if len(pending_transcripts) > initial_count:
+                            additional_transcripts = pending_transcripts[initial_count:]
+                            additional_text = " ".join(t[0] for t in additional_transcripts)
+                            combined_transcript = f"{combined_transcript} {additional_text}"
+                            logger.info("⏱️ Quick answer escalating; collected %d additional transcripts during LLM call", len(additional_transcripts))
+                            print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
+                        # Will send to gateway below
+                except Exception as exc:
+                    logger.error("Quick answer failed: %s; falling back to gateway", exc)
+                    # Check for additional transcripts even on error
+                    if len(pending_transcripts) > initial_count:
+                        additional_transcripts = pending_transcripts[initial_count:]
+                        additional_text = " ".join(t[0] for t in additional_transcripts)
+                        combined_transcript = f"{combined_transcript} {additional_text}"
+                        logger.info("⏱️ Quick answer error; collected %d additional transcripts", len(additional_transcripts))
+                        print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
+                    # Fall through to gateway
+            
+            # Gateway submission (if quick answer didn't handle it)
+            if should_send_to_gateway:
+                # Clear all pending transcripts now (we're sending everything)
+                transcript_count = len(pending_transcripts)
+                pending_transcripts.clear()
+                
+                final_text = f"[{emotion_tag}] {combined_transcript}" if emotion_tag else combined_transcript
+                logger.info("→ GATEWAY: Sending debounced transcript (%d parts) to %s [req#%d]", transcript_count, gateway.provider, current_request_id)
+                gw_start = time.monotonic()
+                try:
+                    response_text = await gateway.send_message(
+                        final_text,
+                        session_id=session_id,
+                        agent_id=agent_id,
+                        metadata={"emotion": emotion_tag} if emotion_tag else {},
+                    )
+                    gw_elapsed = int((time.monotonic() - gw_start) * 1000)
+                    logger.info("← GATEWAY: Response received in %dms", gw_elapsed)
+                    if response_text:
+                        print(f"\033[94m← ASSISTANT: {response_text}\033[0m", flush=True)
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing response: '%s'", current_request_id, response_text[:80])
+                        # Update activity timestamp to keep system awake during TTS synthesis
+                        last_activity_ts = time.monotonic()
+                        await submit_tts(response_text, request_id=current_request_id)
+                except Exception as exc:
+                    logger.warning("Gateway send failed (%s); continuing", exc)
+        finally:
+            # Always clear processing flag
+            processing_request = False
+            
+            # If new transcripts arrived while we were processing, restart debounce timer
+            if pending_transcripts:
+                logger.info("⏱️ New transcripts arrived during processing (%d pending); restarting debounce", len(pending_transcripts))
+                if debounce_task and not debounce_task.done():
+                    debounce_task.cancel()
+                debounce_task = asyncio.create_task(send_debounced_transcripts())
 
     def count_syllables(word: str) -> int:
         """Estimate syllable count based on vowel groups."""
