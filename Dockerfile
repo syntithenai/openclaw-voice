@@ -16,6 +16,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libportaudio2 \
     portaudio19-dev \
     libsndfile1 \
+    mpd \
+    mpc \
+    alsa-utils \
+    pulseaudio-utils \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt requirements-optional.txt ./

@@ -30,6 +30,8 @@ x-orchestrator-common: &orchestrator-common
     - ./.env:/app/.env:ro
     # Persist OpenClaw device identity for websocket auth signatures
     - ${HOME}/.openclaw:/root/.openclaw
+    # Music library for MPD skill
+    - ${HOME}/music:/music:ro
 
 services:
   whisper:
@@ -99,5 +101,7 @@ services:
       - ${HOME}/.openclaw:/root/.openclaw
       - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
       - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
+      # Music library for MPD skill
+      - ${HOME}/music:/music:ro
 
 

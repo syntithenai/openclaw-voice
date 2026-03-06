@@ -128,6 +128,15 @@ PACKAGES+=(
     "portaudio19-dev"
     "libsndfile1"
     "libsndfile1-dev"
+    "pulseaudio"
+    "pulseaudio-utils"
+)
+
+# Music player (MPD for voice-controlled playlist creation)
+PACKAGES+=(
+    "mpd"
+    "mpc"
+    "alsa-utils"
 )
 
 # Additional optional dependencies
@@ -224,6 +233,26 @@ config[AUDIO_CAPTURE_DEVICE]="${config[AUDIO_CAPTURE_DEVICE]:-default}"
 read -p "Audio playback device (default: 'default'): " -r -e config[AUDIO_PLAYBACK_DEVICE]
 config[AUDIO_PLAYBACK_DEVICE]="${config[AUDIO_PLAYBACK_DEVICE]:-default}"
 
+# Music Player (MPD) configuration
+echo ""
+echo -e "${YELLOW}Music Player (MPD) Configuration:${NC}"
+read -p "Enable MPD music player? (y/n, default: y): " -r -e config[ENABLE_MPD]
+config[ENABLE_MPD]="${config[ENABLE_MPD]:-y}"
+
+if [[ "${config[ENABLE_MPD]}" =~ ^[Yy] ]]; then
+    read -p "Music library directory (default: ~/Music): " -r -e config[MPD_MUSIC_DIRECTORY]
+    config[MPD_MUSIC_DIRECTORY]="${config[MPD_MUSIC_DIRECTORY]:-~/Music}"
+    read -p "MPD port (default: 6600): " -r -e config[MPD_PORT]
+    config[MPD_PORT]="${config[MPD_PORT]:-6600}"
+    
+    # Update MPD library after configuration
+    echo -e "${YELLOW}Updating MPD library... (this may take a minute)${NC}"
+    mpc update 2>/dev/null || echo "Note: Run 'mpc update' manually after starting MPD"
+else
+    config[MPD_MUSIC_DIRECTORY]=""
+    config[MPD_PORT]="6600"
+fi
+
 # Gateway configuration
 echo ""
 echo -e "${YELLOW}Gateway Configuration:${NC}"
@@ -293,6 +322,12 @@ AUDIO_CAPTURE_DEVICE=${config[AUDIO_CAPTURE_DEVICE]}
 AUDIO_PLAYBACK_DEVICE=${config[AUDIO_PLAYBACK_DEVICE]}
 AUDIO_SAMPLE_RATE=16000
 AUDIO_FRAME_MS=20
+
+# Music Player Configuration (MPD)
+MPD_ENABLED=${config[ENABLE_MPD]:-y}
+MPD_MUSIC_DIRECTORY=${config[MPD_MUSIC_DIRECTORY]:-~/Music}
+MPD_PORT=${config[MPD_PORT]:-6600}
+MPD_HOST=localhost
 
 # Gateway Configuration
 GATEWAY_URL=${config[GATEWAY_URL]}
