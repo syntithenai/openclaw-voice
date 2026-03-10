@@ -1,9 +1,13 @@
-FROM python:3.11-slim
+FROM rocm/pytorch:latest
 
 WORKDIR /app
 
+RUN getent group video >/dev/null || groupadd -r video
+RUN getent group render >/dev/null || groupadd -r render
+
 COPY requirements.txt ./requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir fastapi uvicorn onnxruntime-rocm \
+	&& pip install --no-cache-dir --no-deps piper-tts
 
 COPY app.py ./app.py
 

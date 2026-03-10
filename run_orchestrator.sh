@@ -49,4 +49,4 @@ source "$VENV_PATH/bin/activate"
 
 # Run orchestrator with any passed arguments (tee output to log)
 set -o pipefail
-python -m orchestrator.main "$@" 2>&1 | tee -a "$SCRIPT_DIR/orchestrator_output.log"
+"$VENV_PATH/bin/python" -m orchestrator.main "$@" 2>&1 | tee -a "$SCRIPT_DIR/orchestrator_output.log"

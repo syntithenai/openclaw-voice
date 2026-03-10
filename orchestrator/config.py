@@ -156,8 +156,34 @@ class VoiceConfig(BaseSettings):
     # Quick Answer LLM
     quick_answer_enabled: bool = Field(False)
     quick_answer_llm_url: str = Field("")  # OpenAI-compatible endpoint (e.g., http://localhost:8080/v1/chat/completions)
+    quick_answer_model: str = Field("")  # Model name to use (e.g., "gpt-3.5-turbo" or specific loaded model in LM Studio)
     quick_answer_api_key: str = Field("")  # Optional API key for authentication
     quick_answer_timeout_ms: int = Field(5000)  # Timeout for quick answer requests
+
+    # Tool System
+    tools_enabled: bool = Field(True)  # Enable timer/alarm tool system
+    timers_enabled: bool = Field(True)  # Enable timer/alarm exposure and background monitoring
+    tools_persist_dir: str = Field("timers")  # Directory for timer/alarm persistence (relative to workspace root)
+    tools_debounce_ms: int = Field(75)  # Write debouncing window for alarm state updates
+    tools_monitor_interval_ms: int = Field(100)  # How often to check for timer/alarm expiration
+
+    # Music Control (MPD)
+    music_enabled: bool = Field(False)  # Enable music control via MPD
+    mpd_host: str = Field("localhost")  # MPD server host
+    mpd_port: int = Field(6600)  # MPD server port
+    mpd_timeout: float = Field(5.0)  # Connection timeout in seconds
+    mpd_pool_size: int = Field(3)  # Number of connections in pool
+    music_fast_path_enabled: bool = Field(True)  # Enable fast-path parsing for music commands
+    music_sleep_during_playback: bool = Field(True)  # Put orchestrator to sleep while music is playing
+    music_auto_resume_timeout_s: int = Field(5)  # Seconds of silence before auto-resuming music after wake
+    music_random_track_count: int = Field(50)  # Number of random tracks to add when queue is empty
+
+    # Media Keys (Hardware button detection)
+    media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
+    media_keys_device_filter: str = Field("")  # Optional device name filter (e.g., "Anker", "USB", "Conference")
+    media_keys_control_music: bool = Field(True)  # Allow media keys to control MPD playback
+    media_keys_play_scan_codes: str = Field("0xc00b6")  # Comma-separated MSC_SCAN values that should be treated as play button
+    media_keys_command_debounce_ms: int = Field(400)  # Ignore duplicate logical button commands within this window
 
     @model_validator(mode='after')
     def validate_critical_config(self):
@@ -215,6 +241,11 @@ class VoiceConfig(BaseSettings):
         if self.audio_output_gain < 0.1 or self.audio_output_gain > 5.0:
             errors.append(f"AUDIO_OUTPUT_GAIN={self.audio_output_gain} is unusual (typical range: 0.1-5.0)")
 
+        if self.media_keys_command_debounce_ms < 0:
+            errors.append(
+                f"MEDIA_KEYS_COMMAND_DEBOUNCE_MS={self.media_keys_command_debounce_ms} must be >= 0"
+            )
+
         # Validate VAD settings
         if not (0.0 <= self.vad_confidence <= 1.0):
             errors.append(f"VAD_CONFIDENCE={self.vad_confidence} must be between 0.0 and 1.0")
@@ -247,6 +278,8 @@ class VoiceConfig(BaseSettings):
                 errors.append("QUICK_ANSWER_ENABLED=true but QUICK_ANSWER_LLM_URL is empty")
             elif not (self.quick_answer_llm_url.startswith("http://") or self.quick_answer_llm_url.startswith("https://")):
                 errors.append(f"Invalid QUICK_ANSWER_LLM_URL format: {self.quick_answer_llm_url}")
+            if not self.quick_answer_model:
+                logger.warning("QUICK_ANSWER_MODEL not set - will default to 'gpt-3.5-turbo' (may not match LM Studio loaded model)")
             if self.quick_answer_timeout_ms <= 0:
                 errors.append(f"QUICK_ANSWER_TIMEOUT_MS={self.quick_answer_timeout_ms} must be > 0")
 

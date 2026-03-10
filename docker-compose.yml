@@ -6,6 +6,7 @@ x-orchestrator-common: &orchestrator-common
   depends_on:
     - whisper
     - piper
+    - mpd
   env_file:
     - .env
   environment:
@@ -13,6 +14,8 @@ x-orchestrator-common: &orchestrator-common
     # Internal service DNS for compose network
     - WHISPER_URL=http://whisper:10000
     - PIPER_URL=http://piper:10001
+    - MPD_HOST=mpd
+    - MPD_PORT=6600
     # Model/cache paths inside container
     - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
     - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
@@ -35,22 +38,39 @@ x-orchestrator-common: &orchestrator-common
 
 services:
   whisper:
-    profiles: ["stt"]
     restart: unless-stopped
     build:
       context: ./docker/whisper
-      dockerfile: Dockerfile
-    command: ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]
+      dockerfile: Dockerfile.whispercpp
     ports:
       - "10000:10000"
     environment:
       - PYTHONUNBUFFERED=1
+      - MODEL_PATH=/models/ggml-base.en.bin
+      - WHISPER_CPP_PATH=/app/build/bin/whisper-cli
     volumes:
-      - ./docker/whisper-models:/root/.cache/whisper
+      - ./docker/whisper-models:/models:rw
+    devices:
+      - /dev/dri:/dev/dri
+  mpd:
+    restart: unless-stopped
+    build:
+      context: ./docker/mpd
+      dockerfile: Dockerfile
+    ports:
+      - "6600:6600"
+    environment:
+      - MUSIC_LIBRARY_PATH=/music
+      - PULSE_SERVER=unix:/tmp/pulse/native
+    volumes:
+      - mpd-state:/var/lib/mpd
+      - ${MUSIC_LIBRARY_HOST_PATH:-${HOME}/Music}:/music:ro
+      - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
+
 
   piper:
-    profiles: ["tts"]
     restart: unless-stopped
+    runtime: amd
     build:
       context: ./docker/piper
       dockerfile: Dockerfile
@@ -61,36 +81,56 @@ services:
       - PIPER_VOICE_ID=${PIPER_VOICE_ID:-en_US-amy-medium}
     volumes:
       - ./docker/piper-data:/root/.local/share/piper
+    devices:
+      - /dev/kfd:/dev/kfd
+      - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
 
   # Cross-platform-safe default orchestrator container.
   # Works on Linux/macOS/Windows, but direct host microphone/speaker mapping
   # requires one of the Linux audio profile services below.
+  # NOTE: Disabled by default - use orchestrator-linux-alsa for Linux with audio
   orchestrator:
     <<: *orchestrator-common
-    profiles: ["orchestrator"]
-
+    profiles:
+      - manual  # Don't start by default - use orchestrator-linux-alsa
+    environment:
+      - AUDIO_CAPTURE_DEVICE=0
+      - AUDIO_PLAYBACK_DEVICE=0
+    
   # Linux ALSA hardware pass-through profile (direct /dev/snd access)
+  # DEFAULT: This is the working orchestrator for Linux desktop
   orchestrator-linux-alsa:
     <<: *orchestrator-common
-    profiles: ["linux-audio"]
+    environment:
+      - AUDIO_CAPTURE_DEVICE=0
+      - AUDIO_PLAYBACK_DEVICE=0
     devices:
       - "/dev/snd:/dev/snd"
     group_add:
       - "audio"
 
   # Linux PulseAudio/PipeWire socket profile (desktop-friendly)
+  # NOTE: Currently broken - PortAudio lacks PulseAudio support in container
   orchestrator-linux-pulse:
     <<: *orchestrator-common
-    profiles: ["linux-pulse"]
+    profiles:
+      - manual  # Don't start by default - requires PulseAudio-enabled PortAudio
     environment:
       - PYTHONUNBUFFERED=1
       - WHISPER_URL=http://whisper:10000
       - PIPER_URL=http://piper:10001
+      - MPD_HOST=mpd
+      - MPD_PORT=6600
       - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
       - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
       - EMOTION_MODELS_DIR=/app/docker/emotion-models
       - MODELSCOPE_CACHE=/app/.cache/modelscope
       - PULSE_SERVER=unix:/tmp/pulse/native
+      - AUDIO_CAPTURE_DEVICE=0
+      - AUDIO_PLAYBACK_DEVICE=0
     volumes:
       - ./docker/silero-models:/app/docker/silero-models
       - ./docker/wakeword-models:/app/docker/wakeword-models
@@ -102,6 +142,9 @@ services:
       - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
       - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
       # Music library for MPD skill
-      - ${HOME}/music:/music:ro
+      - ${HOME}/Music:/music:ro
+volumes:
+  mpd-state:
+    driver: local
 
 

@@ -47,7 +47,7 @@ from orchestrator.audio.playback import AudioPlayback
 from orchestrator.audio.webrtc_aec import WebRTCAEC
 from orchestrator.audio.resample import resample_pcm
 from orchestrator.audio.sounds import generate_click_sound, generate_swoosh_sound
-from orchestrator.metrics import AECStatus
+from orchestrator.metrics import AECStatus, WakeWordResult
 import numpy as np
 
 
@@ -927,19 +927,351 @@ async def run_orchestrator() -> None:
     session_id = f"{config.gateway_session_prefix}-{int(time.time())}"
     agent_id = config.gateway_agent_id or "assistant"
     
+    # Tool System (timers/alarms)
+    tool_router = None
+    tool_monitor = None
+    alert_gen = None
+    timer_manager = None
+    alarm_manager = None
+    timers_feature_enabled = bool(config.tools_enabled and config.timers_enabled)
+    if timers_feature_enabled:
+        print("→ Initializing Tool System (timers/alarms)...", flush=True)
+        logger.info("→ Initializing Tool System...")
+        from pathlib import Path
+        from orchestrator.tools.router import ToolRouter
+        from orchestrator.tools.monitor import ToolMonitor
+        from orchestrator.tools.state import StateManager
+        from orchestrator.tools.timer import TimerManager
+        from orchestrator.tools.alarm import AlarmManager
+        from orchestrator.alerts import AlertGenerator
+        
+        # Get workspace root and ensure timers directory exists
+        workspace_root = Path(__file__).resolve().parent.parent
+        timers_dir = workspace_root / config.tools_persist_dir
+        timers_dir.mkdir(exist_ok=True)
+        
+        # Initialize alert generator
+        alert_gen = AlertGenerator(sample_rate=config.audio_sample_rate)
+        
+        # Initialize state manager
+        state_manager = StateManager(
+            workspace_root=str(workspace_root),
+            debounce_ms=config.tools_debounce_ms,
+        )
+        
+        # Initialize managers
+        timer_manager = TimerManager(state_manager=state_manager)
+        alarm_manager = AlarmManager(state_manager=state_manager)
+        
+        # Initialize tool router
+        tool_router = ToolRouter(
+            timer_manager=timer_manager,
+            alarm_manager=alarm_manager,
+        )
+        
+        # Load persisted timers and alarms from disk
+        await timer_manager.load_from_disk()
+        await alarm_manager.load_from_disk()
+        
+        logger.info("✓ Tool System ready (persist_dir=%s)", timers_dir)
+        print("✓ Tool System ready", flush=True)
+    
+    # Music Control System (MPD)
+    music_router = None
+    music_manager = None
+    if config.music_enabled:
+        print("→ Initializing Music Control System (MPD)...", flush=True)
+        logger.info("→ Initializing Music Control System...")
+        try:
+            from orchestrator.music import MPDClientPool, MusicManager, MusicRouter
+            
+            # Initialize MPD client pool
+            mpd_pool = MPDClientPool(
+                host=config.mpd_host,
+                port=config.mpd_port,
+                pool_size=config.mpd_pool_size,
+                timeout=config.mpd_timeout,
+            )
+            mpd_initialized = False
+            mpd_attempts = 3
+            for attempt in range(1, mpd_attempts + 1):
+                try:
+                    await mpd_pool.initialize()
+                    mpd_initialized = True
+                    break
+                except Exception as mpd_init_err:
+                    if attempt < mpd_attempts:
+                        logger.warning(
+                            "MPD initialization attempt %d/%d failed (%s). Retrying in 1s...",
+                            attempt,
+                            mpd_attempts,
+                            mpd_init_err,
+                        )
+                        await asyncio.sleep(1)
+                    else:
+                        raise
+            
+            # Initialize music manager
+            music_manager = MusicManager(mpd_pool)
+            
+            # Check if library is empty and auto-update if needed
+            stats = await music_manager.get_stats()
+            song_count = int(stats.get("songs", 0))
+            logger.info("MPD library has %d songs", song_count)
+            
+            if song_count == 0:
+                logger.info("Library is empty - triggering automatic scan...")
+                print("  → Library is empty - scanning music directory...", flush=True)
+                update_result = await music_manager.update_library()
+                logger.info("Auto-scan initiated: %s", update_result)
+                
+                # Wait briefly and check again
+                await asyncio.sleep(2)
+                stats = await music_manager.get_stats()
+                new_song_count = int(stats.get("songs", 0))
+                if new_song_count > 0:
+                    logger.info("✓ Library scan complete: %d songs indexed", new_song_count)
+                    print(f"  ✓ Library scan complete: {new_song_count} songs", flush=True)
+                else:
+                    logger.warning("Library still empty after scan - check music directory")
+                    print("  ⚠ Library still empty - check music directory", flush=True)
+            
+            # Initialize music router
+            music_router = MusicRouter(music_manager)
+            
+            logger.info("✓ Music Control System ready")
+            print("✓ Music Control System ready", flush=True)
+            
+        except Exception as e:
+            logger.error("Failed to initialize Music Control System: %s", e)
+            logger.warning(
+                "Music control disabled for this run. If using Docker MPD from host orchestrator, ensure MPD is running and reachable at %s:%s",
+                config.mpd_host,
+                config.mpd_port,
+            )
+            print(f"✗ Music Control System initialization failed: {e}", flush=True)
+            music_router = None
+            music_manager = None
+    
+    # Media Key Detector (optional - works without music system, but won't control music)
+    media_key_detector = None
+    if config.media_keys_enabled:
+        print("→ Initializing Media Key Detector...", flush=True)
+        logger.info("→ Initializing Media Key Detector...")
+        try:
+            from orchestrator.audio.media_keys import MediaKeyDetector, MediaKeyEvent
+            
+            # Create detector with optional device filter
+            device_filter = config.media_keys_device_filter if config.media_keys_device_filter else None
+            media_key_detector = MediaKeyDetector(
+                device_filter=device_filter,
+                play_scan_codes=config.media_keys_play_scan_codes,
+                command_debounce_ms=config.media_keys_command_debounce_ms,
+            )
+            
+            # Set up callback to handle button presses
+            async def on_media_key_press(event: MediaKeyEvent):
+                """Handle media key button presses from hardware devices."""
+                nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
+                nonlocal capture, tts_stop_event, music_paused_for_wake, music_auto_resume_timer, music_was_playing
+                nonlocal state, pending_transcripts, debounce_task, chunk_frames, chunk_start_ts, last_speech_ts
+                nonlocal cut_in_triggered_ts
+                
+                logger.info("Media key pressed: %s from %s", event.key, event.device_name)
+
+                async def pause_music_for_wake(source_label: str) -> bool:
+                    nonlocal music_paused_for_wake, music_auto_resume_timer
+
+                    if not (config.music_enabled and music_manager):
+                        return False
+
+                    try:
+                        playback_state = await music_manager.get_playback_state()
+                        if playback_state == "play":
+                            logger.info("🎵 Pausing music for %s", source_label)
+                            await music_manager.pause()
+                            music_paused_for_wake = True
+                            music_auto_resume_timer = 0.0
+                            return True
+                    except Exception as e:
+                        logger.debug("Error pausing music for %s: %s", source_label, e)
+
+                    return False
+
+                async def restore_music_if_needed(source_label: str):
+                    nonlocal music_paused_for_wake, music_auto_resume_timer, music_was_playing
+
+                    if not music_paused_for_wake or not (config.music_enabled and music_manager):
+                        return
+
+                    try:
+                        logger.info("🎵 Restoring paused music after %s", source_label)
+                        await music_manager.play()
+                        music_paused_for_wake = False
+                        music_auto_resume_timer = 0.0
+                        music_was_playing = True
+                    except Exception as e:
+                        logger.debug("Error restoring music after %s: %s", source_label, e)
+
+                async def trigger_wake(source_label: str):
+                    nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
+                    nonlocal music_paused_for_wake, state
+
+                    logger.info("🎙️ %s - triggering wake word sequence", source_label)
+
+                    await pause_music_for_wake(source_label)
+                    tts_stop_event.set()
+
+                    if capture and hasattr(capture, 'is_muted') and capture.is_muted():
+                        capture.set_muted(False)
+                        logger.info("🎤 Microphone unmuted for %s", source_label)
+
+                    wake_state = WakeState.AWAKE
+                    wake_sleep_ts = None
+                    last_wake_detected_ts = time.monotonic()
+                    last_activity_ts = time.monotonic()
+                    state = VoiceState.LISTENING
+                    logger.info("🎙️ System woken by %s", source_label)
+
+                    if wake_click_sound:
+                        try:
+                            asyncio.create_task(
+                                asyncio.to_thread(playback.play_pcm, wake_click_sound, 1.0, threading.Event())
+                            )
+                        except Exception as e:
+                            logger.debug("Failed to play wake click: %s", e)
+
+                async def trigger_sleep(source_label: str):
+                    nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
+                    nonlocal state, pending_transcripts, debounce_task, chunk_frames, chunk_start_ts
+                    nonlocal last_speech_ts, cut_in_triggered_ts, music_auto_resume_timer
+
+                    logger.info("😴 %s - putting system to sleep", source_label)
+
+                    tts_stop_event.set()
+
+                    drained_tts = 0
+                    while True:
+                        try:
+                            tts_queue.get_nowait()
+                            drained_tts += 1
+                        except asyncio.QueueEmpty:
+                            break
+
+                    if drained_tts:
+                        logger.info("🧹 Cleared %d queued TTS item(s) for sleep", drained_tts)
+
+                    pending_transcripts.clear()
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                    debounce_task = None
+
+                    chunk_frames = []
+                    chunk_start_ts = None
+                    last_speech_ts = None
+                    cut_in_triggered_ts = None
+                    music_auto_resume_timer = 0.0
+                    state = VoiceState.IDLE
+
+                    wake_state = WakeState.ASLEEP
+                    wake_sleep_ts = time.monotonic()
+                    last_wake_detected_ts = None
+                    last_activity_ts = wake_sleep_ts
+
+                    if wake_detector and hasattr(wake_detector, 'reset_state'):
+                        try:
+                            wake_detector.reset_state()
+                        except Exception as e:
+                            logger.debug("Failed to reset wake detector on %s sleep: %s", source_label, e)
+
+                    await restore_music_if_needed(source_label)
+                    logger.info("😴 System put to sleep by %s", source_label)
+                
+                # Mute button → Toggle microphone mute
+                if event.key == "mute":
+                    if capture and hasattr(capture, 'toggle_mute'):
+                        new_state = capture.toggle_mute()
+                        logger.info("🎤 Microphone %s via button press", "muted" if new_state else "unmuted")
+                
+                # Play button (or mapped MSC_SCAN play) → Toggle wake/sleep
+                elif event.key in ("play_pause", "play", "pause"):
+                    if config.wake_word_enabled and wake_state == WakeState.AWAKE:
+                        await trigger_sleep("play button")
+                    else:
+                        await trigger_wake("play button")
+                
+                # Next/Previous track → Also trigger wake (instead of skipping tracks)
+                elif event.key in ("next", "previous"):
+                    await trigger_wake("play button")
+                
+                # Long press play button (0.5s+) → Alternative wake trigger (if supported)
+                elif event.key == "play_pause_long":
+                    await trigger_wake("play button long-press")
+                
+                # Phone button → Trigger wake word (stop audio, notification sound, unmute mic, wake system)
+                elif event.key == "phone":
+                    await trigger_wake("phone button")
+                
+                # Standard media controls
+                elif config.media_keys_control_music and music_manager:
+                    if event.key == "stop":
+                        asyncio.create_task(music_manager.stop())
+                    elif event.key == "volume_up":
+                        asyncio.create_task(music_manager.increase_volume(5))
+                    elif event.key == "volume_down":
+                        asyncio.create_task(music_manager.decrease_volume(5))
+                    else:
+                        logger.debug("Unhandled media key: %s", event.key)
+            
+            media_key_detector.set_callback(on_media_key_press)
+            
+            # Start monitoring and report readiness only when devices are actually active
+            await media_key_detector.start()
+            if media_key_detector.devices:
+                logger.info("✓ Media Key Detector ready (%d device(s))", len(media_key_detector.devices))
+                print("✓ Media Key Detector ready", flush=True)
+            else:
+                logger.warning("Media Key Detector enabled but no devices are currently active")
+                print("⚠ Media Key Detector enabled but no devices found", flush=True)
+            
+        except ImportError:
+            logger.error("Media Key Detector requires 'evdev' library: pip install evdev")
+            print("✗ Media Key Detector failed: evdev library not found", flush=True)
+            media_key_detector = None
+        except Exception as e:
+            logger.error("Failed to initialize Media Key Detector: %s", e)
+            print(f"✗ Media Key Detector initialization failed: {e}", flush=True)
+            media_key_detector = None
+    
     # Quick Answer LLM (optional)
     quick_answer_client = None
     if config.quick_answer_enabled:
         print("→ Initializing Quick Answer LLM...", flush=True)
         logger.info("→ Initializing Quick Answer LLM (%s)...", config.quick_answer_llm_url)
-        from orchestrator.gateway.quick_answer import QuickAnswerClient
-        quick_answer_client = QuickAnswerClient(
-            llm_url=config.quick_answer_llm_url,
-            api_key=config.quick_answer_api_key if config.quick_answer_api_key else None,
-            timeout_ms=config.quick_answer_timeout_ms,
-        )
-        logger.info("✓ Quick Answer LLM ready")
-        print("✓ Quick Answer LLM ready", flush=True)
+        try:
+            from orchestrator.gateway.quick_answer import QuickAnswerClient, get_random_thinking_phrase
+
+            quick_answer_client = QuickAnswerClient(
+                llm_url=config.quick_answer_llm_url,
+                model=config.quick_answer_model if config.quick_answer_model else None,
+                api_key=config.quick_answer_api_key if config.quick_answer_api_key else None,
+                timeout_ms=config.quick_answer_timeout_ms,
+                timers_enabled=timers_feature_enabled,
+                music_enabled=config.music_enabled,
+                tool_router=tool_router,
+                music_router=music_router,
+            )
+            logger.info("✓ Quick Answer LLM ready")
+            print("✓ Quick Answer LLM ready", flush=True)
+        except ImportError as ie:
+            logger.error("Quick Answer disabled: missing dependency (%s)", ie)
+            logger.error("Install dependencies with: pip install -r requirements.txt")
+            print("✗ Quick Answer disabled: missing dependency (install requirements.txt)", flush=True)
+            quick_answer_client = None
+        except Exception as e:
+            logger.error("Quick Answer initialization failed: %s", e)
+            print(f"✗ Quick Answer initialization failed: {e}", flush=True)
+            quick_answer_client = None
     
     # TTS client
     print("→ Initializing Piper TTS client...", flush=True)
@@ -1117,6 +1449,12 @@ async def run_orchestrator() -> None:
             combined_transcript = " ".join(t[0] for t in initial_transcripts)
             # Use emotion from first transcript (or combine if needed)
             emotion_tag = initial_transcripts[0][1] if initial_transcripts else ""
+
+            combined_transcript = normalize_transcript(combined_transcript)
+            if not combined_transcript:
+                logger.info("⊘ Debounced transcript became empty after normalization; skipping quick answer and gateway")
+                pending_transcripts.clear()
+                return
             
             # Increment request ID for new user message
             nonlocal current_request_id
@@ -1128,11 +1466,17 @@ async def run_orchestrator() -> None:
             should_send_to_gateway = True
             if quick_answer_client:
                 try:
-                    should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
+                    qa_start = time.monotonic()
+                    # Use tool-enabled method if tools are configured
+                    if quick_answer_client.has_tool_capabilities():
+                        should_use_upstream, quick_response = await quick_answer_client.get_quick_answer_with_tools(combined_transcript)
+                    else:
+                        should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
+                    qa_elapsed = int((time.monotonic() - qa_start) * 1000)
                     if not should_use_upstream and quick_response:
                         # Quick answer provided - use it and skip gateway
-                        logger.info("✓ QUICK ANSWER: Using LLM response instead of gateway")
-                        print(f"\033[94m← QUICK ANSWER: {quick_response}\033[0m", flush=True)
+                        logger.info("✓ QUICK ANSWER: Using LLM response instead of gateway (latency: %dms)", qa_elapsed)
+                        print(f"\033[94m← QUICK ANSWER: {quick_response} [latency: {qa_elapsed}ms]\033[0m", flush=True)
                         logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
                         last_activity_ts = time.monotonic()
                         await submit_tts(quick_response, request_id=current_request_id)
@@ -1141,22 +1485,43 @@ async def run_orchestrator() -> None:
                         pending_transcripts.clear()
                     else:
                         # Need to escalate to gateway - check for additional transcripts
+                        logger.info("← QUICK ANSWER: Escalating to upstream (latency: %dms)", qa_elapsed)
+                        
+                        # Play a thinking phrase while gateway processes
+                        thinking_phrase = get_random_thinking_phrase()
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing thinking phrase: '%s'", current_request_id, thinking_phrase)
+                        await submit_tts(thinking_phrase, request_id=current_request_id)
+                        
                         if len(pending_transcripts) > initial_count:
                             additional_transcripts = pending_transcripts[initial_count:]
-                            additional_text = " ".join(t[0] for t in additional_transcripts)
-                            combined_transcript = f"{combined_transcript} {additional_text}"
+                            additional_text = normalize_transcript(" ".join(t[0] for t in additional_transcripts))
+                            if additional_text:
+                                combined_transcript = f"{combined_transcript} {additional_text}"
                             logger.info("⏱️ Quick answer escalating; collected %d additional transcripts during LLM call", len(additional_transcripts))
-                            print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
+                            if additional_text:
+                                print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
                         # Will send to gateway below
                 except Exception as exc:
-                    logger.error("Quick answer failed: %s; falling back to gateway", exc)
+                    qa_elapsed = int((time.monotonic() - qa_start) * 1000) if 'qa_start' in locals() else 0
+                    logger.error("Quick answer failed: %s; falling back to gateway (latency: %dms)", exc, qa_elapsed)
+                    
+                    # Play a thinking phrase on error too
+                    try:
+                        thinking_phrase = get_random_thinking_phrase()
+                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing thinking phrase (error fallback): '%s'", current_request_id, thinking_phrase)
+                        await submit_tts(thinking_phrase, request_id=current_request_id)
+                    except Exception as tts_exc:
+                        logger.error("Failed to play thinking phrase: %s", tts_exc)
+                    
                     # Check for additional transcripts even on error
                     if len(pending_transcripts) > initial_count:
                         additional_transcripts = pending_transcripts[initial_count:]
-                        additional_text = " ".join(t[0] for t in additional_transcripts)
-                        combined_transcript = f"{combined_transcript} {additional_text}"
+                        additional_text = normalize_transcript(" ".join(t[0] for t in additional_transcripts))
+                        if additional_text:
+                            combined_transcript = f"{combined_transcript} {additional_text}"
                         logger.info("⏱️ Quick answer error; collected %d additional transcripts", len(additional_transcripts))
-                        print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
+                        if additional_text:
+                            print(f"\033[93m→ USER (continued): {additional_text}\033[0m", flush=True)
                     # Fall through to gateway
             
             # Gateway submission (if quick answer didn't handle it)
@@ -1216,6 +1581,31 @@ async def run_orchestrator() -> None:
             previous_was_vowel = is_vowel
         return max(1, syllable_count)
 
+    def normalize_transcript(transcript: str) -> str:
+        """Normalize STT text and drop blank/punctuation-only markers before routing."""
+        text = (transcript or "").strip()
+        if not text:
+            return ""
+
+        lowered = text.lower()
+        ignore_markers = (
+            "[inaudible]",
+            "[blank_audio]",
+            "blank_audio",
+        )
+        if any(marker in lowered for marker in ignore_markers):
+            return ""
+
+        # Remove bracketed non-speech markers and repeated punctuation-only filler.
+        text = re.sub(r"\[(?:[^\]]+)\]", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+
+        has_words = bool(re.search(r"[a-zA-Z0-9]", text))
+        if not has_words:
+            return ""
+
+        return text
+
     async def process_chunk(
         pcm: bytes,
         cut_in_ts: float | None = None,
@@ -1238,23 +1628,12 @@ async def run_orchestrator() -> None:
             stt_elapsed = int((time.monotonic() - stt_start) * 1000)
             logger.info("← STT: Complete in %dms: '%s'", stt_elapsed, transcript[:80])
                 
-            transcript = transcript.strip()
-            
-            # Filter out transcripts containing [inaudible]
-            if "[inaudible]" in transcript.lower():
-                logger.warning("⊘ Transcript filtered out: contains [inaudible]")
-                return
-            
-            # Filter out transcripts that are only punctuation/silence markers
-            # Keep only if there are actual words (letters/numbers)
-            import re
-            has_words = bool(re.search(r'[a-zA-Z0-9]', transcript))
-            if not transcript or not has_words:
+            transcript = normalize_transcript(transcript)
+
+            # Filter out transcripts that are blank audio, inaudible, or punctuation-only
+            if not transcript:
                 logger.warning(
-                    "⊘ Transcript filtered out: empty=%s, has_words=%s, raw_text='%s'",
-                    not transcript,
-                    has_words,
-                    transcript if transcript else "[EMPTY]"
+                    "⊘ Transcript filtered out after normalization (blank audio / inaudible / punctuation-only)"
                 )
                 return
             
@@ -1555,9 +1934,73 @@ async def run_orchestrator() -> None:
     print("🎧 Listening for audio input...\n", flush=True)
     logger.info("🎧 Listening for audio input...")
     
+    # Start TTS processing loop
     asyncio.create_task(tts_loop())
+    
+    # Start gateway listener if supported
     if getattr(gateway, "supports_listen", False):
         asyncio.create_task(gateway_listener())
+    
+    # Start tool monitor for timers/alarms if enabled
+    if timers_feature_enabled and tool_router and alert_gen:
+        from orchestrator.tools.monitor import ToolMonitor
+        
+        # Define callbacks for timer/alarm events
+        async def on_timer_expired(timer_id: str, name: str):
+            """Called when a timer expires."""
+            logger.info("⏰ TIMER EXPIRED: %s (%s)", name or timer_id, timer_id)
+            # Play bell sound
+            bell_pcm = alert_gen.get_timer_alert_pcm()
+            bell_pcm_16k = resample_pcm(bell_pcm, alert_gen.sample_rate, config.audio_sample_rate)
+            try:
+                if config.audio_backend == "portaudio-duplex":
+                    # For duplex, would need different handling - skip for now
+                    pass
+                else:
+                    await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, threading.Event())
+            except Exception as e:
+                logger.error("Failed to play timer bell: %s", e)
+            # Announce timer completion
+            if name:
+                await submit_tts(f"Timer {name} is complete")
+            else:
+                await submit_tts("Timer is complete")
+        
+        async def on_alarm_triggered(alarm_id: str, name: str):
+            """Called when an alarm first triggers."""
+            logger.info("⏰ ALARM TRIGGERED: %s (%s)", name or alarm_id, alarm_id)
+            # Announce alarm
+            if name:
+                await submit_tts(f"Alarm {name}")
+            else:
+                await submit_tts("Alarm")
+        
+        async def on_alarm_ringing(alarm_id: str, name: str):
+            """Called repeatedly while alarm is ringing (every few seconds)."""
+            logger.info("🔔 ALARM RINGING: %s (%s)", name or alarm_id, alarm_id)
+            # Play bell sound
+            bell_pcm = alert_gen.get_alarm_alert_pcm()
+            bell_pcm_16k = resample_pcm(bell_pcm, alert_gen.sample_rate, config.audio_sample_rate)
+            try:
+                if config.audio_backend == "portaudio-duplex":
+                    # For duplex, would need different handling - skip for now
+                    pass
+                else:
+                    await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, threading.Event())
+            except Exception as e:
+                logger.error("Failed to play alarm bell: %s", e)
+        
+        # Initialize and start tool monitor
+        tool_monitor = ToolMonitor(
+            timer_manager=timer_manager,
+            alarm_manager=alarm_manager,
+            check_interval_ms=config.tools_monitor_interval_ms,
+        )
+        tool_monitor.on_timer_expired = on_timer_expired
+        tool_monitor.on_alarm_triggered = on_alarm_triggered
+        tool_monitor.on_alarm_ringing = on_alarm_ringing
+        await tool_monitor.start()
+        logger.info("✓ Tool monitor started (check_interval=%dms)", config.tools_monitor_interval_ms)
 
     frame_count = 0
     last_heartbeat_ts = time.monotonic()
@@ -1580,6 +2023,13 @@ async def run_orchestrator() -> None:
     speech_frame_count = 0
     min_speech_frames = max(1, int(config.vad_min_speech_ms / config.audio_frame_ms))
     
+    # Music state tracking
+    music_was_playing = False
+    music_paused_for_wake = False
+    music_auto_resume_timer = 0.0
+    last_music_check_ts = 0.0
+    music_check_interval = 0.5  # Check music state every 500ms
+    
     try:
         while True:
             frame = capture.read_frame(timeout=1.0)
@@ -1591,6 +2041,54 @@ async def run_orchestrator() -> None:
             frame_count += 1
 
             processed_frame = frame
+            
+            # Monitor music playback state and manage orchestrator sleep during music
+            if config.music_enabled and music_manager and (now - last_music_check_ts >= music_check_interval):
+                try:
+                    is_playing = await music_manager.is_playing()
+                    
+                    # Music started playing → Put orchestrator to sleep
+                    if is_playing and not music_was_playing and config.music_sleep_during_playback:
+                        if wake_state == WakeState.AWAKE and not music_paused_for_wake:
+                            logger.info("🎵 Music started → Putting orchestrator to sleep")
+                            wake_state = WakeState.ASLEEP
+                            music_was_playing = True
+                            music_auto_resume_timer = 0.0
+                    
+                    # Music stopped playing
+                    elif not is_playing and music_was_playing:
+                        music_was_playing = False
+                        if music_paused_for_wake:
+                            music_auto_resume_timer = 0.0
+                            logger.info("🎵 Music paused for wake/listening")
+                        else:
+                            music_auto_resume_timer = 0.0
+                            logger.info("🎵 Music stopped")
+                    
+                    # Handle auto-resume timer (music was paused for wake word, but no voice activity)
+                    if music_paused_for_wake and not is_playing:
+                        if state in (VoiceState.IDLE, VoiceState.LISTENING):
+                            # No voice activity - increment timer
+                            if music_auto_resume_timer == 0.0:
+                                music_auto_resume_timer = now
+                            elif (now - music_auto_resume_timer) >= config.music_auto_resume_timeout_s:
+                                # Timeout reached - resume music
+                                logger.info("🎵 Auto-resuming music after %ds of silence", config.music_auto_resume_timeout_s)
+                                await music_manager.play()
+                                music_paused_for_wake = False
+                                music_was_playing = True
+                                music_auto_resume_timer = 0.0
+                                if wake_state == WakeState.AWAKE and config.music_sleep_during_playback:
+                                    wake_state = WakeState.ASLEEP
+                                    logger.info("🎵 Returning orchestrator to sleep for music")
+                        else:
+                            # Voice activity detected - reset timer
+                            music_auto_resume_timer = 0.0
+                    
+                except Exception as e:
+                    logger.debug("Error checking music state: %s", e)
+                
+                last_music_check_ts = now
             
             # Periodic heartbeat to show system is alive
             if now - last_heartbeat_ts >= heartbeat_interval:
@@ -1747,6 +2245,19 @@ async def run_orchestrator() -> None:
                             last_activity_ts = now
                             state = VoiceState.LISTENING
                             chunk_start_ts = now
+                            
+                            # Stop music playback when wake word detected
+                            if config.music_enabled and music_manager:
+                                try:
+                                    is_playing = await music_manager.is_playing()
+                                    if is_playing:
+                                        logger.info("🎵 Pausing music for wake word")
+                                        await music_manager.pause()
+                                        music_paused_for_wake = True
+                                        music_auto_resume_timer = 0.0
+                                except Exception as e:
+                                    logger.debug("Error stopping music: %s", e)
+                            
                             # Clear ring buffer if configured to avoid stale pre-wake audio (prevents ghost transcripts)
                             # Recommended for ARM systems where ring buffer latency is high
                             if config.wake_clear_ring_buffer:
@@ -1928,6 +2439,18 @@ async def run_orchestrator() -> None:
                         silero_conf if silero_conf is not None else -1.0,
                     )
                     tts_stop_event.set()
+                    
+                    # Stop music playback when voice cut-in detected
+                    if config.music_enabled and music_manager:
+                        try:
+                            is_playing = await music_manager.is_playing()
+                            if is_playing:
+                                logger.info("🎵 Pausing music for voice cut-in")
+                                await music_manager.pause()
+                                music_paused_for_wake = True
+                                music_auto_resume_timer = 0.0
+                        except Exception as e:
+                            logger.debug("Error stopping music on cut-in: %s", e)
             if tts_playing and last_speech_ts:
                 silence_ms = int(((now - last_speech_ts) * 1000))
                 if silence_ms >= config.vad_min_silence_ms and tts_gain != tts_base_gain:
@@ -1994,6 +2517,14 @@ async def run_orchestrator() -> None:
 
             await asyncio.sleep(0)
     finally:
+        # Cleanup media key detector if running
+        if media_key_detector:
+            logger.info("Stopping media key detector...")
+            await media_key_detector.stop()
+        # Cleanup tool monitor if running
+        if tool_monitor:
+            logger.info("Stopping tool monitor...")
+            await tool_monitor.stop()
         capture.stop()
 
 

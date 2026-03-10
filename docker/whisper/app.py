@@ -1,35 +1,78 @@
-import io
+import os
+import tempfile
+import sys
+import signal
 
 from fastapi import FastAPI, UploadFile
-from faster_whisper import WhisperModel
 
 app = FastAPI()
 
-MODEL_NAME = "base"
-MODEL = WhisperModel(MODEL_NAME, device="cpu", compute_type="int8")
+# Defer torch/whisper imports to avoid GPU initialization on startup
+MODEL = None
+device = None
 
+def load_model_safely():
+    """Load whisper model with GPU fallback"""
+    global MODEL, device
+    import torch
+    import whisper
+    
+    MODEL_NAME = os.getenv("WHISPER_MODEL_NAME", "base")
+    WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cuda" if torch.cuda.is_available() else "cpu")
+    
+    # Start with CPU to avoid GPU segfaults
+    device = "cpu"
+    try:
+        print(f"Loading Whisper model {MODEL_NAME} on CPU (GPU fallback available)...")
+        MODEL = whisper.load_model(MODEL_NAME, device="cpu")
+        print(f"✓ Whisper initialized with model={MODEL_NAME}, device=cpu")
+        
+        # Try to switch to GPU if requested and available
+        if WHISPER_DEVICE == "cuda":
+            try:
+                print(f"Attempting GPU inference (if available)...")
+                MODEL = whisper.load_model(MODEL_NAME, device="cuda")
+                device = "cuda"
+                print(f"✓ Switched to GPU for inference")
+            except Exception as gpu_err:
+                print(f"GPU not available, staying on CPU: {gpu_err}")
+    except Exception as e:
+        print(f"✗ Failed to load model: {e}")
+        raise
+
+@app.on_event("startup")
+async def startup_event():
+    """Load model on startup, using signal alarm to force timeout"""
+    try:
+        # Set a 60 second timeout for model loading
+        def timeout_handler(signum, frame):
+            print("Model loading timed out after 60 seconds, exiting...")
+            sys.exit(1)
+        
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(60)
+        
+        load_model_safely()
+        
+        signal.alarm(0)  # Cancel alarm
+    except Exception as e:
+        print(f"Startup error: {e}")
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
-    audio = await file.read()
-    audio_stream = io.BytesIO(audio)
-    segments, info = MODEL.transcribe(audio_stream, beam_size=5)
-
-    segments = list(segments)  # materialize generator
-    for i, seg in enumerate(segments):
-        dur = seg.end - seg.start
-        gap = None
-        if i + 1 < len(segments):
-            gap = segments[i + 1].start - seg.end
-        print(
-            f"seg {i} start={seg.start:.2f}s end={seg.end:.2f}s "
-            f"dur={dur:.2f}s gap={gap if gap is None else f'{gap:.2f}'}s "
-            f"text={seg.text!r} "
-            f"avg_logprob={getattr(seg, 'avg_logprob', None)} "
-            f"no_speech_prob={getattr(seg, 'no_speech_prob', None)} "
-            f"compression_ratio={getattr(seg, 'compression_ratio', None)}"
-        )
+    if MODEL is None:
+        return {"error": "Model not initialized", "text": "", "language": ""}
     
-    # Combine all segments into single transcript
-    text = " ".join([segment.text.strip() for segment in segments])
-    return {"text": text, "language": info.language}
+    audio = await file.read()
+    if not audio:
+        return {"text": "", "language": ""}
+
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as temp_audio:
+        temp_audio.write(audio)
+        temp_audio.flush()
+        result = MODEL.transcribe(temp_audio.name)
+
+    return {
+        "text": (result.get("text") or "").strip(),
+        "language": result.get("language", ""),
+    }

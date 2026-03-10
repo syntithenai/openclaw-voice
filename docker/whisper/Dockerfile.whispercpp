@@ -1,0 +1,32 @@
+# Use official whisper.cpp Vulkan image
+FROM ghcr.io/ggml-org/whisper.cpp:main-vulkan
+
+WORKDIR /app
+
+# Install Python and FastAPI for wrapper
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --break-system-packages fastapi uvicorn python-multipart
+
+# Download default model if not exists
+RUN mkdir -p /models && \
+    if [ ! -f /models/ggml-base.en.bin ]; then \
+        cd /tmp && \
+        wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin && \
+        mv ggml-base.en.bin /models/; \
+    fi
+
+# Copy FastAPI wrapper
+COPY app_whispercpp.py /app/app.py
+
+ENV MODEL_PATH=/models/ggml-base.en.bin
+ENV WHISPER_CPP_PATH=/app/build/bin/whisper-cli
+
+EXPOSE 10000
+
+# Override base image entrypoint
+ENTRYPOINT []
+CMD ["python3", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "10000"]

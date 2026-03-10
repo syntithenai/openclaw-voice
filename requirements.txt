@@ -10,3 +10,4 @@ python-dotenv
 setuptools<76
 webrtcvad
 webrtc-audio-processing
+evdev

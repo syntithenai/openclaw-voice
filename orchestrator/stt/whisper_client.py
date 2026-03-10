@@ -10,4 +10,6 @@ class WhisperClient:
         response = requests.post(f"{self.base_url}/transcribe", files=files, timeout=120)
         response.raise_for_status()
         payload = response.json()
+        if payload.get("error"):
+            raise RuntimeError(f"Whisper backend error: {payload['error']}")
         return payload.get("text", "")

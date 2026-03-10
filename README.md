@@ -62,6 +62,13 @@ docker-compose --profile stt --profile tts --profile linux-audio up -d
 # Or for PulseAudio/PipeWire (desktop Linux)
 docker-compose --profile stt --profile tts --profile linux-pulse up -d
 
+# Auto-select exactly one orchestrator variant based on host audio stack
+# (uses PulseAudio/PipeWire if available, otherwise ALSA)
+./run_docker_orchestrator_auto_audio.sh
+
+# Stop/remove orchestrator + related voice service containers
+./stop_docker_orchestrator_auto_audio.sh
+
 # View logs
 docker-compose logs -f orchestrator
 ```
@@ -72,6 +79,23 @@ docker-compose logs -f orchestrator
 - `orchestrator` - Main orchestrator (cross-platform base)
 - `linux-audio` - Linux ALSA hardware passthrough (`/dev/snd`)
 - `linux-pulse` - Linux PulseAudio/PipeWire socket passthrough
+
+### AMD GPU (GMK EVO-X2)
+
+Whisper and Piper containers are configured for AMD GPU acceleration with the `amd` Docker runtime.
+
+```bash
+# Verify AMD runtime is available
+docker info --format '{{json .Runtimes}}' | grep amd
+
+# Rebuild GPU-enabled STT/TTS containers after pulling changes
+docker-compose build whisper piper
+
+# Start with STT + TTS profiles (plus your audio profile if running orchestrator in Docker)
+docker-compose --profile stt --profile tts up -d
+```
+
+If your ROCm stack is healthy, the containers will use `/dev/kfd` and `/dev/dri` automatically.
 
 ### Option 2: Native Installation (Raspberry Pi / Low Latency)
 

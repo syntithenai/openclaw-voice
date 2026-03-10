@@ -31,6 +31,7 @@ class DuplexAudioIO:
         self._stream: Optional[sd.Stream] = None
         self._on_playback_frame: Optional[Callable[[bytes], None]] = None
         self._warned_status = False
+        self._muted = False  # Microphone mute state
 
         self._out_queue: queue.Queue[Tuple[np.ndarray, Optional[threading.Event], int]] = queue.Queue()
         self._play_lock = threading.Lock()
@@ -101,9 +102,12 @@ class DuplexAudioIO:
             logger.warning("Audio duplex status: %s", status)
             self._warned_status = True
 
-        # Input capture with gain
-        pcm = np.clip(indata[:, 0] * self.input_gain, -1.0, 1.0)
-        pcm = (pcm * 32767).astype(np.int16).tobytes()
+        # Input capture with gain (or mute)
+        if self._muted:
+            pcm = np.zeros(frames, dtype=np.int16).tobytes()
+        else:
+            pcm = np.clip(indata[:, 0] * self.input_gain, -1.0, 1.0)
+            pcm = (pcm * 32767).astype(np.int16).tobytes()
         try:
             self._queue.put_nowait(pcm)
         except queue.Full:
@@ -218,6 +222,21 @@ class DuplexAudioIO:
             return self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+    def set_muted(self, muted: bool) -> None:
+        """Set microphone mute state."""
+        self._muted = muted
+        logger.info("Microphone %s", "muted" if muted else "unmuted")
+
+    def is_muted(self) -> bool:
+        """Get microphone mute state."""
+        return self._muted
+
+    def toggle_mute(self) -> bool:
+        """Toggle microphone mute state and return new state."""
+        self._muted = not self._muted
+        logger.info("Microphone %s", "muted" if self._muted else "unmuted")
+        return self._muted
 
     def play_pcm(self, pcm: bytes, gain: float = 1.0, stop_event: Optional[threading.Event] = None) -> None:
         if gain != 1.0:

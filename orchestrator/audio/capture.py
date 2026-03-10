@@ -18,15 +18,22 @@ class AudioCapture:
         self._queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
         self._stream: Optional[sd.InputStream] = None
         self._warned_status = False
+        self._muted = False  # Microphone mute state
 
     def _callback(self, indata: np.ndarray, frames: int, time, status) -> None:
         if status:
             if not self._warned_status:
                 logger.warning("Audio capture status: %s", status)
                 self._warned_status = True
-        # Apply software gain and clip to prevent overflow
-        pcm = np.clip(indata[:, 0] * self.input_gain, -1.0, 1.0)
-        pcm = (pcm * 32767).astype(np.int16).tobytes()
+        
+        # If muted, return silence
+        if self._muted:
+            pcm = np.zeros(frames, dtype=np.int16).tobytes()
+        else:
+            # Apply software gain and clip to prevent overflow
+            pcm = np.clip(indata[:, 0] * self.input_gain, -1.0, 1.0)
+            pcm = (pcm * 32767).astype(np.int16).tobytes()
+        
         try:
             self._queue.put_nowait(pcm)
         except queue.Full:
@@ -108,3 +115,18 @@ class AudioCapture:
             return self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
+    
+    def set_muted(self, muted: bool) -> None:
+        """Set microphone mute state."""
+        self._muted = muted
+        logger.info("Microphone %s", "muted" if muted else "unmuted")
+    
+    def is_muted(self) -> bool:
+        """Get microphone mute state."""
+        return self._muted
+    
+    def toggle_mute(self) -> bool:
+        """Toggle microphone mute state and return new state."""
+        self._muted = not self._muted
+        logger.info("Microphone %s", "muted" if self._muted else "unmuted")
+        return self._muted
