@@ -187,8 +187,10 @@ class MPDConnection:
                     if ": " in line:
                         key, value = line.split(": ", 1)
                         
-                        # New item starts with 'file' key
-                        if key == "file" and current_item:
+                        # New item starts when MPD emits another primary key for list-like commands.
+                        # Common boundaries: file (playlist/search), outputid (outputs),
+                        # playlist (listplaylists).
+                        if key in {"file", "outputid", "playlist"} and current_item:
                             items.append(current_item)
                             current_item = {}
                         

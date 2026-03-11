@@ -998,9 +998,18 @@ async def run_orchestrator() -> None:
             alarm_manager=alarm_manager,
         )
         
-        # Load persisted timers and alarms from disk
-        await timer_manager.load_from_disk()
-        await alarm_manager.load_from_disk()
+        if config.tools_clear_on_startup:
+            cleared = await state_manager.clear_active_items()
+            logger.warning(
+                "Tool System: Cleared persisted active timers/alarms on startup "
+                "(TOOLS_CLEAR_ON_STARTUP=true, timers=%d alarms=%d)",
+                cleared.get("timers", 0),
+                cleared.get("alarms", 0),
+            )
+        else:
+            # Load persisted timers and alarms from disk
+            await timer_manager.load_from_disk()
+            await alarm_manager.load_from_disk()
         
         logger.info("✓ Tool System ready (persist_dir=%s)", timers_dir)
         print("✓ Tool System ready", flush=True)
@@ -1047,6 +1056,16 @@ async def run_orchestrator() -> None:
             stats = await music_manager.get_stats()
             song_count = int(stats.get("songs", 0))
             logger.info("MPD library has %d songs", song_count)
+
+            enabled_outputs = await music_manager.get_enabled_output_names()
+            if enabled_outputs:
+                logger.info("MPD enabled outputs: %s", ", ".join(enabled_outputs))
+                if len(enabled_outputs) == 1 and enabled_outputs[0].strip().lower() == "null output":
+                    logger.warning(
+                        "MPD is using only Null Output (silent). Check docker/mpd output routing (Pulse/ALSA)."
+                    )
+            else:
+                logger.warning("MPD reports no enabled outputs; playback will be silent")
             
             if song_count == 0:
                 logger.info("Library is empty - triggering automatic scan...")
@@ -1082,6 +1101,9 @@ async def run_orchestrator() -> None:
             music_router = None
             music_manager = None
     
+    # Embedded realtime web UI service handle (initialized later)
+    web_service = None
+
     # Media Key Detector (optional - works without music system, but won't control music)
     media_key_detector = None
     if config.media_keys_enabled:
@@ -1213,6 +1235,8 @@ async def run_orchestrator() -> None:
                     wake_state = WakeState.AWAKE
                     wake_sleep_ts = None
                     last_wake_detected_ts = time.monotonic()
+                    if web_service:
+                        web_service.note_hotword_detected()
                     last_activity_ts = time.monotonic()
                     state = VoiceState.LISTENING
                     logger.info("🎙️ System woken by %s", source_label)
@@ -1333,6 +1357,13 @@ async def run_orchestrator() -> None:
                 
                 # Play button (or mapped MSC_SCAN play) → Toggle wake/sleep
                 elif event.key in ("play_pause", "play", "pause"):
+                    dismissed = await stop_ringing_alarms_immediately("play button")
+                    if dismissed > 0:
+                        tts_stop_event.set()
+                        _tts_clear_all("alarm dismissed by play button")
+                        logger.info("🎛️ Play button consumed by alarm dismiss")
+                        return
+
                     await pause_system_media_if_needed("play button")
                     if config.wake_word_enabled and wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
@@ -1590,6 +1621,7 @@ async def run_orchestrator() -> None:
     tts_queue: deque[TTSQueueItem] = deque()
     tts_queue_event = asyncio.Event()
     tts_stop_event = threading.Event()
+    alarm_playback_stop_event = threading.Event()
     tts_playback_start_ts: float | None = None
     current_tts_text = ""
     current_tts_duration_s = 0.0
@@ -1614,6 +1646,42 @@ async def run_orchestrator() -> None:
     pending_transcripts: list[tuple[str, str]] = []  # (transcript, emotion_tag)
     debounce_task: asyncio.Task | None = None
     processing_request = False  # Flag to prevent concurrent gateway requests
+    web_service = None
+
+    if config.web_ui_enabled:
+        print("→ Starting Embedded Voice Web UI...", flush=True)
+        logger.info("→ Starting Embedded Voice Web UI service")
+        try:
+            from orchestrator.web import EmbeddedVoiceWebService
+
+            web_service = EmbeddedVoiceWebService(
+                host=config.web_ui_host,
+                ui_port=config.web_ui_port,
+                ws_port=config.web_ui_ws_port,
+                status_hz=config.web_ui_status_hz,
+                hotword_active_ms=config.web_ui_hotword_active_ms,
+            )
+            await web_service.start()
+            web_service.update_orchestrator_status(
+                voice_state=state.value,
+                wake_state=wake_state.value,
+                speech_active=False,
+                tts_playing=False,
+                mic_rms=0.0,
+                queue_depth=0,
+            )
+            logger.info(
+                "✓ Embedded Voice Web UI ready at http://%s:%d (ws://%s:%d)",
+                config.web_ui_host,
+                config.web_ui_port,
+                config.web_ui_host,
+                config.web_ui_ws_port,
+            )
+            print(f"✓ Embedded Voice Web UI ready at http://{config.web_ui_host}:{config.web_ui_port}", flush=True)
+        except Exception as exc:
+            logger.error("Failed to start embedded web UI: %s", exc)
+            print(f"✗ Embedded Voice Web UI failed to start: {exc}", flush=True)
+            web_service = None
 
     def _tts_has_pending() -> bool:
         return len(tts_queue) > 0
@@ -1640,6 +1708,27 @@ async def run_orchestrator() -> None:
             logger.info("🧹 Cleared %d queued TTS item(s): %s", dropped, reason)
         tts_queue_event.clear()
         return dropped
+
+    async def stop_ringing_alarms_immediately(source_label: str) -> int:
+        """Stop all actively ringing alarms and interrupt current alarm bell playback."""
+        if not alarm_manager:
+            return 0
+
+        alarm_playback_stop_event.set()
+        try:
+            stopped_count = await alarm_manager.stop_alarm(None)
+        finally:
+            # Allow future alarms to ring after the current dismiss action.
+            alarm_playback_stop_event.clear()
+
+        if stopped_count > 0:
+            logger.info(
+                "🔕 %s stopped %d ringing alarm%s",
+                source_label,
+                stopped_count,
+                "s" if stopped_count != 1 else "",
+            )
+        return stopped_count
 
     MAX_NOTIFICATION_QUEUE_DEPTH = 5
 
@@ -1697,7 +1786,8 @@ async def run_orchestrator() -> None:
         Keeps: periods, commas, dashes (natural for pacing/reading)
         """
         # Remove punctuation that would be read aloud
-        text = text.replace(":", "")  # colon
+        # Keep colons in time expressions (e.g., 9:45 PM), remove other colons.
+        text = re.sub(r"(?<!\d):(?!\d)", "", text)
         text = text.replace(";", "")  # semicolon
         text = text.replace('"', "")  # quote
         text = text.replace("(", "")  # open paren
@@ -2400,7 +2490,7 @@ async def run_orchestrator() -> None:
         async def on_timer_expired(timer_id: str, name: str):
             """Called when a timer expires."""
             logger.info("⏰ TIMER EXPIRED: %s (%s)", name or timer_id, timer_id)
-            # Play bell sound
+            # Play timer bell three times before speaking completion.
             bell_pcm = alert_gen.get_timer_alert_pcm()
             bell_pcm_16k = resample_pcm(bell_pcm, alert_gen.sample_rate, config.audio_sample_rate)
             try:
@@ -2408,7 +2498,10 @@ async def run_orchestrator() -> None:
                     # For duplex, would need different handling - skip for now
                     pass
                 else:
-                    await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, threading.Event())
+                    for ring_index in range(3):
+                        await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, threading.Event())
+                        if ring_index < 2:
+                            await asyncio.sleep(0.2)
             except Exception as e:
                 logger.error("Failed to play timer bell: %s", e)
             # Announce timer completion
@@ -2437,7 +2530,7 @@ async def run_orchestrator() -> None:
                     # For duplex, would need different handling - skip for now
                     pass
                 else:
-                    await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, threading.Event())
+                    await asyncio.to_thread(playback.play_pcm, bell_pcm_16k, 1.0, alarm_playback_stop_event)
             except Exception as e:
                 logger.error("Failed to play alarm bell: %s", e)
         
@@ -2471,6 +2564,9 @@ async def run_orchestrator() -> None:
     tts_rms_alpha = 0.05
     cut_in_hits = 0
     silero_zero_hits = 0
+    alarm_cut_in_hits = 0
+    last_alarm_cut_in_log_ts = 0.0
+    skip_audio_until = 0.0  # Timestamp until which audio frames are dropped (e.g. after alarm cut-in)
     speech_frame_count = 0
     min_speech_frames = max(1, int(config.vad_min_speech_ms / config.audio_frame_ms))
     
@@ -2490,6 +2586,10 @@ async def run_orchestrator() -> None:
 
             now = time.monotonic()
             frame_count += 1
+
+            # Drop audio frames during the brief post-alarm-cut-in mute window
+            if skip_audio_until and now < skip_audio_until:
+                continue
 
             if cut_in_tts_hold_active and cut_in_tts_hold_started_ts is not None:
                 hold_elapsed_ms = int((now - cut_in_tts_hold_started_ts) * 1000)
@@ -2701,6 +2801,8 @@ async def run_orchestrator() -> None:
                             wake_state = WakeState.AWAKE
                             wake_sleep_ts = None
                             last_wake_detected_ts = now
+                            if web_service:
+                                web_service.note_hotword_detected()
                             last_activity_ts = now
                             state = VoiceState.LISTENING
                             chunk_start_ts = now
@@ -2733,12 +2835,18 @@ async def run_orchestrator() -> None:
                                 chunk_frames.append(frame)
                             last_speech_ts = now
                             logger.info("Wake word detected → awake")
-                            # Play wake word click sound - DISABLED to prevent feedback loop
-                            # try:
-                            #     pcm_click = wav_bytes_to_pcm(wake_click_sound)
-                            #     asyncio.create_task(asyncio.to_thread(playback.play_pcm, pcm_click, 1.0, threading.Event()))
-                            # except Exception as exc:
-                            #     logger.debug("Failed to play wake click sound: %s", exc)
+                            if wake_click_sound:
+                                try:
+                                    asyncio.create_task(
+                                        asyncio.to_thread(
+                                            playback.play_pcm,
+                                            wake_click_sound,
+                                            float(max(0.1, config.wake_feedback_gain)),
+                                            threading.Event(),
+                                        )
+                                    )
+                                except Exception as exc:
+                                    logger.debug("Failed to play wake click sound: %s", exc)
                     await asyncio.sleep(0)
                     continue
 
@@ -2780,6 +2888,17 @@ async def run_orchestrator() -> None:
             else:
                 speech_frame_count = 0
 
+            if web_service:
+                web_service.update_orchestrator_status(
+                    voice_state=state.value,
+                    wake_state=wake_state.value,
+                    speech_active=bool(speech_hit or chunk_frames),
+                    tts_playing=tts_playing,
+                    mic_rms=rms_raw,
+                    queue_depth=len(tts_queue),
+                    wake_word_enabled=config.wake_word_enabled,
+                )
+
             if speech_frame_count >= min_speech_frames:
                 last_activity_ts = now
                 last_speech_ts = now
@@ -2793,6 +2912,38 @@ async def run_orchestrator() -> None:
                     logger.info("Speech detected → listening")
             elif chunk_frames:
                 chunk_frames.append(processed_frame)
+
+            alarm_ringing_active = bool(alarm_manager and alarm_manager.ringing_alarms)
+            if alarm_ringing_active and not tts_playing:
+                alarm_cut_in_candidate = bool(vad_result.speech_detected) and rms_raw >= config.vad_cut_in_rms
+                if alarm_cut_in_candidate:
+                    alarm_cut_in_hits += 1
+                else:
+                    alarm_cut_in_hits = 0
+
+                alarm_cut_in = alarm_cut_in_hits >= config.vad_cut_in_frames
+                if alarm_cut_in and now - last_alarm_cut_in_log_ts >= tts_speech_log_interval:
+                    logger.info(
+                        "✋ Alarm cut-in triggered! (rms_raw=%.4f, vad=%s, hits=%d/%d)",
+                        rms_raw,
+                        vad_result.speech_detected,
+                        alarm_cut_in_hits,
+                        config.vad_cut_in_frames,
+                    )
+                    print("✋ Alarm cut-in triggered → stopping alarm", flush=True)
+                    last_alarm_cut_in_log_ts = now
+
+                if alarm_cut_in:
+                    dismissed_by_cut_in = await stop_ringing_alarms_immediately("voice cut-in")
+                    if dismissed_by_cut_in > 0:
+                        logger.info("✋ Voice cut-in dismissed active alarm ringing")
+                        alarm_cut_in_hits = 0
+                        chunk_frames = []
+                        state = VoiceState.IDLE
+                        skip_audio_until = now + 0.75
+                        logger.info("✋ Dropping audio for 750ms to suppress alarm-cut-in transcript")
+            else:
+                alarm_cut_in_hits = 0
 
             if tts_playing:
                 if now - last_tts_meter_ts >= tts_meter_interval:
@@ -2856,6 +3007,10 @@ async def run_orchestrator() -> None:
                     print("✋ Cut-in triggered → stopping TTS", flush=True)
                     last_tts_speech_log_ts = now
                 if cut_in:
+                    dismissed_by_cut_in = await stop_ringing_alarms_immediately("voice cut-in")
+                    if dismissed_by_cut_in > 0:
+                        logger.info("✋ Voice cut-in dismissed active alarm ringing")
+
                     if not chunk_frames:
                         cut_in_triggered_ts = now
                         chunk_start_ts = now
@@ -2992,6 +3147,9 @@ async def run_orchestrator() -> None:
 
             await asyncio.sleep(0)
     finally:
+        if web_service:
+            logger.info("Stopping embedded web UI service...")
+            await web_service.stop()
         # Cleanup media key detector if running
         if media_key_detector:
             logger.info("Stopping media key detector...")

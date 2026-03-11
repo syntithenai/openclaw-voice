@@ -68,6 +68,10 @@ services:
       - mpd-state:/var/lib/mpd
       - ${MUSIC_LIBRARY_HOST_PATH:-${HOME}/Music}:/music:ro
       - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
+    devices:
+      - "/dev/snd:/dev/snd"
+    group_add:
+      - "audio"
 
 
   piper:

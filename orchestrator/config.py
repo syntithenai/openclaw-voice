@@ -205,12 +205,21 @@ class VoiceConfig(BaseSettings):
     quick_answer_mirror_enabled: bool = Field(False)  # Mirror QA turns to the openclaw session so they appear in web chat
     quick_answer_bypass_window_ms: int = Field(8000)  # After a transcript is sent to gateway, bypass quick answer for this many ms (0=disabled)
 
+    # Embedded realtime web UI / websocket bridge
+    web_ui_enabled: bool = Field(False)  # Serve local UI + websocket bridge for continuous browser audio
+    web_ui_host: str = Field("0.0.0.0")  # Bind address for embedded web service
+    web_ui_port: int = Field(18910)  # HTTP UI port
+    web_ui_ws_port: int = Field(18911)  # WebSocket bridge port
+    web_ui_status_hz: int = Field(12)  # Status broadcast frequency to connected clients
+    web_ui_hotword_active_ms: int = Field(2000)  # How long to keep hotword indicator active in UI after detection
+
     # Tool System
     tools_enabled: bool = Field(True)  # Enable timer/alarm tool system
     timers_enabled: bool = Field(True)  # Enable timer/alarm exposure and background monitoring
     tools_persist_dir: str = Field("timers")  # Directory for timer/alarm persistence (relative to workspace root)
     tools_debounce_ms: int = Field(75)  # Write debouncing window for alarm state updates
     tools_monitor_interval_ms: int = Field(100)  # How often to check for timer/alarm expiration
+    tools_clear_on_startup: bool = Field(True)  # Clear persisted timers/alarms at process start
 
     # Music Control (MPD)
     music_enabled: bool = Field(False)  # Enable music control via MPD
@@ -363,6 +372,23 @@ class VoiceConfig(BaseSettings):
                 logger.warning("QUICK_ANSWER_MODEL not set - will default to 'gpt-3.5-turbo' (may not match LM Studio loaded model)")
             if self.quick_answer_timeout_ms <= 0:
                 errors.append(f"QUICK_ANSWER_TIMEOUT_MS={self.quick_answer_timeout_ms} must be > 0")
+
+        # Validate embedded web UI configuration
+        if self.web_ui_enabled:
+            if not self.web_ui_host:
+                errors.append("WEB_UI_ENABLED=true but WEB_UI_HOST is empty")
+            if self.web_ui_port <= 0 or self.web_ui_port > 65535:
+                errors.append(f"WEB_UI_PORT={self.web_ui_port} must be between 1 and 65535")
+            if self.web_ui_ws_port <= 0 or self.web_ui_ws_port > 65535:
+                errors.append(f"WEB_UI_WS_PORT={self.web_ui_ws_port} must be between 1 and 65535")
+            if self.web_ui_ws_port == self.web_ui_port:
+                errors.append("WEB_UI_WS_PORT must differ from WEB_UI_PORT")
+            if self.web_ui_status_hz <= 0 or self.web_ui_status_hz > 120:
+                errors.append(f"WEB_UI_STATUS_HZ={self.web_ui_status_hz} must be between 1 and 120")
+            if self.web_ui_hotword_active_ms < 100 or self.web_ui_hotword_active_ms > 60000:
+                errors.append(
+                    f"WEB_UI_HOTWORD_ACTIVE_MS={self.web_ui_hotword_active_ms} must be between 100 and 60000"
+                )
 
         # Log and exit if critical errors found
         if errors:

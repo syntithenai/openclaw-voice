@@ -40,10 +40,14 @@ class FastPathParser:
     
     # Alarm stop patterns
     ALARM_STOP_PATTERNS = [
-        (r'stop\s+(?:all\s+)?alarms?', 'stop_alarm'),
+        # Generic stop (no label) — must come before the label-extraction pattern so
+        # articles like "the" are not accidentally captured as a label.
+        # Handles: "stop alarm", "stop alarms", "stop all alarms", "stop the alarm"
+        (r'stop\s+(?:(?:all|the)\s+)?alarms?$', 'stop_alarm'),
+        # Label-based stop: "stop the morning alarm", "stop the oven alarm"
         (r'stop\s+(?:the\s+)?(\w+)\s+alarm', 'stop_alarm_by_label'),
-        (r'dismiss\s+alarm', 'stop_alarm'),
-        (r'turn\s+off\s+alarm', 'stop_alarm'),
+        (r'dismiss\s+(?:the\s+)?alarms?', 'stop_alarm'),
+        (r'turn\s+off\s+(?:the\s+)?alarms?', 'stop_alarm'),
     ]
     
     TIME_MULTIPLIERS = {
@@ -72,7 +76,7 @@ class FastPathParser:
         Returns:
             Tuple of (action, arguments) if matched, None otherwise
         """
-        text = text.strip().lower()
+        text = text.strip().lower().rstrip('.!?,;:')
         
         for pattern, action in self.compiled_patterns:
             match = pattern.search(text)
@@ -207,19 +211,19 @@ class TimeExpressionParser:
         return None
     
     def _parse_relative_time(self, expr: str) -> Optional[float]:
-        """Parse relative time expressions like 'in 2 hours'."""
-        
-        # "in X minutes/hours"
-        match = re.search(r'in\s+(\d+)\s*(min|minute|hour|sec|second)s?', expr)
+        """Parse relative time expressions like 'in 2 hours', '10 seconds', 'for 5 minutes'."""
+
+        # Optional leading 'in'/'for', e.g. "in 2 hours", "10 seconds", "for 5 minutes"
+        match = re.search(r'(?:(?:in|for)\s+)?(\d+)\s*(min|minute|hour|sec|second)s?(?:\b|$)', expr)
         if match:
             amount = int(match.group(1))
             unit = match.group(2)
-            
+
             multiplier = FastPathParser.TIME_MULTIPLIERS.get(unit, 60)
             delta_seconds = amount * multiplier
-            
+
             return time.time() + delta_seconds
-        
+
         return None
     
     def _time_to_timestamp(self, hour: int, minute: int) -> float:

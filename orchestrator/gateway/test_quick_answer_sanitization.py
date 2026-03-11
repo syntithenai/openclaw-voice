@@ -13,3 +13,27 @@ def test_sanitize_quick_answer_text_collapses_whitespace_after_strip() -> None:
 
 def test_sanitize_quick_answer_text_handles_non_string() -> None:
     assert sanitize_quick_answer_text(None) == ""
+
+
+def test_sanitize_quick_answer_text_extracts_nested_tool_result_response() -> None:
+    payload = {
+        "success": True,
+        "result": {
+            "alarm_id": "123",
+            "trigger_time": 1773234000.0,
+            "label": "",
+            "response": "Alarm set for 12:00 AM",
+        },
+    }
+    assert sanitize_quick_answer_text(payload) == "Alarm set for 12:00 AM"
+
+
+def test_sanitize_quick_answer_text_falls_back_to_label() -> None:
+    payload = {
+        "success": True,
+        "result": {
+            "alarm_id": "123",
+            "label": "wake up",
+        },
+    }
+    assert sanitize_quick_answer_text(payload) == "wake up"

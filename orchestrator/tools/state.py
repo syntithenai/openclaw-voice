@@ -287,3 +287,41 @@ class StateManager:
         
         except Exception as e:
             logger.error(f"StateManager: Failed to log event: {e}")
+
+    async def clear_active_items(self) -> Dict[str, int]:
+        """Delete all persisted active timer/alarm records.
+
+        Returns:
+            Dict with counts for removed timer and alarm files.
+        """
+        removed_timers = 0
+        removed_alarms = 0
+
+        async with self.write_lock:
+            # Drop buffered writes for active timer/alarm records we're about to delete.
+            buffer_keys_to_remove = [
+                key
+                for key in self.write_buffer.keys()
+                if key.startswith(str(self.timers_dir / "timer-")) or key.startswith(str(self.timers_dir / "alarm-"))
+            ]
+            for key in buffer_keys_to_remove:
+                self.write_buffer.pop(key, None)
+
+        for filepath in self.timers_dir.glob("timer-*.json"):
+            try:
+                filepath.unlink(missing_ok=True)
+                removed_timers += 1
+            except Exception as exc:
+                logger.error("StateManager: Failed to remove timer file %s: %s", filepath.name, exc)
+
+        for filepath in self.timers_dir.glob("alarm-*.json"):
+            try:
+                filepath.unlink(missing_ok=True)
+                removed_alarms += 1
+            except Exception as exc:
+                logger.error("StateManager: Failed to remove alarm file %s: %s", filepath.name, exc)
+
+        return {
+            "timers": removed_timers,
+            "alarms": removed_alarms,
+        }

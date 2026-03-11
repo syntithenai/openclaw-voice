@@ -73,6 +73,27 @@ class ToolMonitor:
             except Exception as e:
                 logger.error(f"ToolMonitor: Error in monitoring loop: {e}", exc_info=True)
                 await asyncio.sleep(self.check_interval)
+
+    async def _invoke_monitor_callback(self, callback: Callable, obj) -> None:
+        """Invoke callback with modern (id, label) signature, with legacy fallback.
+
+        Preferred callback signature:
+            callback(item_id: str, name: str)
+
+        Legacy fallback:
+            callback(item_obj)
+        """
+        try:
+            result = callback(obj.id, getattr(obj, "label", ""))
+            if asyncio.iscoroutine(result):
+                await result
+            return
+        except TypeError:
+            pass
+
+        result = callback(obj)
+        if asyncio.iscoroutine(result):
+            await result
     
     async def _check_timers(self):
         """Check for expired timers."""
@@ -85,7 +106,7 @@ class ToolMonitor:
                 # Invoke callback if set
                 if self.on_timer_expired:
                     try:
-                        await self.on_timer_expired(timer)
+                        await self._invoke_monitor_callback(self.on_timer_expired, timer)
                     except Exception as e:
                         logger.error(f"ToolMonitor: Timer callback failed: {e}")
                 
@@ -117,7 +138,7 @@ class ToolMonitor:
                 # Invoke callback if set
                 if self.on_alarm_triggered:
                     try:
-                        await self.on_alarm_triggered(alarm)
+                        await self._invoke_monitor_callback(self.on_alarm_triggered, alarm)
                     except Exception as e:
                         logger.error(f"ToolMonitor: Alarm trigger callback failed: {e}")
                 
@@ -135,7 +156,7 @@ class ToolMonitor:
             elif alarm.ringing:
                 if self.on_alarm_ringing:
                     try:
-                        await self.on_alarm_ringing(alarm)
+                        await self._invoke_monitor_callback(self.on_alarm_ringing, alarm)
                     except Exception as e:
                         logger.error(f"ToolMonitor: Alarm ringing callback failed: {e}")
     

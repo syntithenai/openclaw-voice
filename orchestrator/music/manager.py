@@ -162,6 +162,24 @@ class MusicManager:
         except Exception as e:
             logger.error(f"Failed to get stats: {e}")
             return {}
+
+    async def get_outputs(self) -> List[Dict[str, str]]:
+        """Return configured MPD audio outputs."""
+        try:
+            return await self.pool.execute_list("outputs")
+        except Exception as e:
+            logger.error(f"Failed to get outputs: {e}")
+            return []
+
+    async def get_enabled_output_names(self) -> List[str]:
+        """Return enabled output names from MPD outputs list."""
+        outputs = await self.get_outputs()
+        enabled: List[str] = []
+        for output in outputs:
+            name = output.get("outputname", "unknown")
+            if str(output.get("outputenabled", "0")).strip() == "1":
+                enabled.append(name)
+        return enabled
     
     # ========== Search and Browse ==========
     

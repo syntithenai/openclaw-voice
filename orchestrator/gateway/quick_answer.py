@@ -27,18 +27,52 @@ def get_random_thinking_phrase() -> str:
     """Get a random thinking phrase for gateway escalation."""
     return random.choice(THINKING_PHRASES)
 
-    def sanitize_quick_answer_text(text: str) -> str:
-        """Normalize quick-answer text for speech-friendly playback.
 
-        The quick-answer path can emit markdown emphasis markers (e.g. *italic*, **bold**),
-        which are sometimes spoken literally by TTS engines. Strip those markers while
-        preserving the underlying words.
-        """
-        if not isinstance(text, str):
-            return ""
+def _preview(value: object, limit: int = 100) -> str:
+    """Safe string preview for logging that never assumes sliceable types."""
+    return str(value)[:limit]
 
-        cleaned = text.replace("**", "").replace("*", "")
-        return re.sub(r"\s+", " ", cleaned).strip()
+
+def _extract_spoken_text_candidate(value: object) -> str:
+    """Extract best-effort human-friendly speech text from mixed payloads."""
+    if value is None:
+        return ""
+
+    if isinstance(value, dict):
+        # Preferred direct message keys
+        for key in ("response", "text", "content", "message", "error", "label", "name"):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate
+
+        # Common nested tool payload wrappers
+        for nested_key in ("result", "data"):
+            if nested_key in value:
+                nested_candidate = _extract_spoken_text_candidate(value.get(nested_key))
+                if nested_candidate:
+                    return nested_candidate
+
+        # Last resort for dicts: avoid speaking full JSON blobs
+        return ""
+
+    if isinstance(value, list):
+        parts = [_extract_spoken_text_candidate(item) for item in value]
+        return " ".join(part for part in parts if part)
+
+    return str(value)
+
+
+def sanitize_quick_answer_text(text: object) -> str:
+    """Normalize quick-answer content for speech-friendly playback.
+
+    Accepts either a plain string or structured tool-router payloads and returns
+    spoken text with markdown emphasis markers removed.
+    """
+    candidate = _extract_spoken_text_candidate(text)
+
+    candidate = str(candidate)
+    cleaned = candidate.replace("**", "").replace("*", "")
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 QUICK_ANSWER_BASE_SYSTEM_PROMPT = """You are a strict validation gatekeeper. Your sole objective is to provide immediate answers only when they are factual, indisputable, and concise.
@@ -206,7 +240,7 @@ TIMER_TOOL_DEFINITIONS = [
                 "properties": {
                     "time_str": {
                         "type": "string",
-                        "description": "Time in format like '6:30 AM', '18:30', 'tomorrow 9am'"
+                        "description": "Time as absolute clock time ('6:30 AM', '18:30', 'tomorrow 9am') or relative duration ('in 2 hours', 'in 30 minutes', 'in 10 seconds'). Always include the word 'in' for relative durations."
                     },
                     "name": {
                         "type": "string",
@@ -639,14 +673,14 @@ class QuickAnswerClient:
         if self.music_enabled and self.music_router:
             music_result = await self.music_router.handle_request(user_query, use_fast_path=True)
             if music_result is not None:
-                logger.info("← QUICK ANSWER: Music fast-path execution: %s", music_result[:100])
+                logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
         
         # Try timer/alarm fast-path
         if self.timers_enabled and self.tool_router:
             fast_path_result = await self.tool_router.try_deterministic_parse(user_query)
             if fast_path_result is not None:
-                logger.info("← QUICK ANSWER: Fast-path tool execution: %s", fast_path_result[:100])
+                logger.info("← QUICK ANSWER: Fast-path tool execution: %s", _preview(fast_path_result))
                 return False, sanitize_quick_answer_text(fast_path_result)
         
         # If neither system is enabled, fall back to regular quick answer
@@ -714,6 +748,57 @@ class QuickAnswerClient:
                         try:
                             import json
                             args_dict = json.loads(func_args) if isinstance(func_args, str) else func_args
+
+                            # LLM may emit bare numeric alarm args (e.g., 5) and drop units from
+                            # the function arguments even when user said "five seconds".
+                            # Recover unit hints from the original transcript.
+                            if func_name == "set_alarm" and isinstance(args_dict, dict):
+                                raw_time = args_dict.get("time_str")
+                                if raw_time in (None, ""):
+                                    raw_time = args_dict.get("trigger_time")
+                                lowered_query = user_query.lower()
+                                inferred_unit = None
+                                if re.search(r"\bsec(?:ond)?s?\b", lowered_query):
+                                    inferred_unit = "second"
+                                elif re.search(r"\bmin(?:ute)?s?\b", lowered_query):
+                                    inferred_unit = "minute"
+                                elif re.search(r"\bhour?s?\b", lowered_query):
+                                    inferred_unit = "hour"
+
+                                if inferred_unit is not None:
+                                    args_dict["time_unit_hint"] = inferred_unit
+
+                                _relative_unit_re = re.compile(
+                                    r'^(\d+)\s*(sec(?:ond)?|min(?:ute)?|hour)s?$',
+                                    re.IGNORECASE,
+                                )
+                                _rel_match = isinstance(raw_time, str) and _relative_unit_re.match(raw_time.strip())
+                                if isinstance(raw_time, (int, float)) or (
+                                    isinstance(raw_time, str) and raw_time.strip().isdigit()
+                                ):
+                                    amount = int(str(raw_time).strip())
+                                    if amount > 0:
+                                        if inferred_unit is not None:
+                                            normalized = f"in {amount} {inferred_unit}{'s' if amount != 1 else ''}"
+                                            args_dict["time_str"] = normalized
+                                            logger.info(
+                                                "↺ Normalized set_alarm numeric arg from transcript context: %s",
+                                                normalized,
+                                            )
+                                elif _rel_match:
+                                    # e.g. "10 seconds" — LLM passed relative expression without 'in' prefix
+                                    amount = int(_rel_match.group(1))
+                                    raw_unit = _rel_match.group(2).lower()
+                                    # Normalise abbreviations to full unit name
+                                    unit_map = {"sec": "second", "second": "second", "min": "minute", "minute": "minute", "hour": "hour"}
+                                    unit_full = unit_map.get(raw_unit, raw_unit)
+                                    if amount > 0:
+                                        normalized = f"in {amount} {unit_full}{'s' if amount != 1 else ''}"
+                                        args_dict["time_str"] = normalized
+                                        logger.info(
+                                            "↺ Normalized set_alarm relative-unit arg: %s",
+                                            normalized,
+                                        )
                             
                             # Route to appropriate handler
                             if func_name.startswith("music_") and self.music_enabled and self.music_router:
@@ -723,7 +808,7 @@ class QuickAnswerClient:
                             else:
                                 result = f"Tool handler not available for {func_name}"
                             
-                            results.append(result)
+                            results.append(sanitize_quick_answer_text(result))
                         except Exception as e:
                             logger.error("Tool execution failed for %s: %s", func_name, e)
                             results.append(f"Error: {str(e)}")

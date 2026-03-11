@@ -83,8 +83,15 @@ class ToolRouter:
             logger.error(f"ToolRouter: Tool execution failed for {tool_name}: {e}")
             return {"error": str(e)}
     
-    async def set_timer(self, duration_seconds: int, label: str = "") -> Dict[str, Any]:
+    async def set_timer(
+        self,
+        duration_seconds: int,
+        label: str = "",
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Set a timer."""
+        if name and not label:
+            label = name
         timer_id = await self.timer_manager.set_timer(duration_seconds, label)
         
         minutes = duration_seconds // 60
@@ -107,8 +114,15 @@ class ToolRouter:
             "response": response
         }
     
-    async def cancel_timer(self, timer_id: Optional[str] = None, label: Optional[str] = None) -> Dict[str, Any]:
+    async def cancel_timer(
+        self,
+        timer_id: Optional[str] = None,
+        label: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Cancel timer(s)."""
+        if name and not label:
+            label = name
         if label:
             count = await self.timer_manager.cancel_timer_by_label(label)
             response = f"Cancelled {count} timer{'s' if count != 1 else ''}" if count > 0 else f"No timer found with label {label}"
@@ -167,8 +181,44 @@ class ToolRouter:
             "response": response
         }
     
-    async def set_alarm(self, trigger_time: str, label: str = "") -> Dict[str, Any]:
+    async def set_alarm(
+        self,
+        trigger_time: Optional[str] = None,
+        label: str = "",
+        time_str: Optional[str] = None,
+        name: Optional[str] = None,
+        time_unit_hint: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Set an alarm."""
+        if name and not label:
+            label = name
+        if time_str and not trigger_time:
+            trigger_time = time_str
+
+        # LLM tool-calls sometimes send shorthand values like 5 or "5".
+        # Use optional unit hint when available; otherwise default to minutes.
+        if isinstance(trigger_time, (int, float)):
+            amount = int(trigger_time)
+            if amount <= 0:
+                return {"error": f"Could not parse time expression: {trigger_time}"}
+            unit = (time_unit_hint or "minute").strip().lower()
+            if unit not in {"second", "minute", "hour"}:
+                unit = "minute"
+            trigger_time = f"in {amount} {unit}{'s' if amount != 1 else ''}"
+        elif isinstance(trigger_time, str):
+            stripped = trigger_time.strip()
+            if stripped.isdigit():
+                amount = int(stripped)
+                if amount <= 0:
+                    return {"error": f"Could not parse time expression: {trigger_time}"}
+                unit = (time_unit_hint or "minute").strip().lower()
+                if unit not in {"second", "minute", "hour"}:
+                    unit = "minute"
+                trigger_time = f"in {amount} {unit}{'s' if amount != 1 else ''}"
+
+        if not trigger_time:
+            return {"error": "Missing required time string"}
+
         # Parse time expression
         timestamp = time_parser.parse_alarm_time(trigger_time)
         
@@ -191,14 +241,37 @@ class ToolRouter:
             "response": response
         }
     
-    async def cancel_alarm(self, alarm_id: str) -> Dict[str, Any]:
+    async def cancel_alarm(
+        self,
+        alarm_id: Optional[str] = None,
+        name: Optional[str] = None,
+        label: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Cancel an alarm."""
-        success = await self.alarm_manager.cancel_alarm(alarm_id)
-        response = "Alarm cancelled" if success else "Alarm not found"
-        return {"success": success, "response": response}
+        if name and not label:
+            label = name
+
+        if label:
+            count = await self.alarm_manager.cancel_alarm_by_label(label)
+            response = f"Cancelled {count} alarm{'s' if count != 1 else ''}" if count > 0 else f"No alarm found with label {label}"
+            return {"cancelled_count": count, "response": response}
+
+        if alarm_id:
+            success = await self.alarm_manager.cancel_alarm(alarm_id)
+            response = "Alarm cancelled" if success else "Alarm not found"
+            return {"success": success, "response": response}
+
+        return {"error": "Must specify alarm_id or name"}
     
-    async def stop_alarm(self, alarm_id: Optional[str] = None, label: Optional[str] = None) -> Dict[str, Any]:
+    async def stop_alarm(
+        self,
+        alarm_id: Optional[str] = None,
+        label: Optional[str] = None,
+        name: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Stop ringing alarm(s)."""
+        if name and not label:
+            label = name
         if label:
             count = await self.alarm_manager.stop_alarm_by_label(label)
             response = f"Stopped {count} alarm{'s' if count != 1 else ''}" if count > 0 else f"No ringing alarm found with label {label}"

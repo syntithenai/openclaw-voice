@@ -27,6 +27,15 @@ Configurable confidence thresholds and automatic cooldown to prevent false posit
 - **Text-to-Speech** - Piper neural TTS with voice selection and speed control
 - **Optional Emotion Detection** - SenseVoice integration for emotion tagging
 
+### 🧰 Skills & Tooling
+- **Timer & Alarm Skills** - File-backed timer/alarm tools with background monitoring, ringing state, and spoken notifications
+- **Music Player Skill (MPD)** - Play/pause/next/previous, set volume, list/load playlists, and resume-on-wake workflows
+- **Quick Answer + Tool Calls** - Fast local factual answers with deterministic tool fast-paths and upstream escalation for complex tasks
+
+### 🖥️ Realtime Web UI
+- **Embedded Realtime Voice UI** - Browser-facing realtime service and widget for live transcript/assistant interaction flows
+- **Session-Aware UX** - Supports mirrored quick-answer turns and low-latency voice interaction state updates
+
 ### 🌐 Gateway Support
 Universal gateway adapter supporting:
 - **OpenClaw** - Primary OpenClaw gateway with WebSocket streaming
@@ -529,6 +538,7 @@ EMOTION_MODELS_DIR=docker/emotion-models
 
 ## 📚 Additional Documentation
 
+- **[EMBEDDED_WEB_UI.md](EMBEDDED_WEB_UI.md)** - Setup and embedding guide for the realtime browser voice widget
 - **[WAKEWORD_ENGINES.md](WAKEWORD_ENGINES.md)** - Detailed comparison of wake word engines and model selection
 - **[RASPBIAN_INSTALL.md](RASPBIAN_INSTALL.md)** - Comprehensive Raspberry Pi installation guide
 - **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Common commands and troubleshooting

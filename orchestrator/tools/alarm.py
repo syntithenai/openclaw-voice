@@ -132,6 +132,27 @@ class AlarmManager:
         
         logger.info(f"Alarm: Cancelled alarm {alarm_id} ({alarm.label})")
         return True
+
+    async def cancel_alarm_by_label(self, label: str) -> int:
+        """Cancel future alarms by label.
+
+        Returns the number of alarms cancelled.
+        """
+        target = (label or "").strip().lower()
+        if not target:
+            return 0
+
+        alarm_ids = [
+            alarm_id
+            for alarm_id, alarm in self.alarms.items()
+            if alarm.enabled and not alarm.triggered and (alarm.label or "").strip().lower() == target
+        ]
+
+        cancelled = 0
+        for alarm_id in alarm_ids:
+            if await self.cancel_alarm(alarm_id):
+                cancelled += 1
+        return cancelled
     
     async def stop_alarm(self, alarm_id: Optional[str] = None) -> int:
         """
