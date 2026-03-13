@@ -2,6 +2,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from typing import Callable, Optional, Tuple, Union
 
 import numpy as np
@@ -41,6 +42,9 @@ class DuplexAudioIO:
         self._call_stop_events: dict[int, Optional[threading.Event]] = {}
         self._cancelled_calls: set[int] = set()
         self._current: Optional[Tuple[np.ndarray, int, Optional[threading.Event], int]] = None
+        self._bg_chunks: deque[np.ndarray] = deque()
+        self._bg_chunk_offset = 0
+        self._bg_lock = threading.Lock()
 
     def set_playback_callback(self, callback: Callable[[bytes], None]) -> None:
         self._on_playback_frame = callback
@@ -115,6 +119,9 @@ class DuplexAudioIO:
 
         # Output playback
         outdata.fill(0)
+        bg_only = self._dequeue_background_frames(frames)
+        if bg_only is not None:
+            outdata[:] = bg_only
         while True:
             if self._current is None:
                 try:
@@ -158,6 +165,10 @@ class DuplexAudioIO:
             outdata[:count] = data[idx:idx + count]
             if count < frames:
                 outdata[count:] = 0
+
+            bg_overlay = self._dequeue_background_frames(count)
+            if bg_overlay is not None:
+                outdata[:count] = np.clip(outdata[:count] + bg_overlay, -1.0, 1.0)
 
             if self._on_playback_frame:
                 out_pcm = (outdata[:count].flatten() * 32767).astype(np.int16).tobytes()
@@ -261,3 +272,47 @@ class DuplexAudioIO:
             if stop_event is not None and stop_event.is_set():
                 self._cancel_call(call_id)
                 break
+
+    def enqueue_background_pcm(self, pcm: bytes) -> None:
+        """Queue background music PCM (mono int16 at output sample rate) for mixed playback."""
+        if not pcm:
+            return
+        data = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32767.0
+        if data.size == 0:
+            return
+        chunk = data.reshape(-1, 1)
+        with self._bg_lock:
+            self._bg_chunks.append(chunk)
+            max_chunks = 120
+            while len(self._bg_chunks) > max_chunks:
+                self._bg_chunks.popleft()
+
+    def _dequeue_background_frames(self, frame_count: int) -> Optional[np.ndarray]:
+        if frame_count <= 0:
+            return None
+        with self._bg_lock:
+            if not self._bg_chunks:
+                return None
+
+            out = np.zeros((frame_count, 1), dtype=np.float32)
+            written = 0
+            while written < frame_count and self._bg_chunks:
+                current = self._bg_chunks[0]
+                available = current.shape[0] - self._bg_chunk_offset
+                if available <= 0:
+                    self._bg_chunks.popleft()
+                    self._bg_chunk_offset = 0
+                    continue
+
+                take = min(frame_count - written, available)
+                out[written:written + take] = current[self._bg_chunk_offset:self._bg_chunk_offset + take]
+                written += take
+                self._bg_chunk_offset += take
+
+                if self._bg_chunk_offset >= current.shape[0]:
+                    self._bg_chunks.popleft()
+                    self._bg_chunk_offset = 0
+
+            if written == 0:
+                return None
+            return out

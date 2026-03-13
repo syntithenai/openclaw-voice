@@ -322,6 +322,27 @@ GATEWAY_AGENT_ID=voice
 VOICE_SESSION_PREFIX=voiceorch
 
 # ==============================================================================
+# MUSIC / MPD (optional)
+# ==============================================================================
+MUSIC_ENABLED=false
+MPD_HOST=localhost
+MPD_PORT=6600
+MPD_FIFO_HOST_PATH=/tmp/openclaw-mpd-fifo
+MPD_FIFO_ENABLED=false
+MPD_FIFO_PATH=/tmp/openclaw-mpd-fifo/music.pcm
+MPD_FIFO_SAMPLE_RATE=44100
+MPD_FIFO_CHANNELS=2
+MPD_FIFO_BITS_PER_SAMPLE=16
+MPD_FIFO_CHUNK_BYTES=16384
+MPD_MIX_GAIN=1.0
+MPD_MIX_DUCK_TTS_GAIN=0.30
+MPD_MIX_DUCK_ALARM_GAIN=0.12
+MPD_MIX_DUCK_LISTENING_GAIN=0.25
+SNAPCAST_ENABLED=false
+SNAPCAST_HOST=localhost
+SNAPCAST_PORT=1705
+
+# ==============================================================================
 # EMOTION DETECTION (OPTIONAL)
 # ==============================================================================
 EMOTION_ENABLED=false
@@ -333,6 +354,10 @@ EMOTION_MODELS_DIR=docker/emotion-models
 SENSEVOICE_MODEL_PATH=iic/SenseVoiceSmall
 ENVEOF
 echo '  ✓ .env configured with host IP: $LOCAL_HOST_IP'"
+
+ssh "$PI_SSH_ALIAS" "mkdir -p /tmp/openclaw-mpd-fifo && chmod 0777 /tmp/openclaw-mpd-fifo && \
+    ( [ -p /tmp/openclaw-mpd-fifo/music.pcm ] || (rm -f /tmp/openclaw-mpd-fifo/music.pcm && mkfifo -m 0666 /tmp/openclaw-mpd-fifo/music.pcm) ) && \
+    chmod 0666 /tmp/openclaw-mpd-fifo/music.pcm || true"
 
 # Ensure wakeword resources are available for all engines
 echo ""

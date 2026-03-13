@@ -59,6 +59,7 @@ from orchestrator.audio.sounds import (
     generate_exhale_sound,
 )
 from orchestrator.metrics import AECStatus, WakeWordResult
+from orchestrator.services.mpd_manager import MPDManager
 import numpy as np
 
 
@@ -479,6 +480,13 @@ def validate_runtime_config(config: VoiceConfig) -> None:
         )
     else:
         logger.info("  ✓ Audio output gain: %.2fx", config.audio_output_gain)
+
+    if not (0.1 <= config.tts_relative_gain <= 2.0):
+        errors.append(
+            f"TTS_RELATIVE_GAIN={config.tts_relative_gain} out of range (must be 0.1-2.0)"
+        )
+    else:
+        logger.info("  ✓ TTS relative gain: %.2fx", config.tts_relative_gain)
     
     # TTS speed
     if not (0.5 <= config.piper_speed <= 5.0):
@@ -950,6 +958,21 @@ async def run_orchestrator() -> None:
     logger.info("✓ Gateway ready in %dms", gateway_elapsed)
     print(f"✓ Gateway ready in {gateway_elapsed}ms", flush=True)
     
+    # MPD (Music Player Daemon)
+    print("→ Starting MPD...", flush=True)
+    mpd_manager = MPDManager(mpd_port=6600, mpd_host="127.0.0.1")
+    mpd_start = time.monotonic()
+    if mpd_manager.start():
+        if mpd_manager.wait_for_ready(timeout_sec=5):
+            mpd_elapsed = int((time.monotonic() - mpd_start) * 1000)
+            logger.info("✓ MPD ready in %dms", mpd_elapsed)
+            print(f"✓ MPD ready in {mpd_elapsed}ms", flush=True)
+        else:
+            logger.warning("MPD started but did not become ready within timeout")
+    else:
+        logger.warning("Failed to start MPD; music features may be unavailable")
+        mpd_manager = None
+    
     # Use the session prefix directly as a stable session name rather than appending a
     # timestamp.  A stable name means all voice interactions accumulate in one persistent
     # session (e.g. agent:voice:main) so the web chat UI always shows the full history.
@@ -1050,7 +1073,12 @@ async def run_orchestrator() -> None:
                         raise
             
             # Initialize music manager
-            music_manager = MusicManager(mpd_pool)
+            music_manager = MusicManager(
+                mpd_pool,
+                genre_queue_limit=config.music_genre_queue_limit,
+                pipewire_stream_normalize_enabled=config.music_pipewire_stream_normalize_enabled,
+                pipewire_stream_target_percent=config.music_pipewire_stream_target_percent,
+            )
             
             # Check if library is empty and auto-update if needed
             stats = await music_manager.get_stats()
@@ -1062,7 +1090,13 @@ async def run_orchestrator() -> None:
                 logger.info("MPD enabled outputs: %s", ", ".join(enabled_outputs))
                 if len(enabled_outputs) == 1 and enabled_outputs[0].strip().lower() == "null output":
                     logger.warning(
-                        "MPD is using only Null Output (silent). Check docker/mpd output routing (Pulse/ALSA)."
+                        "MPD is using only Null Output (silent). Check orchestrator container audio routing (Pulse/ALSA)."
+                    )
+                elif len(enabled_outputs) > 1:
+                    logger.warning(
+                        "MPD has multiple outputs enabled (%s). Ducking may sound inconsistent depending on active route; "
+                        "prefer a single primary output with software mixer.",
+                        ", ".join(enabled_outputs),
                     )
             else:
                 logger.warning("MPD reports no enabled outputs; playback will be silent")
@@ -1140,10 +1174,9 @@ async def run_orchestrator() -> None:
                         return False
 
                     try:
-                        playback_state = await music_manager.get_playback_state()
-                        if playback_state == "play":
+                        paused = await music_manager.pause_if_playing()
+                        if paused:
                             logger.info("🎵 Pausing music for %s", source_label)
-                            await music_manager.pause()
                             music_paused_for_wake = True
                             music_auto_resume_timer = 0.0
                             return True
@@ -1191,6 +1224,29 @@ async def run_orchestrator() -> None:
                     except Exception as e:
                         logger.debug("Error restoring music after %s: %s", source_label, e)
 
+                def play_feedback_async(
+                    pcm: bytes | None,
+                    gain: float,
+                    label: str,
+                    stop_event: threading.Event | None = None,
+                ) -> None:
+                    """Play short cues in background with explicit error logging."""
+                    if not pcm:
+                        return
+
+                    async def _runner() -> None:
+                        try:
+                            await asyncio.to_thread(
+                                playback.play_pcm,
+                                pcm,
+                                float(gain),
+                                stop_event if stop_event is not None else threading.Event(),
+                            )
+                        except Exception as exc:
+                            logger.error("Failed to play %s: %s", label, exc)
+
+                    asyncio.create_task(_runner())
+
                 async def adjust_output_volume(direction: int):
                     nonlocal tts_base_gain, tts_gain
 
@@ -1219,13 +1275,21 @@ async def run_orchestrator() -> None:
                         except Exception as e:
                             logger.debug("Failed to adjust music volume: %s", e)
 
+                    # Play feedback click proportional to current volume level.
+                    if volume_click_sound:
+                        try:
+                            normalized_level = (tts_base_gain - 0.2) / max(0.01, 3.0 - 0.2)
+                            base_click_gain = float(max(0.0, config.volume_feedback_gain))
+                            feedback_gain = float(min(3.0, base_click_gain * (0.75 + 0.5 * normalized_level)))
+                            play_feedback_async(volume_click_sound, feedback_gain, "volume feedback click")
+                        except Exception as e:
+                            logger.debug("Failed to play volume feedback click: %s", e)
+
                 async def trigger_wake(source_label: str):
                     nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
                     nonlocal music_paused_for_wake, state
 
                     logger.info("🎙️ %s - triggering wake word sequence", source_label)
-
-                    await pause_music_for_wake(source_label)
                     tts_stop_event.set()
 
                     if capture and hasattr(capture, 'is_muted') and capture.is_muted():
@@ -1243,16 +1307,17 @@ async def run_orchestrator() -> None:
 
                     if wake_click_sound:
                         try:
-                            asyncio.create_task(
-                                asyncio.to_thread(
-                                    playback.play_pcm,
-                                    wake_click_sound,
-                                    float(max(0.1, config.wake_feedback_gain)),
-                                    threading.Event(),
-                                )
+                            play_feedback_async(
+                                wake_click_sound,
+                                float(max(0.1, config.wake_feedback_gain)),
+                                "wake click",
                             )
                         except Exception as e:
                             logger.debug("Failed to play wake click: %s", e)
+
+                    # Pause music in background so wake click and state transition are immediate.
+                    if config.music_enabled and music_manager:
+                        asyncio.create_task(pause_music_for_wake(source_label))
 
                 async def trigger_sleep(source_label: str):
                     nonlocal wake_state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
@@ -1319,13 +1384,10 @@ async def run_orchestrator() -> None:
 
                     if timeout_swoosh_sound:
                         try:
-                            asyncio.create_task(
-                                asyncio.to_thread(
-                                    playback.play_pcm,
-                                    timeout_swoosh_sound,
-                                    float(max(0.1, config.sleep_feedback_gain)),
-                                    threading.Event(),
-                                )
+                            play_feedback_async(
+                                timeout_swoosh_sound,
+                                float(max(0.1, config.sleep_feedback_gain)),
+                                "sleep swoosh",
                             )
                         except Exception as e:
                             logger.debug("Failed to play sleep swoosh: %s", e)
@@ -1364,7 +1426,8 @@ async def run_orchestrator() -> None:
                         logger.info("🎛️ Play button consumed by alarm dismiss")
                         return
 
-                    await pause_system_media_if_needed("play button")
+                    asyncio.create_task(pause_system_media_if_needed("play button"))
+
                     if config.wake_word_enabled and wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
                     else:
@@ -1372,17 +1435,17 @@ async def run_orchestrator() -> None:
                 
                 # Next/Previous track → Also trigger wake (instead of skipping tracks)
                 elif event.key in ("next", "previous"):
-                    await pause_system_media_if_needed("play button")
+                    asyncio.create_task(pause_system_media_if_needed("play button"))
                     await trigger_wake("play button")
                 
                 # Long press play button (0.5s+) → Alternative wake trigger (if supported)
                 elif event.key == "play_pause_long":
-                    await pause_system_media_if_needed("play button long-press")
+                    asyncio.create_task(pause_system_media_if_needed("play button long-press"))
                     await trigger_wake("play button long-press")
                 
                 # Phone button → Trigger wake word (stop audio, notification sound, unmute mic, wake system)
                 elif event.key == "phone":
-                    await pause_system_media_if_needed("phone button")
+                    asyncio.create_task(pause_system_media_if_needed("phone button"))
                     await trigger_wake("phone button")
                 
                 # Volume controls -> orchestrator-managed TTS + music volume.
@@ -1605,6 +1668,38 @@ async def run_orchestrator() -> None:
         )
     else:
         timeout_swoosh_sound = generate_swoosh_sound(sample_rate=config.audio_sample_rate)
+
+    volume_click_sound = generate_click_sound(
+        sample_rate=config.audio_sample_rate,
+        duration_ms=10,
+        frequency=3000,
+    )
+    if volume_click_sound and volume_click_sound.startswith(b"RIFF"):
+        volume_click_sound = wav_bytes_to_pcm(volume_click_sound)
+
+    def play_feedback_async(
+        pcm: bytes | None,
+        gain: float,
+        label: str,
+        stop_event: threading.Event | None = None,
+    ) -> None:
+        """Play short cues in background with explicit error logging."""
+        if not pcm:
+            return
+
+        async def _runner() -> None:
+            try:
+                await asyncio.to_thread(
+                    playback.play_pcm,
+                    pcm,
+                    float(gain),
+                    stop_event if stop_event is not None else threading.Event(),
+                )
+            except Exception as exc:
+                logger.error("Failed to play %s: %s", label, exc)
+
+        asyncio.create_task(_runner())
+
     aec = WebRTCAEC(
         sample_rate=config.audio_sample_rate,
         frame_ms=config.audio_frame_ms,
@@ -1885,6 +1980,7 @@ async def run_orchestrator() -> None:
     async def send_debounced_transcripts() -> None:
         """Send accumulated transcripts after debounce period."""
         nonlocal pending_transcripts, processing_request, debounce_task
+        nonlocal music_paused_for_wake, music_auto_resume_timer
         
         # If already processing, let that task handle everything
         if processing_request:
@@ -1917,6 +2013,20 @@ async def run_orchestrator() -> None:
                 logger.info("⊘ Debounced transcript became empty after normalization; skipping quick answer and gateway")
                 pending_transcripts.clear()
                 return
+
+            # Belt-and-suspenders: if user explicitly asked to stop/pause music,
+            # clear wake-pause auto-resume state immediately so music cannot
+            # restart on the silence timer path.
+            if config.music_enabled and music_router:
+                try:
+                    parsed_music = music_router.parser.parse(combined_transcript)
+                except Exception:
+                    parsed_music = None
+                if parsed_music and parsed_music[0] == "stop":
+                    if music_paused_for_wake or music_auto_resume_timer != 0.0:
+                        logger.info("🎵 Explicit stop intent detected → clearing wake pause/auto-resume state")
+                    music_paused_for_wake = False
+                    music_auto_resume_timer = 0.0
             
             # Increment request ID for new user message
             nonlocal current_request_id
@@ -1928,11 +2038,18 @@ async def run_orchestrator() -> None:
             should_send_to_gateway = True
             nonlocal last_gateway_send_ts, last_thinking_phrase_ts
             bypass_window_ms = config.quick_answer_bypass_window_ms
+            is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
             in_bypass_window = (
                 bypass_window_ms > 0
                 and last_gateway_send_ts is not None
                 and (time.monotonic() - last_gateway_send_ts) * 1000 < bypass_window_ms
             )
+            if in_bypass_window and is_music_query:
+                logger.info(
+                    "⏩ QA bypass override: music command detected; running quick-answer/tool path despite %dms bypass window",
+                    bypass_window_ms,
+                )
+                in_bypass_window = False
             if in_bypass_window:
                 logger.info(
                     "⏩ QA bypass: within %dms of last gateway send; skipping quick answer",
@@ -1947,18 +2064,23 @@ async def run_orchestrator() -> None:
                     else:
                         should_use_upstream, quick_response = await quick_answer_client.get_quick_answer(combined_transcript)
                     qa_elapsed = int((time.monotonic() - qa_start) * 1000)
-                    if not should_use_upstream and quick_response:
-                        # Quick answer provided - use it and skip gateway
-                        logger.info("✓ QUICK ANSWER: Using LLM response instead of gateway (latency: %dms)", qa_elapsed)
-                        print(f"\033[94m← QUICK ANSWER: {quick_response} [latency: {qa_elapsed}ms]\033[0m", flush=True)
-                        logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
-                        last_activity_ts = time.monotonic()
-                        await submit_tts(quick_response, request_id=current_request_id)
+                    if not should_use_upstream:
+                        # Quick answer handled locally. Some command classes intentionally
+                        # return empty text to keep interactions silent (e.g. play/stop).
+                        logger.info("✓ QUICK ANSWER: Using LLM/tool response instead of gateway (latency: %dms)", qa_elapsed)
+                        if quick_response:
+                            print(f"\033[94m← QUICK ANSWER: {quick_response} [latency: {qa_elapsed}ms]\033[0m", flush=True)
+                            logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
+                            last_activity_ts = time.monotonic()
+                            await submit_tts(quick_response, request_id=current_request_id)
+                        else:
+                            logger.info("→ QUICK ANSWER [req#%d]: Silent success (no TTS response)", current_request_id)
+
                         should_send_to_gateway = False
                         # Clear all transcripts processed (including any that arrived during LLM call)
                         pending_transcripts.clear()
                         # Mirror both turns to the openclaw session so they appear in the web chat UI
-                        if config.quick_answer_mirror_enabled:
+                        if config.quick_answer_mirror_enabled and quick_response:
                             from orchestrator.gateway.providers import OpenClawGateway
                             if isinstance(gateway, OpenClawGateway):
                                 mirror_session_key = f"agent:{agent_id}:{session_id}"
@@ -2243,7 +2365,13 @@ async def run_orchestrator() -> None:
                     logger.info("← TTS SYNTH: Generated %d bytes in %dms", len(wav_bytes), synth_elapsed)
 
                     # Playback phase
-                    logger.info("→ TTS PLAY: Starting playback (gain=%.1f)", tts_gain)
+                    effective_tts_gain = max(0.05, float(tts_gain * config.tts_relative_gain))
+                    logger.info(
+                        "→ TTS PLAY: Starting playback (base_gain=%.2f, relative=%.2f, effective=%.2f)",
+                        tts_gain,
+                        config.tts_relative_gain,
+                        effective_tts_gain,
+                    )
                     # Reset Silero RNN state to prevent carryover from previous speech
                     if cut_in_silero is not None:
                         cut_in_silero.reset_state()
@@ -2257,7 +2385,7 @@ async def run_orchestrator() -> None:
                     sample_count = len(pcm) / 2.0
                     current_tts_duration_s = sample_count / float(target_rate) if sample_count > 0 else 0.0
                     tts_stop_event.clear()
-                    await asyncio.to_thread(playback.play_pcm, pcm, tts_gain, tts_stop_event)
+                    await asyncio.to_thread(playback.play_pcm, pcm, effective_tts_gain, tts_stop_event)
                     play_elapsed = int((time.monotonic() - play_start) * 1000)
                     interrupted = tts_stop_event.is_set()
                     if interrupted:
@@ -2576,15 +2704,59 @@ async def run_orchestrator() -> None:
     music_auto_resume_timer = 0.0
     last_music_check_ts = 0.0
     music_check_interval = 0.5  # Check music state every 500ms
-    
+    music_tts_duck_active = False
+    music_tts_duck_restore_volume: int | None = None
+    music_cut_in_duck_active = False
+    music_cut_in_duck_restore_volume: int | None = None
+    music_cut_in_duck_until_ts = 0.0
+    music_cut_in_hits = 0
+    last_music_sleep_suppressed_log_ts = 0.0
+    music_sleep_suppressed_log_interval_s = 8.0
+
+    async def apply_music_duck(*, reason: str, ratio: float) -> int | None:
+        """Lower MPD volume by ratio and return original volume for later restoration."""
+        if not (config.music_enabled and music_manager):
+            return None
+        current = await music_manager.get_volume()
+        if current is None or current < 0:
+            # MPD volume control is unavailable (e.g. hardware output with no mixer).
+            # Skip ducking entirely so we don't accidentally restore to 0 later.
+            return None
+        target = max(1, min(100, int(round(current * ratio))))
+        if target >= current:
+            logger.debug(
+                "🎚️ Skipping music duck for %s (current=%s%%, target=%s%%; no attenuation possible)",
+                reason,
+                current,
+                target,
+            )
+            return None
+        await music_manager.set_volume(target)
+        logger.info("🎚️ Music ducked for %s: %s%% → %s%%", reason, current, target)
+        return current
+
+    async def restore_music_duck(*, reason: str, restore_volume: int | None) -> None:
+        """Restore MPD volume after temporary ducking."""
+        if not (config.music_enabled and music_manager):
+            return
+        if restore_volume is None:
+            return
+        target = max(0, min(100, int(restore_volume)))
+        await music_manager.set_volume(target)
+        logger.info("🎚️ Music duck restore (%s): %s%%", reason, target)
+
     try:
         while True:
+            now = time.monotonic()  # Always advance time, even when no audio frame arrives
             frame = capture.read_frame(timeout=1.0)
             if frame is None:
+                # Still run period tasks so logs/heartbeat appear even when mic is silent/blocked
+                if now - last_heartbeat_ts >= heartbeat_interval:
+                    logger.info("💓 Heartbeat (no audio frame): state=%s", state.name)
+                    last_heartbeat_ts = now
                 await asyncio.sleep(0.01)
                 continue
 
-            now = time.monotonic()
             frame_count += 1
 
             # Drop audio frames during the brief post-alarm-cut-in mute window
@@ -2605,18 +2777,83 @@ async def run_orchestrator() -> None:
             if config.music_enabled and music_manager and (now - last_music_check_ts >= music_check_interval):
                 try:
                     is_playing = await music_manager.is_playing()
+
+                    # If playback has resumed (e.g., user said "play music"), clear
+                    # pause-for-wake state so downstream sleep logic can run.
+                    if is_playing and music_paused_for_wake:
+                        music_paused_for_wake = False
+                        music_auto_resume_timer = 0.0
+                        logger.info("🎵 Music playback resumed → cleared wake pause state")
+
+                    # TTS ducking while music plays (when not explicitly paused for wake/listening).
+                    if config.music_tts_duck_enabled:
+                        if is_playing and tts_playing and not music_paused_for_wake:
+                            if not music_tts_duck_active:
+                                music_tts_duck_restore_volume = await apply_music_duck(
+                                    reason="tts",
+                                    ratio=float(max(0.05, min(1.0, config.music_tts_duck_ratio))),
+                                )
+                                music_tts_duck_active = music_tts_duck_restore_volume is not None
+                        elif music_tts_duck_active:
+                            await restore_music_duck(
+                                reason="tts complete",
+                                restore_volume=music_tts_duck_restore_volume,
+                            )
+                            music_tts_duck_active = False
+                            music_tts_duck_restore_volume = None
+
+                    # Cut-in duck timeout (restore volume after brief attentional dip).
+                    if music_cut_in_duck_active and now >= music_cut_in_duck_until_ts:
+                        await restore_music_duck(
+                            reason="cut-in timeout",
+                            restore_volume=music_cut_in_duck_restore_volume,
+                        )
+                        music_cut_in_duck_active = False
+                        music_cut_in_duck_restore_volume = None
+                        music_cut_in_duck_until_ts = 0.0
                     
-                    # Music started playing → Put orchestrator to sleep
-                    if is_playing and not music_was_playing and config.music_sleep_during_playback:
-                        if wake_state == WakeState.AWAKE and not music_paused_for_wake:
+                    # Music started playing → latch playback state and (if awake)
+                    # transition orchestrator to sleep.
+                    if is_playing and not music_was_playing:
+                        music_was_playing = True
+                        music_auto_resume_timer = 0.0
+                        if (
+                            config.music_sleep_during_playback
+                            and wake_state == WakeState.AWAKE
+                            and not music_paused_for_wake
+                        ):
                             logger.info("🎵 Music started → Putting orchestrator to sleep")
                             wake_state = WakeState.ASLEEP
-                            music_was_playing = True
-                            music_auto_resume_timer = 0.0
+                        else:
+                            logger.info(
+                                "🎵 Music start detected (wake_state=%s, paused_for_wake=%s)",
+                                wake_state.value,
+                                music_paused_for_wake,
+                            )
+                    # If we were temporarily awake (e.g., due to TTS), re-enter
+                    # sleep while music is still actively playing.
+                    elif (
+                        is_playing
+                        and music_was_playing
+                        and config.music_sleep_during_playback
+                        and wake_state == WakeState.AWAKE
+                        and not music_paused_for_wake
+                        and not tts_playing
+                        and not _tts_has_pending()
+                    ):
+                        logger.info("🎵 Music still playing → returning orchestrator to sleep")
+                        wake_state = WakeState.ASLEEP
                     
                     # Music stopped playing
                     elif not is_playing and music_was_playing:
                         music_was_playing = False
+                        if music_tts_duck_active:
+                            music_tts_duck_active = False
+                            music_tts_duck_restore_volume = None
+                        if music_cut_in_duck_active:
+                            music_cut_in_duck_active = False
+                            music_cut_in_duck_restore_volume = None
+                            music_cut_in_duck_until_ts = 0.0
                         if music_paused_for_wake:
                             music_auto_resume_timer = 0.0
                             logger.info("🎵 Music paused for wake/listening")
@@ -2626,7 +2863,18 @@ async def run_orchestrator() -> None:
                     
                     # Handle auto-resume timer (music was paused for wake word, but no voice activity)
                     if music_paused_for_wake and not is_playing:
-                        if state in (VoiceState.IDLE, VoiceState.LISTENING):
+                        playback_state = await music_manager.get_playback_state()
+
+                        # Only auto-resume when MPD is actually paused. If user explicitly
+                        # stopped playback, clear pause-for-wake state so it will not restart.
+                        if playback_state != "pause":
+                            logger.info(
+                                "🎵 Skipping auto-resume: playback state is '%s' (not pause) → cleared wake pause state",
+                                playback_state,
+                            )
+                            music_paused_for_wake = False
+                            music_auto_resume_timer = 0.0
+                        elif state in (VoiceState.IDLE, VoiceState.LISTENING):
                             # No voice activity - increment timer
                             if music_auto_resume_timer == 0.0:
                                 music_auto_resume_timer = now
@@ -2736,8 +2984,56 @@ async def run_orchestrator() -> None:
             ring_buffer.add_frame(frame)
 
             if config.wake_word_enabled and wake_state == WakeState.ASLEEP:
+                # While sleeping during music playback, use voice cut-in only to duck
+                # volume briefly so the hotword can be heard more reliably.
+                if (
+                    config.music_enabled
+                    and config.music_sleep_during_playback
+                    and music_manager
+                    and music_was_playing
+                    and not tts_playing
+                ):
+                    music_cutin_vad_frame = processed_frame
+                    if isinstance(vad, SileroVAD) and config.audio_sample_rate != 16000:
+                        music_cutin_vad_frame = resample_pcm(processed_frame, config.audio_sample_rate, 16000)
+                    music_cutin_vad_result = vad.is_speech(music_cutin_vad_frame)
+                    cut_in_voice_candidate = bool(music_cutin_vad_result.speech_detected) and rms_raw >= config.vad_cut_in_rms
+                    if cut_in_voice_candidate:
+                        music_cut_in_hits += 1
+                    else:
+                        music_cut_in_hits = 0
+
+                    if music_cut_in_hits >= config.vad_cut_in_frames:
+                        music_cut_in_hits = 0
+
+                        if not music_cut_in_duck_active:
+                            music_cut_in_duck_restore_volume = await apply_music_duck(
+                                reason="voice cut-in",
+                                ratio=float(max(0.05, min(1.0, config.music_cut_in_duck_ratio))),
+                            )
+                            music_cut_in_duck_active = music_cut_in_duck_restore_volume is not None
+                            if music_cut_in_duck_active:
+                                music_cut_in_duck_until_ts = now + (max(0, config.music_cut_in_duck_timeout_ms) / 1000.0)
+                                logger.info(
+                                    "🎚️ Voice cut-in while music sleeping → ducking for hotword window (%dms)",
+                                    max(0, config.music_cut_in_duck_timeout_ms),
+                                )
+
                 # Keep awake while TTS is playing or queued so cut-in can work
-                if tts_playing or _tts_has_pending():
+                # But do NOT wake up solely due to TTS when sleeping because music
+                # playback is active; music-sleep must remain authoritative.
+                keep_sleep_for_music = (
+                    config.music_enabled
+                    and config.music_sleep_during_playback
+                    and music_was_playing
+                    and not music_paused_for_wake
+                )
+                if keep_sleep_for_music and (now - last_music_sleep_suppressed_log_ts) >= music_sleep_suppressed_log_interval_s:
+                    logger.info(
+                        "😴 Music sleep active: suppressing wake/listen processing while playback is active"
+                    )
+                    last_music_sleep_suppressed_log_ts = now
+                if (tts_playing or _tts_has_pending()) and not keep_sleep_for_music:
                     wake_state = WakeState.AWAKE
                     last_activity_ts = now
                 else:
@@ -2806,6 +3102,18 @@ async def run_orchestrator() -> None:
                             last_activity_ts = now
                             state = VoiceState.LISTENING
                             chunk_start_ts = now
+
+                            # If we temporarily ducked music for hotword assist,
+                            # restore normal level before pausing so resume returns
+                            # to the expected user volume.
+                            if music_cut_in_duck_active:
+                                await restore_music_duck(
+                                    reason="hotword detected",
+                                    restore_volume=music_cut_in_duck_restore_volume,
+                                )
+                                music_cut_in_duck_active = False
+                                music_cut_in_duck_restore_volume = None
+                                music_cut_in_duck_until_ts = 0.0
                             
                             # Stop music playback when wake word detected
                             if config.music_enabled and music_manager:
@@ -2837,13 +3145,10 @@ async def run_orchestrator() -> None:
                             logger.info("Wake word detected → awake")
                             if wake_click_sound:
                                 try:
-                                    asyncio.create_task(
-                                        asyncio.to_thread(
-                                            playback.play_pcm,
-                                            wake_click_sound,
-                                            float(max(0.1, config.wake_feedback_gain)),
-                                            threading.Event(),
-                                        )
+                                    play_feedback_async(
+                                        wake_click_sound,
+                                        float(max(0.1, config.wake_feedback_gain)),
+                                        "wake click (hotword)",
                                     )
                                 except Exception as exc:
                                     logger.debug("Failed to play wake click sound: %s", exc)
@@ -3134,13 +3439,10 @@ async def run_orchestrator() -> None:
                         logger.info("Wake timeout reached → asleep")
                         if timeout_swoosh_sound:
                             try:
-                                asyncio.create_task(
-                                    asyncio.to_thread(
-                                        playback.play_pcm,
-                                        timeout_swoosh_sound,
-                                        float(max(0.1, config.sleep_feedback_gain)),
-                                        threading.Event(),
-                                    )
+                                play_feedback_async(
+                                    timeout_swoosh_sound,
+                                    float(max(0.1, config.sleep_feedback_gain)),
+                                    "sleep swoosh (timeout)",
                                 )
                             except Exception as exc:
                                 logger.debug("Failed to play timeout sleep cue: %s", exc)
@@ -3158,6 +3460,10 @@ async def run_orchestrator() -> None:
         if tool_monitor:
             logger.info("Stopping tool monitor...")
             await tool_monitor.stop()
+        # Cleanup MPD if running
+        if mpd_manager:
+            logger.info("Stopping MPD...")
+            mpd_manager.cleanup()
         capture.stop()
 
 

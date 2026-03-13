@@ -43,11 +43,17 @@ _ROOT_DIR = Path(__file__).resolve().parent.parent
 _BASE_ENV_FILE = _ROOT_DIR / ".env"
 _SELECTED_ENV_FILE = _detect_env_file()
 
-# Load base .env first (if present), then selected env as override.
-if _BASE_ENV_FILE.exists():
-    load_dotenv(str(_BASE_ENV_FILE), override=False)
-if _SELECTED_ENV_FILE.exists():
-    load_dotenv(str(_SELECTED_ENV_FILE), override=True)
+# Load exactly one env profile file, and never override explicit process env.
+#
+# Precedence should be:
+#   1) Explicit process env (e.g., docker compose service environment)
+#   2) Selected env profile file (.env.docker / .env.pi / .env)
+#
+# Loading base .env in addition to a selected profile can leak host-specific
+# values (e.g., local device indices) into container/PI runtimes.
+_env_file_to_load = _SELECTED_ENV_FILE if _SELECTED_ENV_FILE.exists() else _BASE_ENV_FILE
+if _env_file_to_load.exists():
+    load_dotenv(str(_env_file_to_load), override=False)
 
 
 class VoiceConfig(BaseSettings):
@@ -79,6 +85,7 @@ class VoiceConfig(BaseSettings):
     audio_backend: str = Field("portaudio")
     audio_input_gain: float = Field(1.0)  # Software gain multiplier for input audio
     audio_output_gain: float = Field(1.0)  # Software gain multiplier for TTS/output audio
+    tts_relative_gain: float = Field(0.75)  # Additional trim for TTS only (relative to music/background)
 
     # VAD
     vad_type: str = Field("webrtc")
@@ -231,6 +238,13 @@ class VoiceConfig(BaseSettings):
     music_sleep_during_playback: bool = Field(True)  # Put orchestrator to sleep while music is playing
     music_auto_resume_timeout_s: int = Field(5)  # Seconds of silence before auto-resuming music after wake
     music_random_track_count: int = Field(50)  # Number of random tracks to add when queue is empty
+    music_genre_queue_limit: int = Field(120)  # Max genre tracks enqueued per command to avoid long startup stalls
+    music_tts_duck_enabled: bool = Field(True)  # Reduce music volume while TTS is speaking
+    music_tts_duck_ratio: float = Field(0.45)  # Keep this fraction of current music volume during TTS
+    music_cut_in_duck_ratio: float = Field(0.35)  # Keep this fraction of current music volume during voice cut-in
+    music_cut_in_duck_timeout_ms: int = Field(2000)  # Restore cut-in ducking after this timeout if not paused
+    music_pipewire_stream_normalize_enabled: bool = Field(True)  # Normalize PipeWire per-app stream volume for MPD on play/resume
+    music_pipewire_stream_target_percent: int = Field(100)  # Target PipeWire sink-input volume for MPD stream (percent)
 
     # Media Keys (Hardware button detection)
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
@@ -246,6 +260,7 @@ class VoiceConfig(BaseSettings):
     sleep_feedback_variant: str = Field("swoosh")  # swoosh|short|deep|sigh|sighshort|exhale|exhaleshort|exhalelong|none
     wake_feedback_gain: float = Field(1.6)  # Playback gain multiplier for wake cue
     sleep_feedback_gain: float = Field(1.3)  # Playback gain multiplier for sleep cue
+    volume_feedback_gain: float = Field(0.4)  # Playback gain for volume-step click sounds
 
     @model_validator(mode='after')
     def validate_critical_config(self):
@@ -330,10 +345,28 @@ class VoiceConfig(BaseSettings):
             errors.append(f"AUDIO_INPUT_GAIN={self.audio_input_gain} is unusual (typical range: 0.1-10.0)")
         if self.audio_output_gain < 0.1 or self.audio_output_gain > 5.0:
             errors.append(f"AUDIO_OUTPUT_GAIN={self.audio_output_gain} is unusual (typical range: 0.1-5.0)")
+        if self.tts_relative_gain < 0.1 or self.tts_relative_gain > 2.0:
+            errors.append(f"TTS_RELATIVE_GAIN={self.tts_relative_gain} is unusual (typical range: 0.1-2.0)")
 
         if self.media_keys_command_debounce_ms < 0:
             errors.append(
                 f"MEDIA_KEYS_COMMAND_DEBOUNCE_MS={self.media_keys_command_debounce_ms} must be >= 0"
+            )
+
+        if not (0.05 <= self.music_tts_duck_ratio <= 1.0):
+            errors.append(f"MUSIC_TTS_DUCK_RATIO={self.music_tts_duck_ratio} must be between 0.05 and 1.0")
+
+        if not (0.05 <= self.music_cut_in_duck_ratio <= 1.0):
+            errors.append(f"MUSIC_CUT_IN_DUCK_RATIO={self.music_cut_in_duck_ratio} must be between 0.05 and 1.0")
+
+        if self.music_cut_in_duck_timeout_ms < 0:
+            errors.append(
+                f"MUSIC_CUT_IN_DUCK_TIMEOUT_MS={self.music_cut_in_duck_timeout_ms} must be >= 0"
+            )
+
+        if not (1 <= self.music_pipewire_stream_target_percent <= 150):
+            errors.append(
+                f"MUSIC_PIPEWIRE_STREAM_TARGET_PERCENT={self.music_pipewire_stream_target_percent} must be between 1 and 150"
             )
 
         # Validate VAD settings

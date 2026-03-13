@@ -82,6 +82,7 @@ async def test_parser():
     test_cases = [
         ("play", ("play", {})),
         ("pause", ("pause", {})),
+        ("hey minecraft, stop playing.", ("stop", {})),
         ("next", ("next_track", {})),
         ("volume 50", ("set_volume", {"level": 50})),
         ("what's playing", ("get_current_track", {})),

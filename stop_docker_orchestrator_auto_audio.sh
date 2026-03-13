@@ -18,9 +18,9 @@ services=(
   orchestrator
   orchestrator-linux-alsa
   orchestrator-linux-pulse
+  snapserver
   whisper
   piper
-  mpd
 )
 
 "${COMPOSE[@]}" stop "${services[@]}" >/dev/null 2>&1 || true

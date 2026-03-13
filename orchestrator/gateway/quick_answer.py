@@ -145,6 +145,8 @@ ACTION_INTENT_PATTERNS = [
     r"\b(shopping|grocery)\b.*\b(add|buy|get|pick up)\b",
     r"^\s*(also\s+)?add\b",
     r"\b(remind me|set up|create|book|schedule|order|send|message|email|call)\b",
+    r"\b(open|launch|start)\b.*\b(browser|web\s*browser|tab|window)\b",
+    r"\b(open|go to|navigate to|visit)\b\s+([\w-]+\.)+[a-z]{2,}\b",
 ]
 
 
@@ -691,6 +693,7 @@ class QuickAnswerClient:
         try:
             current_datetime = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
             system_prompt = build_system_prompt(current_datetime, self.timers_enabled, self.music_enabled)
+            music_like_query = bool(self.music_enabled and self.music_router and self.music_router.is_music_related(user_query))
             
             headers = {"Content-Type": "application/json"}
             if self.api_key:
@@ -705,7 +708,7 @@ class QuickAnswerClient:
                 "temperature": 0.0,
                 "max_tokens": 150,
                 "tools": self.tool_definitions,
-                "tool_choice": "auto",
+                "tool_choice": "required" if music_like_query else "auto",
             }
             
             logger.info("→ QUICK ANSWER (with tools): Querying LLM for: '%s'", user_query)
@@ -819,6 +822,13 @@ class QuickAnswerClient:
             
             # No tool calls, check for regular content response
             content = message.get("content", "").strip()
+
+            if music_like_query and not tool_calls:
+                # Media command policy: never speak long free-form LLM prose for music control.
+                # If model failed to emit a tool call, escalate so gateway/tooling can decide,
+                # rather than returning verbose text.
+                logger.info("← QUICK ANSWER: Music-like query returned no tool call; escalating upstream")
+                return True, ""
             
             if not content:
                 logger.warning("Quick answer LLM returned empty content")

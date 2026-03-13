@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 
 class MusicRouter:
     """Route music commands through fast-path or LLM, execute, and format responses."""
+    COMMAND_TIMEOUT_S = 12.0
     
     def __init__(self, manager: MusicManager):
         self.manager = manager
@@ -53,6 +54,21 @@ class MusicRouter:
             # Library management
             "update_library": self._handle_update_library,
         }
+
+    @staticmethod
+    def _is_error(result: str) -> bool:
+        return str(result).lower().startswith("error")
+
+    @staticmethod
+    def _extract_numeric_volume(result: str) -> Optional[int]:
+        import re
+        match = re.search(r"(\d{1,3})%", result or "")
+        if not match:
+            return None
+        try:
+            return max(0, min(100, int(match.group(1))))
+        except Exception:
+            return None
     
     async def handle_request(self, text: str, use_fast_path: bool = True) -> Optional[str]:
         """
@@ -76,8 +92,14 @@ class MusicRouter:
                 handler = self.command_handlers.get(command)
                 if handler:
                     try:
-                        response = await handler(**params)
+                        response = await asyncio.wait_for(
+                            handler(**params),
+                            timeout=self.COMMAND_TIMEOUT_S,
+                        )
                         return response
+                    except asyncio.TimeoutError:
+                        logger.error("Timed out executing music command %s", command)
+                        return "Music command timed out. Please try again."
                     except Exception as e:
                         logger.error(f"Error executing {command}: {e}")
                         return f"Sorry, I couldn't {command.replace('_', ' ')}"
@@ -95,36 +117,53 @@ class MusicRouter:
     # ========== Command Handlers ==========
     
     async def _handle_play(self) -> str:
-        """Handle play/resume command."""
-        return await self.manager.play()
+        """Handle play/resume command (silent on success)."""
+        result = await self.manager.play()
+        return result if self._is_error(result) else ""
     
     async def _handle_pause(self) -> str:
-        """Handle pause/unpause command."""
-        return await self.manager.pause()
+        """Handle pause command as stop (silent on success)."""
+        result = await self.manager.stop()
+        return result if self._is_error(result) else ""
     
     async def _handle_stop(self) -> str:
-        """Handle stop command."""
-        return await self.manager.stop()
+        """Handle stop command (silent on success)."""
+        result = await self.manager.stop()
+        return result if self._is_error(result) else ""
     
     async def _handle_next_track(self) -> str:
         """Handle next track command."""
-        return await self.manager.next_track()
+        result = await self.manager.next_track()
+        return result if self._is_error(result) else "Next."
     
     async def _handle_previous_track(self) -> str:
         """Handle previous track command."""
-        return await self.manager.previous_track()
+        result = await self.manager.previous_track()
+        return result if self._is_error(result) else "Previous."
     
     async def _handle_set_volume(self, level: int) -> str:
         """Handle set volume command."""
-        return await self.manager.set_volume(level)
+        result = await self.manager.set_volume(level)
+        if self._is_error(result):
+            return result
+        vol = self._extract_numeric_volume(result)
+        return f"Volume {vol}%" if vol is not None else "Volume updated."
     
     async def _handle_volume_up(self, amount: int = 10) -> str:
         """Handle volume up command."""
-        return await self.manager.volume_up(amount)
+        result = await self.manager.volume_up(amount)
+        if self._is_error(result):
+            return result
+        vol = self._extract_numeric_volume(result)
+        return f"Volume {vol}%" if vol is not None else "Volume up."
     
     async def _handle_volume_down(self, amount: int = 10) -> str:
         """Handle volume down command."""
-        return await self.manager.volume_down(amount)
+        result = await self.manager.volume_down(amount)
+        if self._is_error(result):
+            return result
+        vol = self._extract_numeric_volume(result)
+        return f"Volume {vol}%" if vol is not None else "Volume down."
     
     async def _handle_get_current_track(self) -> str:
         """Handle current track query."""
@@ -159,19 +198,23 @@ class MusicRouter:
     
     async def _handle_play_artist(self, artist: str, shuffle: bool = True) -> str:
         """Handle play artist command."""
-        return await self.manager.play_artist(artist, shuffle)
+        result = await self.manager.play_artist(artist, shuffle)
+        return result if self._is_error(result) else f"Playing artist: {artist}."
     
     async def _handle_play_album(self, album: str) -> str:
         """Handle play album command."""
-        return await self.manager.play_album(album)
+        result = await self.manager.play_album(album)
+        return result if self._is_error(result) else f"Playing album: {album}."
     
     async def _handle_play_genre(self, genre: str, shuffle: bool = True) -> str:
         """Handle play genre command."""
-        return await self.manager.play_genre(genre, shuffle)
+        result = await self.manager.play_genre(genre, shuffle)
+        return result if self._is_error(result) else f"Playing genre: {genre}."
     
     async def _handle_play_song(self, title: str) -> str:
         """Handle play song command."""
-        return await self.manager.play_song(title)
+        result = await self.manager.play_song(title)
+        return result if self._is_error(result) else f"Playing: {title}."
     
     async def _handle_load_playlist(self, name: str) -> str:
         """Handle load playlist command."""
@@ -218,24 +261,24 @@ class MusicRouter:
         
         # Map tool names to handlers
         tool_map = {
-            "music_play": lambda: self.manager.play(),
-            "music_pause": lambda: self.manager.pause(),
-            "music_stop": lambda: self.manager.stop(),
-            "music_next": lambda: self.manager.next_track(),
-            "music_previous": lambda: self.manager.previous_track(),
-            "music_set_volume": lambda: self.manager.set_volume(arguments.get("level", 50)),
+            "music_play": lambda: self._handle_play(),
+            "music_pause": lambda: self._handle_pause(),
+            "music_stop": lambda: self._handle_stop(),
+            "music_next": lambda: self._handle_next_track(),
+            "music_previous": lambda: self._handle_previous_track(),
+            "music_set_volume": lambda: self._handle_set_volume(arguments.get("level", 50)),
             "music_get_current": lambda: self._handle_get_current_track(),
             "music_get_status": lambda: self._handle_get_status(),
-            "music_play_artist": lambda: self.manager.play_artist(
+            "music_play_artist": lambda: self._handle_play_artist(
                 arguments.get("artist", ""),
                 arguments.get("shuffle", True)
             ),
-            "music_play_album": lambda: self.manager.play_album(arguments.get("album", "")),
-            "music_play_genre": lambda: self.manager.play_genre(
+            "music_play_album": lambda: self._handle_play_album(arguments.get("album", "")),
+            "music_play_genre": lambda: self._handle_play_genre(
                 arguments.get("genre", ""),
                 arguments.get("shuffle", True)
             ),
-            "music_play_song": lambda: self.manager.play_song(arguments.get("title", "")),
+            "music_play_song": lambda: self._handle_play_song(arguments.get("title", "")),
             "music_search": lambda: self._handle_search(arguments.get("query", "")),
             "music_load_playlist": lambda: self.manager.load_playlist(arguments.get("name", "")),
             "music_update_library": lambda: self.manager.update_library(),
@@ -246,8 +289,11 @@ class MusicRouter:
             return f"Unknown music tool: {tool_name}"
         
         try:
-            result = await handler()
+            result = await asyncio.wait_for(handler(), timeout=self.COMMAND_TIMEOUT_S)
             return result
+        except asyncio.TimeoutError:
+            logger.error("Timed out executing tool %s", tool_name)
+            return "Music command timed out. Please try again."
         except Exception as e:
             logger.error(f"Error executing tool {tool_name}: {e}")
             return f"Error: {e}"
@@ -260,9 +306,5 @@ class MusicRouter:
             return f"No results found for: {query}"
         
         if len(tracks) == 1:
-            track = tracks[0]
-            title = track.get("Title", "Unknown")
-            artist = track.get("Artist", "Unknown artist")
-            return f"Found: {title} by {artist}"
-        else:
-            return f"Found {len(tracks)} tracks matching: {query}"
+            return f"Found 1 match for: {query}."
+        return f"Found {len(tracks)} matches for: {query}."

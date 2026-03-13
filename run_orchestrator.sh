@@ -22,6 +22,10 @@ if [ -z "$ENV_FILE_PATH" ]; then
 fi
 export OPENCLAW_ENV_FILE="$ENV_FILE_PATH"
 
+# PipeWire: ensure PortAudio ALSA plugin can locate the PipeWire session socket.
+# Without this, opening the 'pipewire' ALSA device hangs indefinitely.
+export PIPEWIRE_RUNTIME_DIR="/run/user/$(id -u)"
+
 # Kill any existing orchestrator process
 pkill -f "python.*orchestrator.main" 2>/dev/null || true
 sleep 1

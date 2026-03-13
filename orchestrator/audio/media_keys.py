@@ -200,6 +200,8 @@ class MediaKeyDetector:
         device_filter: Optional[str] = None,
         long_press_threshold: float = 0.5,
         play_scan_codes: Optional[str] = "0xc00b6,0xc00cd",
+        volume_up_scan_codes: Optional[str] = "0xc00e9",
+        volume_down_scan_codes: Optional[str] = "0xc00ea",
         command_debounce_ms: int = 400,
         exclusive_grab: bool = False,
     ):
@@ -214,6 +216,8 @@ class MediaKeyDetector:
         self.device_filter = device_filter
         self.long_press_threshold = long_press_threshold
         self.play_scan_codes = self.parse_scan_code_list(play_scan_codes)
+        self.volume_up_scan_codes = self.parse_scan_code_list(volume_up_scan_codes)
+        self.volume_down_scan_codes = self.parse_scan_code_list(volume_down_scan_codes)
         self.command_debounce_s = max(0.0, command_debounce_ms / 1000.0)
         self.exclusive_grab = bool(exclusive_grab)
         self.callback: Optional[Callable[[MediaKeyEvent], None]] = None
@@ -230,6 +234,9 @@ class MediaKeyDetector:
         self._scan_debounce_s: float = 0.1  # 100ms - filters duplicate events from single press, allows rapid taps
         # Debounce emitted commands: {(device_name, logical_key): last_timestamp}
         self._command_last_seen_ts: Dict[tuple, float] = {}
+        # Suppress repeated safety warnings during periodic rescans.
+        self._blocked_name_warned_paths: Set[str] = set()
+        self._keyboard_like_warned_paths: Set[str] = set()
 
     async def _dispatch_media_event(self, media_event: MediaKeyEvent) -> None:
         """Dispatch a logical media event with per-command debounce."""
@@ -286,20 +293,24 @@ class MediaKeyDetector:
                 )
 
                 if self._is_blocked_device_name(device.name):
-                    logger.warning(
-                        "Skipping blocked input device name for media capture safety: %s (%s)",
-                        device.name,
-                        path,
-                    )
+                    if path not in self._blocked_name_warned_paths:
+                        logger.warning(
+                            "Skipping blocked input device name for media capture safety: %s (%s)",
+                            device.name,
+                            path,
+                        )
+                        self._blocked_name_warned_paths.add(path)
                     device.close()
                     continue
 
                 if self._looks_like_keyboard_device(key_codes):
-                    logger.warning(
-                        "Skipping keyboard-like input device for media capture safety: %s (%s)",
-                        device.name,
-                        path,
-                    )
+                    if path not in self._keyboard_like_warned_paths:
+                        logger.warning(
+                            "Skipping keyboard-like input device for media capture safety: %s (%s)",
+                            device.name,
+                            path,
+                        )
+                        self._keyboard_like_warned_paths.add(path)
                     device.close()
                     continue
                 
@@ -338,13 +349,13 @@ class MediaKeyDetector:
     
     async def start(self):
         """Start monitoring for media key events."""
+        self.running = True
         added = self._add_new_devices(self.find_media_devices())
 
         if not self.devices:
             logger.warning("No media devices found to monitor")
+            self._schedule_rescan()
             return
-
-        self.running = True
 
         if added:
             logger.info(f"Media key detector started with {len(self.devices)} device(s)")
@@ -518,7 +529,15 @@ class MediaKeyDetector:
                             event.value,
                             event.value,
                         )
+                        mapped_key = None
                         if event.value in self.play_scan_codes:
+                            mapped_key = "play_pause"
+                        elif event.value in self.volume_up_scan_codes:
+                            mapped_key = "volume_up"
+                        elif event.value in self.volume_down_scan_codes:
+                            mapped_key = "volume_down"
+
+                        if mapped_key is not None:
                             now = time.time()
                             key = (device.name, event.value)
                             last_seen = self._scan_last_seen_ts.get(key, 0.0)
@@ -527,12 +546,13 @@ class MediaKeyDetector:
                             self._scan_last_seen_ts[key] = now
 
                             logger.info(
-                                "Mapped MSC_SCAN 0x%x from %s to play_pause",
+                                "Mapped MSC_SCAN 0x%x from %s to %s",
                                 event.value,
                                 device.name,
+                                mapped_key,
                             )
                             media_event = MediaKeyEvent(
-                                key="play_pause",
+                                key=mapped_key,
                                 device_name=device.name,
                                 timestamp=now,
                                 event_type="press",

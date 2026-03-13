@@ -1,4 +1,4 @@
-from orchestrator.gateway.quick_answer import sanitize_quick_answer_text
+from orchestrator.gateway.quick_answer import sanitize_quick_answer_text, should_force_upstream
 
 
 def test_sanitize_quick_answer_text_strips_asterisk_markdown() -> None:
@@ -37,3 +37,11 @@ def test_sanitize_quick_answer_text_falls_back_to_label() -> None:
         },
     }
     assert sanitize_quick_answer_text(payload) == "wake up"
+
+
+def test_should_force_upstream_for_open_browser_tab_command() -> None:
+    assert should_force_upstream("open a browser tab to google.com") is True
+
+
+def test_should_force_upstream_for_direct_visit_command() -> None:
+    assert should_force_upstream("visit wikipedia.org") is True

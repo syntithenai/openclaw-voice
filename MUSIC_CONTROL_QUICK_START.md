@@ -8,7 +8,7 @@ The music control system provides voice-controlled music playback via MPD with:
 - **Fast-path parsing** for instant responses (<200ms)
 - **LLM fallback** for complex queries
 - **Automatic library scanning** on first run
-- **Persistent state** across container restarts
+- **Persistent state** inside the orchestrator runtime
 
 ## Quick Setup (Docker)
 
@@ -19,7 +19,7 @@ Add to your `.env` file:
 ```bash
 # Music Control
 MUSIC_ENABLED=true
-MPD_HOST=mpd
+MPD_HOST=127.0.0.1
 MPD_PORT=6600
 MUSIC_LIBRARY_HOST_PATH=/home/stever/Music
 ```
@@ -31,7 +31,7 @@ docker-compose up -d
 ```
 
 The system will automatically:
-- Start MPD with your music library mounted
+- Start orchestrator-managed MPD with your music library mounted
 - Scan the library if empty (first run)
 - Initialize the music router with fast-path parsing
 
@@ -110,26 +110,25 @@ python test_music_system.py
 
 Or manually:
 ```bash
-docker-compose exec mpd mpc update
+docker-compose exec orchestrator-linux-alsa mpc update
 ```
 
 ### Check Library Status
 
 ```bash
-docker-compose exec mpd mpc stats
+docker-compose exec orchestrator-linux-alsa mpc stats
 ```
 
-### View MPD Logs
+### View Orchestrator Logs
 
 ```bash
-docker-compose logs mpd
+docker-compose logs orchestrator-linux-alsa
 ```
 
 ### Clear MPD State (Fresh Start)
 
 ```bash
 docker-compose down
-docker volume rm openclaw-voice_mpd-state
 docker-compose up -d
 ```
 
@@ -168,27 +167,27 @@ docker-compose up -d
 **Symptom:** "No tracks found for genre: jazz"
 
 **Solution:**
-1. Check music path: `docker-compose exec mpd ls /music`
+1. Check music path: `docker-compose exec orchestrator-linux-alsa ls /music`
 2. Voice command: "update library"
-3. Verify: `docker-compose exec mpd mpc stats`
+3. Verify: `docker-compose exec orchestrator-linux-alsa mpc stats`
 
 ### MPD Connection Failed
 
 **Symptom:** "Failed to connect to MPD at mpd:6600"
 
 **Solution:**
-1. Check MPD is running: `docker-compose ps mpd`
-2. Check orchestrator can reach MPD: `docker-compose exec orchestrator ping mpd`
-3. Verify environment: `echo $MPD_HOST` (should be "mpd" in Docker)
+1. Check orchestrator is running: `docker-compose ps orchestrator-linux-alsa`
+2. Check MPD inside the orchestrator container: `docker-compose exec orchestrator-linux-alsa mpc status`
+3. Verify environment: `echo $MPD_HOST` (should be `127.0.0.1` in Docker)
 
 ### Library Not Updating
 
 **Symptom:** Song count stays at 0 after scan
 
 **Solution:**
-1. Check mount: `docker-compose exec mpd df -h /music`
-2. Check permissions: `docker-compose exec mpd ls -la /music`
-3. Check MPD logs: `docker-compose logs mpd`
+1. Check mount: `docker-compose exec orchestrator-linux-alsa df -h /music`
+2. Check permissions: `docker-compose exec orchestrator-linux-alsa ls -la /music`
+3. Check orchestrator logs: `docker-compose logs orchestrator-linux-alsa`
 
 ## Performance Targets
 
@@ -212,9 +211,9 @@ orchestrator/music/
 ├── parser.py             # Fast-path regex patterns
 └── router.py             # Request routing + tool handling
 
-docker/mpd/
-├── Dockerfile            # MPD container image
-└── mpd.conf             # MPD configuration
+orchestrator/services/
+├── mpd_manager.py        # MPD lifecycle management
+└── mpd.conf              # Bundled MPD configuration
 
 test_music_system.py      # Test suite
 ```

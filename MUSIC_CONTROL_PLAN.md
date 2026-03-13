@@ -494,16 +494,15 @@ Add to `orchestrator/config.py`:
 ```python
 # Music Control (MPD)
 music_enabled: bool = Field(False)
-music_mpd_host: str = Field("localhost")
-music_mpd_port: int = Field(6600)
-music_mpd_timeout: float = Field(5.0)
-music_connection_pool_size: int = Field(3)
-music_search_limit: int = Field(50)  # Max songs per search result
+mpd_host: str = Field("localhost")
+mpd_port: int = Field(6600)
+mpd_timeout: float = Field(5.0)
+mpd_pool_size: int = Field(3)
 
 # Music paths (for MPD configuration generation)
 music_library_path: str = Field("/music")  # Inside container: /music, outside: /home/stever/Music
-music_mpd_state_dir: str = Field("/var/lib/mpd")  # MPD state directory
-music_mpd_config_path: str = Field("")  # Optional custom mpd.conf path
+mpd_fifo_host_path: str = Field("/tmp/openclaw-mpd-fifo")
+mpd_config_path: str = Field("")  # Optional custom mpd.conf path
 ```
 
 ### 4.3 .env Configuration
@@ -512,30 +511,28 @@ music_mpd_config_path: str = Field("")  # Optional custom mpd.conf path
 ```bash
 # Music Control
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=localhost
-MUSIC_MPD_PORT=6600
-MUSIC_MPD_TIMEOUT=5.0
-MUSIC_CONNECTION_POOL_SIZE=3
-MUSIC_SEARCH_LIMIT=50
+MPD_HOST=127.0.0.1
+MPD_PORT=6600
+MPD_TIMEOUT=5.0
+MPD_POOL_SIZE=3
 
 # Music paths (Docker volume mounts)
 MUSIC_LIBRARY_PATH=/music
-MUSIC_MPD_STATE_DIR=/var/lib/mpd
+MPD_FIFO_HOST_PATH=/tmp/openclaw-mpd-fifo
 ```
 
 **For native deployment (outside Docker):**
 ```bash
 # Music Control
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=localhost
-MUSIC_MPD_PORT=6600
-MUSIC_MPD_TIMEOUT=5.0
-MUSIC_CONNECTION_POOL_SIZE=3
-MUSIC_SEARCH_LIMIT=50
+MPD_HOST=localhost
+MPD_PORT=6600
+MPD_TIMEOUT=5.0
+MPD_POOL_SIZE=3
 
 # Music paths (native filesystem)
 MUSIC_LIBRARY_PATH=/home/stever/Music
-MUSIC_MPD_STATE_DIR=/var/lib/mpd
+MPD_FIFO_HOST_PATH=/tmp/openclaw-mpd-fifo
 ```
 
 ### 4.4 Docker Compose Configuration
@@ -576,26 +573,6 @@ services:
     networks:
       - voice-network
 
-  # MPD music player service
-  mpd:
-    image: vimagick/mpd:latest
-    container_name: mpd
-    ports:
-      - "6600:6600"
-      - "8000:8000"  # Optional: HTTP streaming
-    volumes:
-      # Music library (read-only)
-      - ${MUSIC_LIBRARY_HOST_PATH:-/home/stever/Music}:/music:ro
-      # MPD state persistence (read-write)
-      - mpd-state:/var/lib/mpd
-      # MPD configuration
-      - ./docker/mpd/mpd.conf:/etc/mpd.conf:ro
-    environment:
-      - MPD_CONF=/etc/mpd.conf
-    restart: unless-stopped
-    networks:
-      - voice-network
-
   # Voice orchestrator service
   orchestrator:
     build: .
@@ -612,15 +589,14 @@ services:
     environment:
       # Music configuration
       - MUSIC_ENABLED=true
-      - MUSIC_MPD_HOST=mpd
-      - MUSIC_MPD_PORT=6600
+            - MPD_HOST=127.0.0.1
+            - MPD_PORT=6600
       - MUSIC_LIBRARY_PATH=/music
       # Whisper/Piper URLs
       - WHISPER_URL=http://whisper:10000
       - PIPER_URL=http://piper:10001
       # Other env vars from .env file
     depends_on:
-      - mpd
       - whisper
       - piper
     restart: unless-stopped
@@ -628,8 +604,6 @@ services:
       - voice-network
 
 volumes:
-  mpd-state:
-    driver: local
   whisper-models:
     driver: local
   piper-data:
@@ -642,49 +616,41 @@ networks:
 
 ### 4.5 MPD Configuration File
 
-Create `docker/mpd/mpd.conf`:
+Create `orchestrator/services/mpd.conf`:
 
 ```conf
 # Music directory (container path)
 music_directory         "/music"
 
 # State files
-playlist_directory      "/var/lib/mpd/playlists"
-db_file                 "/var/lib/mpd/database"
-log_file                "/var/lib/mpd/mpd.log"
-pid_file                "/var/run/mpd/pid"
-state_file              "/var/lib/mpd/state"
-sticker_file            "/var/lib/mpd/sticker.sql"
+playlist_directory      "/tmp/openclaw-mpd/playlists"
+db_file                 "/tmp/openclaw-mpd/database"
+log_file                "/tmp/openclaw-mpd/mpd.log"
+pid_file                "/tmp/openclaw-mpd/mpd.pid"
+state_file              "/tmp/openclaw-mpd/state"
+sticker_file            "/tmp/openclaw-mpd/sticker.sql"
 
 # Network settings
-bind_to_address         "0.0.0.0"
+bind_to_address         "127.0.0.1"
 port                    "6600"
 
-# Audio output (ALSA for container, or null if no audio needed)
+# Audio output (ALSA/Pulse inside orchestrator container)
 audio_output {
     type                "alsa"
-    name                "Container Output"
+    name                "Orchestrator Output"
     mixer_type          "software"
 }
 
-# Optional: HTTP streaming output
 audio_output {
-    type                "httpd"
-    name                "HTTP Stream"
-    encoder             "vorbis"
-    port                "8000"
-    bind_to_address     "0.0.0.0"
-    quality             "5.0"
+    type                "fifo"
+    name                "Orchestrator FIFO Output"
+    path                "/tmp/mpd-fifo/music.pcm"
     format              "44100:16:2"
+    mixer_type          "none"
 }
-
-# Permissions
-user                    "mpd"
-group                   "audio"
 
 # Performance
 auto_update             "yes"
-auto_update_depth       "4"
 ```
 
 ### 4.6 Docker Environment File
@@ -697,10 +663,9 @@ MUSIC_LIBRARY_HOST_PATH=/home/stever/Music
 
 # Music Control
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=mpd
-MUSIC_MPD_PORT=6600
+MPD_HOST=127.0.0.1
+MPD_PORT=6600
 MUSIC_LIBRARY_PATH=/music
-MUSIC_MPD_STATE_DIR=/var/lib/mpd
 
 # ... other orchestrator settings ...
 ```
@@ -1317,11 +1282,11 @@ orchestrator/
   main.py                 # Modified: initialize music system
 
 docker/
-  mpd/
-    mpd.conf              # MPD configuration for container
-    Dockerfile            # Optional: custom MPD image
+    services/
+        mpd.conf              # Bundled MPD configuration
+        mpd_manager.py        # Orchestrator-managed MPD lifecycle
 
-docker-compose.yml        # Updated: add MPD service and volumes
+docker-compose.yml        # Updated: orchestrator container owns MPD runtime
 .env.docker               # Docker-specific environment config
 test_music_system.py      # Test suite
 MUSIC_CONTROL_USAGE.md    # Usage documentation
@@ -1358,18 +1323,6 @@ services:
     networks:
       - voice-network
 
-  mpd:
-    image: vimagick/mpd:latest
-    ports:
-      - "6600:6600"
-    volumes:
-      - ${MUSIC_LIBRARY_HOST_PATH:-/home/stever/Music}:/music:ro
-      - mpd-state:/var/lib/mpd
-      - ./docker/mpd/mpd.conf:/etc/mpd.conf:ro
-    restart: unless-stopped
-    networks:
-      - voice-network
-
   orchestrator:
     build: .
     volumes:
@@ -1377,13 +1330,12 @@ services:
       - ./timers:/app/timers
     environment:
       - MUSIC_ENABLED=true
-      - MUSIC_MPD_HOST=mpd
-      - MUSIC_MPD_PORT=6600
+            - MPD_HOST=127.0.0.1
+            - MPD_PORT=6600
       - MUSIC_LIBRARY_PATH=/music
       - WHISPER_URL=http://whisper:10000
       - PIPER_URL=http://piper:10001
     depends_on:
-      - mpd
       - whisper
       - piper
     restart: unless-stopped
@@ -1391,7 +1343,6 @@ services:
       - voice-network
 
 volumes:
-  mpd-state:
   whisper-models:
   piper-data:
 
@@ -1406,8 +1357,8 @@ MUSIC_LIBRARY_HOST_PATH=/home/stever/Music
 
 # Music Control
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=mpd
-MUSIC_MPD_PORT=6600
+MPD_HOST=127.0.0.1
+MPD_PORT=6600
 MUSIC_LIBRARY_PATH=/music
 
 # Quick Answer (required for tools)
@@ -1426,20 +1377,20 @@ docker-compose up -d
 # Say: "update library" or "scan music"
 
 # Or manually via command:
-docker-compose exec mpd mpc update
+docker-compose exec orchestrator-linux-alsa mpc update
 
 # Index music library (IMPORTANT - run once after first start)
 # Option 1: Via voice command (preferred)
 # Say: "update library" or "scan music"
 
 # Option 2: Manual command
-docker-compose exec mpd mpc update
+docker-compose exec orchestrator-linux-alsa mpc update
 
 # Wait for indexing to complete (check progress)
-docker-compose exec mpd mpc status
+docker-compose exec orchestrator-linux-alsa mpc status
 
 # Verify songs were indexed
-docker-compose exec mpd mpc listall | wc -l
+docker-compose exec orchestrator-linux-alsa mpc listall | wc -l
 
 # Note: The orchestrator will auto-update if library is empty on startup
 ```
@@ -1450,8 +1401,8 @@ docker-compose exec mpd mpc listall | wc -l
 ```bash
 # Music Control
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=localhost
-MUSIC_MPD_PORT=6600
+MPD_HOST=localhost
+MPD_PORT=6600
 MUSIC_LIBRARY_PATH=/home/stever/Music
 
 # Quick Answer (required for tools)
@@ -1485,11 +1436,10 @@ mpc listall | wc -l
 ```bash
 # Music Control
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=localhost
-MUSIC_MPD_PORT=6600
-MUSIC_MPD_TIMEOUT=5.0
-MUSIC_CONNECTION_POOL_SIZE=3
-MUSIC_SEARCH_LIMIT=50
+MPD_HOST=localhost
+MPD_PORT=6600
+MPD_TIMEOUT=5.0
+MPD_POOL_SIZE=3
 MUSIC_LIBRARY_PATH=/home/stever/Music  # Or /music in Docker
 
 # Tools (timers/alarms)
@@ -1512,10 +1462,10 @@ QUICK_ANSWER_TIMEOUT_MS=5000
 
 **System requirements:**
 
-**Option 1: MPD in Docker (Recommended for orchestrator in container)**
+**Option 1: MPD bundled in orchestrator container (recommended for Docker)**
 ```yaml
-# docker-compose.yml includes MPD service
-# Volumes automatically configured
+# Dockerfile installs mpd/mpc in the orchestrator image
+# Music/FIFO paths are mounted into the orchestrator container
 # No host installation needed
 ```
 
@@ -1543,8 +1493,8 @@ mpc listall | wc -l  # Should show song count > 0
 
 **MPD Configuration Requirements:**
 - Music library path: `/home/stever/Music` (host) → `/music` (container)
-- MPD state directory: Persistent volume for database/playlists
-- Network access: Port 6600 exposed for orchestrator
+- MPD state directory: container-local runtime path such as `/tmp/openclaw-mpd`
+- Network access: `127.0.0.1:6600` inside the orchestrator runtime
 
 **Volume Mount Strategy:**
 
@@ -1552,14 +1502,14 @@ mpc listall | wc -l  # Should show song count > 0
 Host Path                    Container Path              Mode    Purpose
 ---------------------------- --------------------------- ------- ---------------------------
 /home/stever/Music          /music                      ro      Music files (read-only)
-mpd-state (named volume)    /var/lib/mpd               rw      MPD database & playlists
-docker/mpd/mpd.conf         /etc/mpd.conf              ro      MPD configuration
+orchestrator temp runtime   /tmp/openclaw-mpd          rw      MPD database & playlists
+orchestrator/services/mpd.conf internal                ro      Bundled MPD configuration
 ```
 
 **Why persistent volumes matter:**
-- `/var/lib/mpd/database` - Avoids re-indexing 100k+ songs on every restart (can take 5+ minutes)
-- `/var/lib/mpd/state` - Preserves playback queue and position across restarts
-- `/var/lib/mpd/playlists/` - Keeps user-created playlists
+- `/tmp/openclaw-mpd/database` - Avoids re-indexing during a running container session
+- `/tmp/openclaw-mpd/state` - Preserves playback queue and position during runtime
+- `/tmp/openclaw-mpd/playlists/` - Keeps user-created playlists during runtime
 - Music library can be read-only since MPD doesn't modify audio files
 
 ## Migration from Skills Folder
@@ -1591,7 +1541,7 @@ Copy concepts, NOT code:
 
 ## Deployment Scenarios
 
-### Scenario 1: Orchestrator + MPD Both in Docker (Recommended)
+### Scenario 1: Orchestrator Container with Bundled MPD (Recommended)
 
 **Advantages:**
 - ✅ Complete isolation and portability
@@ -1607,10 +1557,9 @@ services:
   mpd:
     volumes:
       - /home/stever/Music:/music:ro
-      - mpd-state:/var/lib/mpd
   orchestrator:
     environment:
-      - MUSIC_MPD_HOST=mpd
+    - MPD_HOST=127.0.0.1
       - MUSIC_LIBRARY_PATH=/music
 ```
 
@@ -1626,6 +1575,7 @@ services:
     network_mode: host  # Access host's localhost
     environment:
       - MUSIC_MPD_HOST=localhost
+    - MPD_HOST=localhost
       - MUSIC_LIBRARY_PATH=/home/stever/Music  # Not used by orchestrator, only for reference
 ```
 
@@ -1636,8 +1586,8 @@ services:
 **Configuration:**
 ```bash
 # .env
-MUSIC_MPD_HOST=localhost
-MUSIC_MPD_PORT=6600
+MPD_HOST=localhost
+MPD_PORT=6600
 MUSIC_LIBRARY_PATH=/home/stever/Music
 ```
 
@@ -1652,7 +1602,7 @@ music_directory "/home/stever/Music"
 | Component | Docker Path | Native Path | Who Uses It |
 |-----------|-------------|-------------|-------------|
 | Music files | `/music` (container) | `/home/stever/Music` (host) | MPD only |
-| MPD state | `/var/lib/mpd` | `/var/lib/mpd` | MPD only |
+| MPD state | `/tmp/openclaw-mpd` | `/var/lib/mpd` | MPD only |
 | Orchestrator | No direct access | No direct access | Connects via TCP port 6600 |
 
 **Key insight:** The orchestrator never needs direct filesystem access to music files or MPD state. It only connects to MPD via TCP socket (port 6600). The `MUSIC_LIBRARY_PATH` environment variable is optional and only used for user reference or potential future features.
@@ -1844,16 +1794,16 @@ The system is designed to be:
 
 ### Docker Deployment Highlights
 
-**MPD State Persistence:**
-- Database file: `/var/lib/mpd/database` - Indexed library (avoid re-scanning 100k+ songs)
-- State file: `/var/lib/mpd/state` - Playback position, queue, volume
-- Playlists: `/var/lib/mpd/playlists/` - User-created playlists
-- All stored in Docker named volume for persistence across container restarts
+**MPD Runtime State:**
+- Database file: `/tmp/openclaw-mpd/database` - Indexed library during container runtime
+- State file: `/tmp/openclaw-mpd/state` - Playback position, queue, volume
+- Playlists: `/tmp/openclaw-mpd/playlists/` - User-created playlists during runtime
+- Host music files remain mounted read-only at `/music`
 
 **Volume Mount Strategy:**
 ```yaml
 Host: /home/stever/Music     → Container: /music (read-only)
-Named volume: mpd-state      → Container: /var/lib/mpd (read-write)
+Host: /tmp/openclaw-mpd-fifo → Container: /tmp/mpd-fifo (rw FIFO bind)
 ```
 
 **Path Configuration:**
@@ -1881,7 +1831,7 @@ docker-compose up -d
 # Say: "update library" or "scan music"
 
 # 4. Verify indexing complete
-docker-compose exec mpd mpc stats
+docker-compose exec orchestrator-linux-alsa mpc stats
 # Should show: songs, albums, artists counts > 0
 
 # 5. Test voice control
@@ -1893,31 +1843,31 @@ docker-compose exec mpd mpc stats
 
 ```bash
 # Check MPD status
-docker-compose exec mpd mpc status
+docker-compose exec orchestrator-linux-alsa mpc status
 
 # Update library after adding music (or use voice: "update library")
-docker-compose exec mpd mpc update
+docker-compose exec orchestrator-linux-alsa mpc update
 
 # List indexed songs
-docker-compose exec mpd mpc listall | head -20
+docker-compose exec orchestrator-linux-alsa mpc listall | head -20
 
 # Check library statistics
-docker-compose exec mpd mpc stats
+docker-compose exec orchestrator-linux-alsa mpc stats
 
 # Test playback
-docker-compose exec mpd mpc play
-docker-compose exec mpd mpc next
-docker-compose exec mpd mpc pause
+docker-compose exec orchestrator-linux-alsa mpc play
+docker-compose exec orchestrator-linux-alsa mpc next
+docker-compose exec orchestrator-linux-alsa mpc pause
 
 # View MPD logs
-docker-compose logs mpd
+docker-compose logs orchestrator-linux-alsa
 
 # Restart MPD
-docker-compose restart mpd
+docker-compose restart orchestrator-linux-alsa
 
 # Backup playlists
-docker-compose exec mpd tar czf /tmp/playlists.tar.gz /var/lib/mpd/playlists/
-docker cp mpd:/tmp/playlists.tar.gz ./mpd-playlists-backup.tar.gz
+docker-compose exec orchestrator-linux-alsa tar czf /tmp/playlists.tar.gz /tmp/openclaw-mpd/playlists/
+docker cp openclaw-voice:/tmp/playlists.tar.gz ./mpd-playlists-backup.tar.gz
 ```
 
 ### Environment Variables Quick Reference
@@ -1925,15 +1875,14 @@ docker cp mpd:/tmp/playlists.tar.gz ./mpd-playlists-backup.tar.gz
 ```bash
 # Required
 MUSIC_ENABLED=true
-MUSIC_MPD_HOST=mpd              # Or 'localhost' for native
-MUSIC_MPD_PORT=6600
+MPD_HOST=127.0.0.1              # Or 'localhost' for native
+MPD_PORT=6600
 MUSIC_LIBRARY_PATH=/music       # Or '/home/stever/Music' for native
 
 # Optional
 MUSIC_LIBRARY_HOST_PATH=/home/stever/Music  # For docker-compose volume mount
-MUSIC_MPD_TIMEOUT=5.0
-MUSIC_CONNECTION_POOL_SIZE=3
-MUSIC_SEARCH_LIMIT=50
+MPD_TIMEOUT=5.0
+MPD_POOL_SIZE=3
 ```
 
 ### Volume Mount Paths
@@ -1941,5 +1890,5 @@ MUSIC_SEARCH_LIMIT=50
 | Purpose | Host Path | Container Path | Mode |
 |---------|-----------|----------------|------|
 | Music files | `/home/stever/Music` | `/music` | `ro` |
-| MPD state | (Docker volume) | `/var/lib/mpd` | `rw` |
-| MPD config | `./docker/mpd/mpd.conf` | `/etc/mpd.conf` | `ro` |
+| MPD runtime FIFO | `/tmp/openclaw-mpd-fifo` | `/tmp/mpd-fifo` | `rw` |
+| MPD config | bundled in image | `orchestrator/services/mpd.conf` | `ro` |

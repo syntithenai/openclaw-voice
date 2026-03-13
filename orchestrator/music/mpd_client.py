@@ -297,6 +297,8 @@ class MPDClientPool:
     async def execute(self, command: str) -> Dict[str, str]:
         """
         Execute a single command using a pooled connection.
+        Retries once with a fresh connection if the pooled connection was stale
+        (MPD closes idle TCP connections without notifying the client).
         
         Args:
             command: MPD protocol command
@@ -305,11 +307,19 @@ class MPDClientPool:
             Dictionary of response key-value pairs
         """
         async with self.get_connection() as conn:
-            return await conn.send_command(command)
+            try:
+                return await conn.send_command(command)
+            except ConnectionError:
+                # Stale/half-open connection — reconnect and retry once
+                await conn.close()
+                if not await conn.connect():
+                    raise ConnectionError("Failed to reconnect to MPD")
+                return await conn.send_command(command)
     
     async def execute_list(self, command: str) -> List[Dict[str, str]]:
         """
         Execute a list command and return multiple items.
+        Retries once with a fresh connection if the pooled connection was stale.
         
         Args:
             command: MPD protocol command that returns multiple items
@@ -318,11 +328,15 @@ class MPDClientPool:
             List of dictionaries, one per item
         """
         async with self.get_connection() as conn:
-            # Send command
-            conn._writer.write(f"{command}\n".encode('utf-8'))
-            await asyncio.wait_for(
-                conn._writer.drain(),
-                timeout=conn.timeout
-            )
-            # Read list response
-            return await conn.send_command_list()
+            try:
+                conn._writer.write(f"{command}\n".encode('utf-8'))
+                await asyncio.wait_for(conn._writer.drain(), timeout=conn.timeout)
+                return await conn.send_command_list()
+            except ConnectionError:
+                # Stale/half-open connection — reconnect and retry once
+                await conn.close()
+                if not await conn.connect():
+                    raise ConnectionError("Failed to reconnect to MPD")
+                conn._writer.write(f"{command}\n".encode('utf-8'))
+                await asyncio.wait_for(conn._writer.drain(), timeout=conn.timeout)
+                return await conn.send_command_list()

@@ -22,11 +22,12 @@ class MusicFastPathParser:
     ]
     
     PAUSE_PATTERNS = [
-        r"^(?:pause|hold|stop)\s+(?:music|song|track|it|playback)?$",
-        r"^(?:pause|stop)$",
+        r"^(?:pause|hold)\s+(?:music|song|track|it|playback)?$",
+        r"^(?:pause|hold)$",
     ]
     
     STOP_PATTERNS = [
+        r"^(?:stop)$",
         r"^(?:stop)\s+(?:music|song|track|playing|playback|the music)$",
     ]
     
@@ -77,6 +78,12 @@ class MusicFastPathParser:
         r"^(?:update|scan|refresh)\s+music$",
         r"^(?:scan|update)\s+(?:the\s+)?(?:music|library)$",
     ]
+
+    COMMAND_START_HINT = (
+        r"(?:play|resume|continue|unpause|pause|hold|stop|next|skip|previous|back|"
+        r"volume|turn|increase|raise|decrease|lower|louder|quieter|what|current|"
+        r"now|update|scan|refresh|index|load|save)"
+    )
     
     def __init__(self):
         # Compile patterns for efficiency
@@ -101,6 +108,33 @@ class MusicFastPathParser:
         self.save_playlist_regex = re.compile(self.SAVE_PLAYLIST_PATTERN, re.IGNORECASE)
         
         self.library_regexes = [re.compile(p, re.IGNORECASE) for p in self.LIBRARY_PATTERNS]
+
+    def _normalize_for_matching(self, text: str) -> str:
+        """Normalize transcript for deterministic command matching."""
+        normalized = (text or "").strip().lower()
+        if not normalized:
+            return ""
+
+        # Drop obvious wake-style address prefixes that can leak into STT.
+        # Examples: "hey minecraft, stop playing", "ok openclaw stop".
+        normalized = re.sub(
+            rf"^(?:hey|hi|hello|ok(?:ay)?)\s+[a-z0-9][a-z0-9'\- ]{{0,40}},\s*",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+        normalized = re.sub(
+            rf"^(?:hey|hi|hello|ok(?:ay)?)\s+[a-z0-9][a-z0-9'\- ]{{0,40}}\s+(?={self.COMMAND_START_HINT}\b)",
+            "",
+            normalized,
+            flags=re.IGNORECASE,
+        )
+
+        # Trim polite/filler words and end punctuation to improve regex hit rate.
+        normalized = re.sub(r"^(?:please\s+)", "", normalized)
+        normalized = re.sub(r"[\s\.,!?;:]+$", "", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
     
     def parse(self, text: str) -> Optional[Tuple[str, Dict[str, Any]]]:
         """
@@ -118,7 +152,7 @@ class MusicFastPathParser:
             "play beatles" -> ("play_artist", {"artist": "beatles"})
             "what's playing" -> ("get_current_track", {})
         """
-        text = text.strip().lower()
+        text = self._normalize_for_matching(text)
         
         if not text:
             return None
@@ -128,8 +162,9 @@ class MusicFastPathParser:
         if any(regex.match(text) for regex in self.play_regexes):
             return ("play", {})
         
+        # User requested behavior: pause requests should act as stop.
         if any(regex.match(text) for regex in self.pause_regexes):
-            return ("pause", {})
+            return ("stop", {})
         
         if any(regex.match(text) for regex in self.stop_regexes):
             return ("stop", {})
@@ -185,8 +220,13 @@ class MusicFastPathParser:
         # Play genre (single word after "play some")
         if text.startswith("play some ") or text.startswith("play "):
             words = text.split()
+            genre = None
             if len(words) == 2:  # "play jazz", "play rock"
                 genre = words[1]
+            elif len(words) == 3 and words[1] == "some":  # "play some jazz"
+                genre = words[2]
+
+            if genre:
                 # Common genres (helps disambiguate from artist names)
                 common_genres = [
                     "rock", "pop", "jazz", "blues", "classical", "country",

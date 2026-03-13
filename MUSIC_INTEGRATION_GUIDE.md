@@ -78,7 +78,7 @@ The orchestrator now has deep integration with MPD music playback and hardware m
 ```bash
 # Enable music system (required for all music features)
 MUSIC_ENABLED=true
-MPD_HOST=mpd  # or localhost
+MPD_HOST=127.0.0.1
 MPD_PORT=6600
 
 # Enable media keys (required for button detection)
@@ -105,7 +105,7 @@ MUSIC_RANDOM_TRACK_COUNT=50
 ```bash
 # Music Control (MPD)
 MUSIC_ENABLED=true
-MPD_HOST=mpd
+MPD_HOST=127.0.0.1
 MPD_PORT=6600
 MUSIC_SLEEP_DURING_PLAYBACK=true
 MUSIC_AUTO_RESUME_TIMEOUT_S=5
@@ -223,7 +223,7 @@ if music_paused_for_wake and no_voice_activity:
 
 **Check:**
 1. `MUSIC_ENABLED=true` in `.env`
-2. MPD is running: `docker ps | grep mpd`
+2. MPD is running: `mpc status`
 3. Music manager initialized in logs
 4. Wake word detector working properly
 

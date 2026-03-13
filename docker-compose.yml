@@ -6,15 +6,14 @@ x-orchestrator-common: &orchestrator-common
   depends_on:
     - whisper
     - piper
-    - mpd
   env_file:
     - .env.docker
   environment:
     - PYTHONUNBUFFERED=1
-    # Internal service DNS for compose network
+    # Internal service endpoints for compose network
     - WHISPER_URL=http://whisper:10000
     - PIPER_URL=http://piper:10001
-    - MPD_HOST=mpd
+    - MPD_HOST=127.0.0.1
     - MPD_PORT=6600
     # Model/cache paths inside container
     - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
@@ -37,6 +36,8 @@ x-orchestrator-common: &orchestrator-common
     - ${HOME}/.openclaw:/root/.openclaw
     # Music library for MPD skill
     - ${HOME}/music:/music:ro
+    # Shared MPD->orchestrator FIFO path
+    - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
 
 services:
   whisper:
@@ -54,24 +55,20 @@ services:
       - ./docker/whisper-models:/models:rw
     devices:
       - /dev/dri:/dev/dri
-  mpd:
+
+  snapserver:
     restart: unless-stopped
-    build:
-      context: ./docker/mpd
-      dockerfile: Dockerfile
+    image: ghcr.io/badaix/snapserver:latest
+    profiles:
+      - snapcast
     ports:
-      - "6600:6600"
-    environment:
-      - MUSIC_LIBRARY_PATH=/music
-      - PULSE_SERVER=unix:/tmp/pulse/native
+      - "1704:1704"
+      - "1705:1705"
+      - "1780:1780"
+    command:
+      - "--stream.source=pipe:///tmp/mpd-fifo/music.pcm?name=mpd_fifo&mode=read&sampleformat=44100:16:2"
     volumes:
-      - mpd-state:/var/lib/mpd
-      - ${MUSIC_LIBRARY_HOST_PATH:-${HOME}/Music}:/music:ro
-      - ${XDG_RUNTIME_DIR}/pulse/native:/tmp/pulse/native
-    devices:
-      - "/dev/snd:/dev/snd"
-    group_add:
-      - "audio"
+      - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
 
 
   piper:
@@ -103,40 +100,44 @@ services:
     profiles:
       - manual  # Don't start by default - use orchestrator-linux-alsa
     environment:
-      - AUDIO_CAPTURE_DEVICE=0
-      - AUDIO_PLAYBACK_DEVICE=0
+      - AUDIO_CAPTURE_DEVICE=hw:2,0
+      - AUDIO_PLAYBACK_DEVICE=hw:1,0
     
   # Linux ALSA hardware pass-through profile (direct /dev/snd access)
   # DEFAULT: This is the working orchestrator for Linux desktop
   orchestrator-linux-alsa:
     <<: *orchestrator-common
     environment:
-      - AUDIO_CAPTURE_DEVICE=0
-      - AUDIO_PLAYBACK_DEVICE=0
+      - AUDIO_CAPTURE_DEVICE=hw:2,0
+      - AUDIO_PLAYBACK_DEVICE=hw:1,0
     devices:
       - "/dev/snd:/dev/snd"
     group_add:
       - "audio"
 
   # Linux PulseAudio/PipeWire socket profile (desktop-friendly)
-  # NOTE: Currently broken - PortAudio lacks PulseAudio support in container
+  # Uses host networking so localhost host services (gateway, mapped STT/TTS ports)
+  # are reachable directly from the container.
   orchestrator-linux-pulse:
     <<: *orchestrator-common
     profiles:
       - manual  # Don't start by default - requires PulseAudio-enabled PortAudio
+    network_mode: host
     environment:
+      - OPENCLAW_ENV_FILE=/app/.env.docker
       - PYTHONUNBUFFERED=1
-      - WHISPER_URL=http://whisper:10000
-      - PIPER_URL=http://piper:10001
-      - MPD_HOST=mpd
+      - WHISPER_URL=http://127.0.0.1:10000
+      - PIPER_URL=http://127.0.0.1:10001
+      - OPENCLAW_GATEWAY_URL=http://127.0.0.1:18789
+      - MPD_HOST=127.0.0.1
       - MPD_PORT=6600
       - SILERO_MODEL_CACHE_DIR=/app/docker/silero-models
       - OPENWAKEWORD_MODELS_DIR=/app/docker/wakeword-models
       - EMOTION_MODELS_DIR=/app/docker/emotion-models
       - MODELSCOPE_CACHE=/app/.cache/modelscope
       - PULSE_SERVER=unix:/tmp/pulse/native
-      - AUDIO_CAPTURE_DEVICE=0
-      - AUDIO_PLAYBACK_DEVICE=0
+      - AUDIO_CAPTURE_DEVICE=default
+      - AUDIO_PLAYBACK_DEVICE=default
     volumes:
       - ./docker/silero-models:/app/docker/silero-models
       - ./docker/wakeword-models:/app/docker/wakeword-models
@@ -151,8 +152,7 @@ services:
       - ${HOME}/.config/pulse/cookie:/root/.config/pulse/cookie:ro
       # Music library for MPD skill
       - ${HOME}/Music:/music:ro
-volumes:
-  mpd-state:
-    driver: local
+      # Shared MPD->orchestrator FIFO path
+      - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
 
 

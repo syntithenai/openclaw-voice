@@ -266,6 +266,8 @@ AUDIO_CAPTURE_DEVICE=default             # Input device (default, hw:0,0, etc.)
 AUDIO_PLAYBACK_DEVICE=default            # Output device
 AUDIO_BACKEND=portaudio                  # Audio backend (portaudio, alsa)
 AUDIO_INPUT_GAIN=1.0                     # Microphone gain multiplier
+AUDIO_OUTPUT_GAIN=1.0                    # Base TTS/output gain multiplier
+TTS_RELATIVE_GAIN=0.75                   # TTS trim relative to music/background (lower = quieter TTS)
 ```
 
 ### Voice Activity Detection (VAD)
@@ -288,6 +290,10 @@ VAD_CUT_IN_MIN_MS=150                    # Min duration to trigger cut-in
 VAD_CUT_IN_FRAMES=3                      # Consecutive frames required
 VAD_CUT_IN_USE_SILERO=false              # Use Silero VAD for cut-in detection
 VAD_CUT_IN_SILERO_CONFIDENCE=0.3         # Silero confidence for cut-in
+
+MUSIC_CUT_IN_RMS=0.0                     # 0 = inherit VAD_CUT_IN_RMS; raise/lower for music only
+MUSIC_CUT_IN_MIN_MS=0                    # 0 = inherit VAD_CUT_IN_MIN_MS
+MUSIC_CUT_IN_FRAMES=0                    # 0 = inherit VAD_CUT_IN_FRAMES
 ```
 
 ### Echo Cancellation
@@ -353,6 +359,51 @@ GATEWAY_TIMEOUT_MS=30000                 # Request timeout
 GATEWAY_DEBOUNCE_MS=2000                 # Debounce rapid follow-ups
 GATEWAY_TTS_FAST_START_WORDS=5           # Start TTS after N words
 ```
+
+### MPD FIFO Scaffold (optional)
+```bash
+MPD_FIFO_ENABLED=false                   # Enable MPD FIFO reader scaffold (no mixer yet)
+MPD_FIFO_PATH=/tmp/openclaw-mpd-fifo/music.pcm  # Native orchestrator + MPD container path
+MPD_FIFO_SAMPLE_RATE=44100               # Expected FIFO sample rate
+MPD_FIFO_CHANNELS=2                      # Expected FIFO channels
+MPD_FIFO_BITS_PER_SAMPLE=16              # Expected FIFO bit depth
+MPD_FIFO_CHUNK_BYTES=16384               # FIFO read chunk size for passthrough
+MPD_MIX_GAIN=1.0                         # Base mixed music gain
+MPD_MIX_DUCK_TTS_GAIN=0.30               # Ducked gain while TTS active/pending
+MPD_MIX_DUCK_ALARM_GAIN=0.12             # Ducked gain while alarm ringing
+MPD_MIX_DUCK_LISTENING_GAIN=0.25         # Ducked gain while listening/sending
+```
+
+For Docker deployments, set the host bind path used by both containers:
+
+```bash
+MPD_FIFO_HOST_PATH=/tmp/openclaw-mpd-fifo
+MPD_FIFO_PATH=/tmp/mpd-fifo/music.pcm    # Inside orchestrator container
+```
+
+Deployment scenarios:
+
+- Docker orchestrator container: the orchestrator starts MPD internally and uses in-container `/tmp/mpd-fifo/music.pcm` backed by `MPD_FIFO_HOST_PATH`.
+- Native orchestrator + native MPD: both use the host FIFO path directly (for example `/tmp/openclaw-mpd-fifo/music.pcm`).
+- Docker orchestrator + Snapserver: both mount `MPD_FIFO_HOST_PATH`, with Snapserver reading `/tmp/mpd-fifo/music.pcm`.
+
+Phase 2 status:
+
+- FIFO passthrough playback is active when `MPD_FIFO_ENABLED=true`.
+- Current implementation is a basic downmix/resample passthrough (not a full multi-source mixer).
+
+### Snapcast (optional)
+```bash
+SNAPCAST_ENABLED=false                   # Auto-start snapserver in docker helper script
+SNAPCAST_HOST=snapserver                 # Snapserver host for future control integration
+SNAPCAST_PORT=1705                       # Snapserver control port
+```
+
+Docker usage:
+
+- Set `SNAPCAST_ENABLED=true` in `.env.docker`
+- Run `./run_docker_orchestrator_auto_audio.sh`
+- Script will start compose with `--profile snapcast` and include `snapserver`
 
 See `orchestrator/config.py` for all available gateway providers and configuration options.
 

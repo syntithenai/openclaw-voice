@@ -11,6 +11,8 @@ Provides user-friendly methods that map to MPD commands:
 
 import asyncio
 import logging
+import shutil
+import time
 from typing import Dict, List, Optional
 from .mpd_client import MPDClientPool
 
@@ -20,8 +22,94 @@ logger = logging.getLogger(__name__)
 class MusicManager:
     """High-level music control interface wrapping MPD client pool."""
     
-    def __init__(self, pool: MPDClientPool):
+    def __init__(
+        self,
+        pool: MPDClientPool,
+        genre_queue_limit: int = 120,
+        pipewire_stream_normalize_enabled: bool = True,
+        pipewire_stream_target_percent: int = 100,
+    ):
         self.pool = pool
+        self.genre_queue_limit = max(1, int(genre_queue_limit))
+        self.pipewire_stream_normalize_enabled = bool(pipewire_stream_normalize_enabled)
+        self.pipewire_stream_target_percent = max(1, min(150, int(pipewire_stream_target_percent)))
+        self._last_pipewire_normalize_ts = 0.0
+
+    async def _normalize_pipewire_mpd_stream_volume(self) -> None:
+        """Best-effort: set PipeWire per-app stream volume for MPD to target percent.
+
+        MPD's internal volume (setvol/status volume) can diverge from PipeWire's
+        sink-input volume for the MPD stream, causing silent playback despite MPD
+        reporting normal playback. This method normalizes the MPD sink-input level.
+        """
+        if not self.pipewire_stream_normalize_enabled:
+            return
+
+        # Avoid hammering pactl when play() is called repeatedly.
+        now = time.monotonic()
+        if (now - self._last_pipewire_normalize_ts) < 2.0:
+            return
+        self._last_pipewire_normalize_ts = now
+
+        if shutil.which("pactl") is None:
+            return
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pactl",
+                "list",
+                "sink-inputs",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+            if proc.returncode != 0:
+                logger.debug("Skipping PipeWire MPD stream normalize: pactl list failed: %s", stderr.decode("utf-8", errors="ignore").strip())
+                return
+
+            text = stdout.decode("utf-8", errors="ignore")
+            blocks = text.split("Sink Input #")
+            mpd_ids: List[str] = []
+
+            for block in blocks[1:]:
+                lines = block.splitlines()
+                if not lines:
+                    continue
+                sink_input_id = lines[0].strip()
+                if not sink_input_id:
+                    continue
+                if 'application.name = "Music Player Daemon"' in block:
+                    mpd_ids.append(sink_input_id)
+
+            if not mpd_ids:
+                return
+
+            target = f"{self.pipewire_stream_target_percent}%"
+            for sink_input_id in mpd_ids:
+                set_proc = await asyncio.create_subprocess_exec(
+                    "pactl",
+                    "set-sink-input-volume",
+                    sink_input_id,
+                    target,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, set_err = await set_proc.communicate()
+                if set_proc.returncode != 0:
+                    logger.debug(
+                        "Failed to normalize MPD PipeWire stream volume (sink-input=%s): %s",
+                        sink_input_id,
+                        set_err.decode("utf-8", errors="ignore").strip(),
+                    )
+                    continue
+
+                logger.info(
+                    "🎚️ Normalized MPD PipeWire stream volume: sink-input=%s target=%s",
+                    sink_input_id,
+                    target,
+                )
+        except Exception as exc:
+            logger.debug("PipeWire MPD stream normalize skipped: %s", exc)
     
     # ========== Playback Control ==========
     
@@ -38,9 +126,11 @@ class MusicManager:
         try:
             if position is not None:
                 await self.pool.execute(f"play {position}")
+                await self._normalize_pipewire_mpd_stream_volume()
                 return f"Playing track {position + 1}"
             else:
                 await self.pool.execute("play")
+                await self._normalize_pipewire_mpd_stream_volume()
                 return "Playback started"
         except Exception as e:
             logger.error(f"Failed to play: {e}")
@@ -63,11 +153,35 @@ class MusicManager:
         except Exception as e:
             logger.error(f"Failed to pause: {e}")
             return f"Error: {e}"
+
+    async def pause_if_playing(self) -> bool:
+        """Pause playback only when state is 'play'. Returns True if paused."""
+        try:
+            status = await self.pool.execute("status")
+            if status.get("state", "stop") == "play":
+                await self.pool.execute("pause 1")
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Failed to pause_if_playing: {e}")
+            return False
     
     async def stop(self) -> str:
         """Stop playback."""
         try:
             await self.pool.execute("stop")
+            # Verify stop actually took effect; if MPD state still reports play,
+            # force a pause and issue stop again as a fallback.
+            status = await self.pool.execute("status")
+            state = status.get("state", "stop") if status else "stop"
+            if state == "play":
+                await self.pool.execute("pause 1")
+                await self.pool.execute("stop")
+                status = await self.pool.execute("status")
+                state = status.get("state", "stop") if status else "stop"
+                if state == "play":
+                    logger.warning("MPD stop fallback executed but state is still 'play'")
+                    return "Error: failed to stop playback"
             return "Stopped"
         except Exception as e:
             logger.error(f"Failed to stop: {e}")
@@ -352,27 +466,68 @@ class MusicManager:
     async def play_genre(self, genre: str, shuffle: bool = True) -> str:
         """Play tracks from a genre."""
         try:
-            tracks = await self.search_genre(genre)
-            if not tracks:
+            # Use server-side MPD query+enqueue to avoid client-side per-track loops
+            # that can stall for very large genres.
+            await self.clear_queue()
+
+            safe_genre = genre.replace('"', '\\"')
+            await self.pool.execute(f'searchadd genre "{safe_genre}"')
+
+            status_after_add = await self.get_status()
+            queue_len = int(status_after_add.get("playlistlength", 0)) if status_after_add else 0
+
+            if queue_len == 0:
                 stats = await self.get_stats()
                 song_count = int(stats.get("songs", 0))
-                
                 if song_count == 0:
                     return "No music in library. Say 'update library' to scan your music folder."
-                else:
-                    return f"No tracks found for genre: {genre}"
-            
-            # Clear queue and add all tracks
-            await self.clear_queue()
-            for track in tracks:
-                if "file" in track:
-                    await self.add_to_queue(track["file"])
+                return f"No tracks found for genre: {genre}"
+
+            # Apply queue cap to keep startup snappy for very broad genres.
+            if queue_len > self.genre_queue_limit:
+                await self.pool.execute(f'delete {self.genre_queue_limit}:')
+                queue_len = self.genre_queue_limit
+                logger.info(
+                    "Genre '%s' queue capped to %d tracks (originally > %d)",
+                    genre,
+                    queue_len,
+                    self.genre_queue_limit,
+                )
             
             if shuffle:
                 await self.pool.execute("random 1")
             
             await self.play()
-            return f"Playing {len(tracks)} {genre} tracks"
+
+            status_after_play = await self.get_status()
+            state_after_play = status_after_play.get("state", "unknown") if status_after_play else "unknown"
+            volume_after_play_raw = status_after_play.get("volume") if status_after_play else None
+            try:
+                volume_after_play = int(volume_after_play_raw) if volume_after_play_raw is not None else None
+            except (TypeError, ValueError):
+                volume_after_play = None
+            enabled_outputs = await self.get_enabled_output_names()
+
+            logger.info(
+                "Genre playback diagnostics: genre=%s queue=%d state=%s volume=%s outputs=%s",
+                genre,
+                queue_len,
+                state_after_play,
+                volume_after_play if volume_after_play is not None else "unknown",
+                ", ".join(enabled_outputs) if enabled_outputs else "none",
+            )
+
+            if volume_after_play is not None and volume_after_play <= 0:
+                await self.set_volume(35)
+                logger.warning(
+                    "MPD volume was 0 during genre playback; auto-raised to 35%% to avoid silent playback"
+                )
+                return f"Playing {queue_len} {genre} tracks (volume was muted, set to 35%)"
+
+            if not enabled_outputs:
+                return f"Playing {queue_len} {genre} tracks, but MPD has no enabled audio outputs"
+
+            return f"Playing {queue_len} {genre} tracks"
         except Exception as e:
             logger.error(f"Failed to play genre: {e}")
             return f"Error: {e}"
