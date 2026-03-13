@@ -49,12 +49,18 @@ services:
       - "10000:10000"
     environment:
       - PYTHONUNBUFFERED=1
-      - MODEL_PATH=/models/ggml-base.en.bin
+      - MODEL_PATH=/models/ggml-large-v3.bin
       - WHISPER_CPP_PATH=/app/build/bin/whisper-cli
+      - WHISPER_BACKEND_PREFERENCE=${WHISPER_BACKEND_PREFERENCE:-auto}
+      - WHISPER_CPU_FALLBACK=${WHISPER_CPU_FALLBACK:-true}
     volumes:
       - ./docker/whisper-models:/models:rw
+    # GPU passthrough for Vulkan (auto-detected; remove on non-GPU systems)
     devices:
       - /dev/dri:/dev/dri
+    group_add:
+      - video
+      - render
 
   snapserver:
     restart: unless-stopped
@@ -73,7 +79,6 @@ services:
 
   piper:
     restart: unless-stopped
-    runtime: amd
     build:
       context: ./docker/piper
       dockerfile: Dockerfile
@@ -82,14 +87,10 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - PIPER_VOICE_ID=${PIPER_VOICE_ID:-en_US-amy-medium}
+      - PIPER_BACKEND_PREFERENCE=${PIPER_BACKEND_PREFERENCE:-auto}
+      - PIPER_CPU_FALLBACK=${PIPER_CPU_FALLBACK:-true}
     volumes:
       - ./docker/piper-data:/root/.local/share/piper
-    devices:
-      - /dev/kfd:/dev/kfd
-      - /dev/dri:/dev/dri
-    group_add:
-      - video
-      - render
 
   # Cross-platform-safe default orchestrator container.
   # Works on Linux/macOS/Windows, but direct host microphone/speaker mapping
@@ -112,6 +113,8 @@ services:
       - AUDIO_PLAYBACK_DEVICE=hw:1,0
     devices:
       - "/dev/snd:/dev/snd"
+      - "/dev/input:/dev/input:ro"
+      - "/dev/uinput:/dev/uinput"
     group_add:
       - "audio"
 
@@ -154,5 +157,8 @@ services:
       - ${HOME}/Music:/music:ro
       # Shared MPD->orchestrator FIFO path
       - ${MPD_FIFO_HOST_PATH:-/tmp/openclaw-mpd-fifo}:/tmp/mpd-fifo
+    devices:
+      - "/dev/input:/dev/input:ro"
+      - "/dev/uinput:/dev/uinput"
 
 

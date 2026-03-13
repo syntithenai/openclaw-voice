@@ -31,6 +31,7 @@ from collections import deque
 from contextlib import redirect_stderr
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 from urllib.request import urlretrieve
 
 from orchestrator.config import VoiceConfig
@@ -1151,9 +1152,83 @@ async def run_orchestrator() -> None:
             media_key_detector = MediaKeyDetector(
                 device_filter=device_filter,
                 play_scan_codes=config.media_keys_play_scan_codes,
+                mute_scan_codes=config.media_keys_mute_scan_codes,
+                phone_scan_codes=config.media_keys_phone_scan_codes,
                 command_debounce_ms=config.media_keys_command_debounce_ms,
                 exclusive_grab=config.media_keys_exclusive_grab,
+                passthrough_keys=config.media_keys_passthrough_keys,
             )
+
+            alsa_card_cache: dict[str, str | None] = {}
+
+            def _resolve_alsa_card_for_device(device_name: str) -> str | None:
+                explicit_card = str(config.media_keys_alsa_card or "").strip()
+                if explicit_card:
+                    return explicit_card
+
+                key = (device_name or "").strip().lower()
+                if key in alsa_card_cache:
+                    return alsa_card_cache[key]
+
+                try:
+                    out = subprocess.run(
+                        ["arecord", "-l"],
+                        check=False,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                        text=True,
+                    ).stdout
+                except Exception:
+                    alsa_card_cache[key] = None
+                    return None
+
+                card_id: str | None = None
+                for line in out.splitlines():
+                    m = re.search(r"card\s+(\d+):\s+([^\[]+)", line, flags=re.IGNORECASE)
+                    if not m:
+                        continue
+                    idx = m.group(1)
+                    title = m.group(2).strip().lower()
+                    if key and key in title:
+                        card_id = idx
+                        break
+                    # Friendly fallback for conference speaker naming differences.
+                    if "anker" in key and "powerconf" in title:
+                        card_id = idx
+                        break
+
+                alsa_card_cache[key] = card_id
+                return card_id
+
+            async def _sync_hardware_mic_switch(muted: bool, device_name: str) -> None:
+                if not config.media_keys_sync_alsa_mic_switch:
+                    return
+
+                card = _resolve_alsa_card_for_device(device_name)
+                if not card:
+                    return
+
+                control = (config.media_keys_alsa_mic_control or "Mic").strip() or "Mic"
+                switch_value = "nocap" if muted else "cap"
+
+                def _run_amixer() -> None:
+                    subprocess.run(
+                        ["amixer", "-c", str(card), "sset", control, switch_value],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+
+                try:
+                    await asyncio.to_thread(_run_amixer)
+                    logger.info(
+                        "🎛️ ALSA mic switch sync: card=%s control=%s -> %s",
+                        card,
+                        control,
+                        switch_value,
+                    )
+                except Exception as e:
+                    logger.debug("ALSA mic switch sync failed: %s", e)
             
             # Set up callback to handle button presses
             async def on_media_key_press(event: MediaKeyEvent):
@@ -1408,6 +1483,7 @@ async def run_orchestrator() -> None:
                 if event.key == "mute":
                     if capture and hasattr(capture, "toggle_mute"):
                         new_state = capture.toggle_mute()
+                        await _sync_hardware_mic_switch(new_state, event.device_name)
                         logger.info(
                             "🎤 Microphone %s via hardware mute button on %s",
                             "muted" if new_state else "unmuted",
@@ -1755,6 +1831,9 @@ async def run_orchestrator() -> None:
                 ws_port=config.web_ui_ws_port,
                 status_hz=config.web_ui_status_hz,
                 hotword_active_ms=config.web_ui_hotword_active_ms,
+                mic_starts_disabled=config.web_ui_mic_starts_disabled,
+                audio_authority=config.web_ui_audio_authority,
+                chat_history_limit=config.web_ui_chat_history_limit,
             )
             await web_service.start()
             web_service.update_orchestrator_status(
@@ -1773,6 +1852,152 @@ async def run_orchestrator() -> None:
                 config.web_ui_ws_port,
             )
             print(f"✓ Embedded Voice Web UI ready at http://{config.web_ui_host}:{config.web_ui_port}", flush=True)
+
+            # Register web UI action handlers
+            async def _ui_mic_toggle(client_id: str) -> None:
+                nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts
+                cur_mic = web_service._ui_control_state.get("mic_enabled", False)
+                if not cur_mic:
+                    web_service.update_ui_control_state(mic_enabled=True)
+                    wake_state = WakeState.AWAKE
+                    last_wake_detected_ts = time.monotonic()
+                    last_activity_ts = time.monotonic()
+                    state = VoiceState.LISTENING
+                    web_service.note_hotword_detected()
+                    if config.music_enabled and music_manager:
+                        asyncio.create_task(music_manager.pause_if_playing())
+                elif wake_state == WakeState.AWAKE:
+                    web_service.update_ui_control_state(mic_enabled=False)
+                    wake_state = WakeState.ASLEEP
+                    last_wake_detected_ts = None
+                    state = VoiceState.IDLE
+                else:
+                    web_service.note_hotword_detected()
+                    wake_state = WakeState.AWAKE
+                    last_wake_detected_ts = time.monotonic()
+                    last_activity_ts = time.monotonic()
+                    state = VoiceState.LISTENING
+                    if config.music_enabled and music_manager:
+                        asyncio.create_task(music_manager.pause_if_playing())
+                web_service.update_orchestrator_status(
+                    wake_state=wake_state.value, voice_state=state.value,
+                    mic_enabled=web_service._ui_control_state.get("mic_enabled", False),
+                )
+
+            async def _ui_music_toggle(client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.toggle_playback()
+                    except Exception as exc:
+                        logger.warning("Web UI music_toggle: %s", exc)
+
+            async def _ui_music_stop(client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.stop()
+                    except Exception as exc:
+                        logger.warning("Web UI music_stop: %s", exc)
+
+            async def _ui_music_play_track(position: int, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.play(position)
+                    except Exception as exc:
+                        logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
+
+            async def _ui_timer_cancel(timer_id: str, client_id: str) -> None:
+                if timer_manager:
+                    try:
+                        await timer_manager.cancel_timer(timer_id)
+                    except Exception as exc:
+                        logger.warning("Web UI timer_cancel id=%s: %s", timer_id, exc)
+
+            async def _ui_chat_new(client_id: str) -> None:
+                nonlocal pending_transcripts, debounce_task, processing_request
+                logger.info("🆕 Web UI new chat requested by client %s", client_id)
+                try:
+                    pending_transcripts.clear()
+                    if debounce_task and not debounce_task.done():
+                        debounce_task.cancel()
+                    debounce_task = None
+                    processing_request = False
+                    _tts_clear_all("web ui new chat")
+                    tts_stop_event.set()
+
+                    try:
+                        await gateway.send_message(
+                            "/reset",
+                            session_id=session_id,
+                            agent_id=agent_id,
+                            metadata={"source": "web_ui"},
+                        )
+                        logger.info("✓ Gateway session reset via /reset")
+                    except Exception as exc:
+                        logger.warning("Gateway /reset failed (continuing with local reset): %s", exc)
+
+                    if web_service:
+                        web_service.start_new_chat()
+                finally:
+                    tts_stop_event.clear()
+
+            async def _ui_chat_text(text: str, client_id: str) -> None:
+                nonlocal pending_transcripts, debounce_task
+                normalized = normalize_transcript(text)
+                if not normalized:
+                    return
+                logger.info("💬 Web UI text message from %s: '%s'", client_id, normalized[:120])
+                pending_transcripts.append((normalized, ""))
+                if debounce_task and not debounce_task.done():
+                    debounce_task.cancel()
+                debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=True))
+
+            web_service.set_action_handlers(
+                on_mic_toggle=_ui_mic_toggle,
+                on_music_toggle=_ui_music_toggle,
+                on_music_stop=_ui_music_stop,
+                on_music_play_track=_ui_music_play_track,
+                on_timer_cancel=_ui_timer_cancel,
+                on_chat_new=_ui_chat_new,
+                on_chat_text=_ui_chat_text,
+            )
+
+            # Start music + timer state publisher
+            async def _web_ui_publisher() -> None:
+                last_music_hash = ""
+                last_timer_hash = ""
+                music_poll = config.web_ui_music_poll_ms / 1000.0
+                timer_poll = config.web_ui_timer_poll_ms / 1000.0
+                music_tick = 0.0
+                timer_tick = 0.0
+                while True:
+                    await asyncio.sleep(0.2)
+                    if not web_service:
+                        break
+                    now = time.monotonic()
+                    if music_manager and (now - music_tick) >= music_poll:
+                        music_tick = now
+                        try:
+                            ms = await music_manager.get_ui_music_state()
+                            mh = str(sorted(ms.items()))
+                            if mh != last_music_hash:
+                                last_music_hash = mh
+                                q = await music_manager.get_ui_playlist()
+                                web_service.update_music_state(queue=q, **ms)
+                        except Exception:
+                            pass
+                    if timer_manager and (now - timer_tick) >= timer_poll:
+                        timer_tick = now
+                        try:
+                            timers = timer_manager.list_ui_timers()
+                            th = str([(t["id"], round(t["remaining_seconds"])) for t in timers])
+                            if th != last_timer_hash:
+                                last_timer_hash = th
+                                web_service.update_timers_state(timers)
+                        except Exception:
+                            pass
+
+            asyncio.create_task(_web_ui_publisher())
+
         except Exception as exc:
             logger.error("Failed to start embedded web UI: %s", exc)
             print(f"✗ Embedded Voice Web UI failed to start: {exc}", flush=True)
@@ -1880,6 +2105,23 @@ async def run_orchestrator() -> None:
         Removes: emoji/icon symbol characters
         Keeps: periods, commas, dashes (natural for pacing/reading)
         """
+        def _url_to_domain(raw_url: str) -> str:
+            candidate = raw_url.strip().strip(".,!?;:)")
+            if not candidate:
+                return raw_url
+
+            parsed = urlsplit(candidate if "://" in candidate else f"https://{candidate}")
+            domain = parsed.netloc.lower().strip()
+            if "@" in domain:
+                domain = domain.split("@", 1)[-1]
+            if ":" in domain:
+                domain = domain.split(":", 1)[0]
+            return domain or raw_url
+
+        # Convert full links to domains only for speech.
+        text = re.sub(r"https?://[^\s<>\"']+", lambda m: _url_to_domain(m.group(0)), text, flags=re.IGNORECASE)
+        text = re.sub(r"\bwww\.[^\s<>\"']+", lambda m: _url_to_domain(m.group(0)), text, flags=re.IGNORECASE)
+
         # Remove punctuation that would be read aloud
         # Keep colons in time expressions (e.g., 9:45 PM), remove other colons.
         text = re.sub(r"(?<!\d):(?!\d)", "", text)
@@ -1977,7 +2219,7 @@ async def run_orchestrator() -> None:
             )
         )
 
-    async def send_debounced_transcripts() -> None:
+    async def send_debounced_transcripts(immediate: bool = False) -> None:
         """Send accumulated transcripts after debounce period."""
         nonlocal pending_transcripts, processing_request, debounce_task
         nonlocal music_paused_for_wake, music_auto_resume_timer
@@ -1987,8 +2229,11 @@ async def run_orchestrator() -> None:
             logger.info("⏱️ Debounce timer skipped - already processing a request")
             return
         
-        logger.info("⏱️ Debounce timer started (will fire in %dms)", config.gateway_debounce_ms)
-        await asyncio.sleep(config.gateway_debounce_ms / 1000)
+        if immediate:
+            logger.info("⏱️ Immediate dispatch requested (web text input)")
+        else:
+            logger.info("⏱️ Debounce timer started (will fire in %dms)", config.gateway_debounce_ms)
+            await asyncio.sleep(config.gateway_debounce_ms / 1000)
         
         logger.info("⏱️ Debounce timer fired with %d pending transcripts", len(pending_transcripts))
         if not pending_transcripts:
@@ -2033,6 +2278,13 @@ async def run_orchestrator() -> None:
             current_request_id += 1
             logger.info("📍 New user message [req#%d]", current_request_id)
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
+            if web_service:
+                web_service.append_chat_message({
+                    "role": "user",
+                    "text": combined_transcript,
+                    "source": "voice",
+                    "request_id": current_request_id,
+                })
             
             # Try quick answer first if enabled
             should_send_to_gateway = True
@@ -2073,6 +2325,14 @@ async def run_orchestrator() -> None:
                             logger.info("→ TTS QUEUE [req#%d]: Enqueuing quick answer: '%s'", current_request_id, quick_response[:80])
                             last_activity_ts = time.monotonic()
                             await submit_tts(quick_response, request_id=current_request_id)
+                            if web_service and quick_response:
+                                web_service.append_chat_message({
+                                    "role": "assistant",
+                                    "text": quick_response,
+                                    "source": "quick_answer",
+                                    "request_id": current_request_id,
+                                    "segment_kind": "final",
+                                })
                         else:
                             logger.info("→ QUICK ANSWER [req#%d]: Silent success (no TTS response)", current_request_id)
 
@@ -2168,6 +2428,14 @@ async def run_orchestrator() -> None:
                         # Update activity timestamp to keep system awake during TTS synthesis
                         last_activity_ts = time.monotonic()
                         await submit_tts(response_text, request_id=current_request_id)
+                        if web_service and response_text:
+                            web_service.append_chat_message({
+                                "role": "assistant",
+                                "text": response_text,
+                                "source": "gateway",
+                                "request_id": current_request_id,
+                                "segment_kind": "final",
+                            })
                     else:
                         # Agent executed command without returning text (e.g., "play jazz")
                         logger.info("← GATEWAY: No text response (agent executed action without speech response)")
@@ -2201,6 +2469,17 @@ async def run_orchestrator() -> None:
             previous_was_vowel = is_vowel
         return max(1, syllable_count)
 
+    def canonicalize_transcript_for_match(text: str) -> str:
+        """Lowercase transcript and remove punctuation for phrase matching."""
+        lowered = (text or "").strip().lower()
+        if not lowered:
+            return ""
+        # Normalize apostrophes, then keep only word-ish content.
+        lowered = lowered.replace("’", "'")
+        lowered = re.sub(r"[^a-z0-9\s']+", " ", lowered)
+        lowered = re.sub(r"\s+", " ", lowered).strip()
+        return lowered
+
     def normalize_transcript(transcript: str) -> str:
         """Normalize STT text and drop blank/punctuation-only markers before routing."""
         text = (transcript or "").strip()
@@ -2233,6 +2512,57 @@ async def run_orchestrator() -> None:
 
         return text
 
+    def is_likely_tts_self_echo(transcript: str, now_ts: float) -> bool:
+        """Best-effort echo suppression for transcripts captured from speaker playback."""
+        canonical = canonicalize_transcript_for_match(transcript)
+        if not canonical:
+            return False
+
+        # While TTS is active, aggressively suppress common short acknowledgements
+        # that are repeatedly re-captured from the speaker path.
+        if tts_playing and canonical in {
+            "thank you",
+            "thanks",
+            "thanks for watching",
+            "you re welcome",
+            "you're welcome",
+            "youre welcome",
+        }:
+            return True
+
+        # Only apply similarity checks while TTS is active or shortly after the
+        # most recent TTS enqueue time.
+        recent_window_s = 6.0
+        if not tts_playing and (now_ts - last_tts_ts) > recent_window_s:
+            return False
+
+        candidates: list[str] = []
+        if last_tts_text:
+            candidates.append(canonicalize_transcript_for_match(last_tts_text))
+        if current_tts_text:
+            candidates.append(canonicalize_transcript_for_match(current_tts_text))
+
+        tx_words = canonical.split()
+        tx_set = set(tx_words)
+        for candidate in candidates:
+            if not candidate:
+                continue
+            if canonical == candidate:
+                return True
+            if len(canonical) >= 8 and (canonical in candidate or candidate in canonical):
+                return True
+
+            cand_words = candidate.split()
+            cand_set = set(cand_words)
+            if not tx_set or not cand_set:
+                continue
+            overlap = len(tx_set & cand_set) / float(max(len(tx_set), 1))
+            candidate_overlap = len(tx_set & cand_set) / float(max(len(cand_set), 1))
+            if overlap >= 0.75 and candidate_overlap >= 0.6 and len(tx_words) <= 12:
+                return True
+
+        return False
+
     async def process_chunk(
         pcm: bytes,
         cut_in_ts: float | None = None,
@@ -2240,6 +2570,7 @@ async def run_orchestrator() -> None:
     ) -> None:
         nonlocal active_transcriptions, state, pending_transcripts, debounce_task
         nonlocal cut_in_tts_hold_active, cut_in_tts_hold_started_ts, cut_in_tts_hold_request_id
+        nonlocal tts_playing, last_tts_text, last_tts_ts, current_tts_text
         active_transcriptions += 1
         state = VoiceState.SENDING
         try:
@@ -2264,6 +2595,18 @@ async def run_orchestrator() -> None:
                     "⊘ Transcript filtered out after normalization (blank audio / inaudible / punctuation-only)"
                 )
                 return
+
+            # Guardrail: suppress likely self-echo transcripts captured from speaker
+            # output during playback and immediately after playback tails.
+            now_ts = time.monotonic()
+            if is_likely_tts_self_echo(transcript, now_ts):
+                logger.warning(
+                    "⊘ Transcript filtered as likely TTS self-echo (tts_playing=%s, recent_tts_ms=%d): '%s'",
+                    tts_playing,
+                    int(max(0.0, (now_ts - last_tts_ts) * 1000)),
+                    transcript[:120],
+                )
+                return
             
             # Filter single-syllable words during cut-in
             if cut_in_ts is not None:
@@ -2279,6 +2622,17 @@ async def run_orchestrator() -> None:
                             elapsed_ms
                         )
                         return
+
+                # Guardrail: when TTS is currently playing and STT captures the common
+                # self-echo phrase "you're welcome", ignore it to avoid recursive
+                # gateway requests that interrupt in-flight TTS.
+                canonical = canonicalize_transcript_for_match(transcript)
+                if tts_playing and canonical in {"you're welcome", "youre welcome"}:
+                    logger.warning(
+                        "⊘ Cut-in: Ignored likely TTS self-echo transcript during playback: '%s'",
+                        transcript[:80],
+                    )
+                    return
 
             # Emotion detection phase
             emotion_tag = ""
@@ -2471,6 +2825,14 @@ async def run_orchestrator() -> None:
                 return
                 
             await submit_tts(text_to_send, request_id=current_request_id)
+            if web_service:
+                web_service.append_chat_message({
+                    "role": "assistant",
+                    "text": text_to_send,
+                    "source": "gateway_stream",
+                    "request_id": current_request_id,
+                    "segment_kind": "stream",
+                })
             buffer = ""
 
         while True:
@@ -2537,6 +2899,14 @@ async def run_orchestrator() -> None:
                             kickoff_sent_request_id = current_request_id
                             logger.info("🚀 Fast-start chunk [req#%d]: '%s'", current_request_id, kickoff_text)
                             await submit_tts(kickoff_text, request_id=current_request_id)
+                            if web_service:
+                                web_service.append_chat_message({
+                                    "role": "assistant",
+                                    "text": kickoff_text,
+                                    "source": "gateway_stream",
+                                    "request_id": current_request_id,
+                                    "segment_kind": "stream",
+                                })
                             if flush_task and not flush_task.done():
                                 flush_task.cancel()
                             continue
@@ -2555,6 +2925,14 @@ async def run_orchestrator() -> None:
                         
                         logger.info("✅ Complete sentence: '%s'", sentence)
                         await submit_tts(sentence, request_id=current_request_id)
+                        if web_service:
+                            web_service.append_chat_message({
+                                "role": "assistant",
+                                "text": sentence,
+                                "source": "gateway_stream",
+                                "request_id": current_request_id,
+                                "segment_kind": "stream",
+                            })
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
                         continue
@@ -2746,9 +3124,26 @@ async def run_orchestrator() -> None:
         logger.info("🎚️ Music duck restore (%s): %s%%", reason, target)
 
     try:
+        local_capture_paused_for_browser = False
+        local_capture_prev_muted = False
         while True:
             now = time.monotonic()  # Always advance time, even when no audio frame arrives
-            frame = capture.read_frame(timeout=1.0)
+
+            use_browser_audio = bool(web_service and web_service.has_active_client())
+            if use_browser_audio:
+                if not local_capture_paused_for_browser and hasattr(capture, "is_muted") and hasattr(capture, "set_muted"):
+                    local_capture_prev_muted = bool(capture.is_muted())
+                    capture.set_muted(True)
+                    local_capture_paused_for_browser = True
+                    logger.info("🌐 Browser client connected: pausing local mic stream")
+                frame = await web_service.read_browser_frame(timeout=1.0)
+            else:
+                if local_capture_paused_for_browser and hasattr(capture, "set_muted"):
+                    capture.set_muted(local_capture_prev_muted)
+                    local_capture_paused_for_browser = False
+                    logger.info("🌐 Browser client disconnected: resuming local mic stream")
+                frame = capture.read_frame(timeout=1.0)
+
             if frame is None:
                 # Still run period tasks so logs/heartbeat appear even when mic is silent/blocked
                 if now - last_heartbeat_ts >= heartbeat_interval:
@@ -2909,7 +3304,19 @@ async def run_orchestrator() -> None:
                     if samples.size:
                         rms = float(np.sqrt(np.mean(samples ** 2)) / 32768.0)
                         dbfs = 20.0 * math.log10(max(rms, 1e-6))
-                        logger.info("🎚️ Mic level: %.4f (%.1f dBFS)", rms, dbfs)
+                        source_label = "Browser" if use_browser_audio else "Mic"
+                        if use_browser_audio and web_service:
+                            browser_level = web_service.latest_browser_audio()
+                            logger.info(
+                                "🎚️ %s level: frame_rms=%.4f (%.1f dBFS), browser_rms=%.4f, browser_peak=%.4f",
+                                source_label,
+                                rms,
+                                dbfs,
+                                float(browser_level.get("rms", 0.0) or 0.0),
+                                float(browser_level.get("peak", 0.0) or 0.0),
+                            )
+                        else:
+                            logger.info("🎚️ %s level: %.4f (%.1f dBFS)", source_label, rms, dbfs)
                         mic_level_count += 1
                         
                         # Swoosh sound disabled
@@ -3204,19 +3611,45 @@ async def run_orchestrator() -> None:
                     wake_word_enabled=config.wake_word_enabled,
                 )
 
-            if speech_frame_count >= min_speech_frames:
-                last_activity_ts = now
-                last_speech_ts = now
-                if not chunk_frames:
-                    chunk_start_ts = now
-                    chunk_frames = ring_buffer.get_frames()
-                chunk_frames.append(processed_frame)
-                if state == VoiceState.IDLE:
-                    state = VoiceState.LISTENING
-                    print("🎤 Speech detected → listening", flush=True)
-                    logger.info("Speech detected → listening")
-            elif chunk_frames:
-                chunk_frames.append(processed_frame)
+            if tts_playing:
+                # During TTS playback, suppress the normal speech→STT pipeline entirely
+                # to prevent TTS echo from feeding back as transcripts and causing a
+                # response loop. The cut-in path is the only authorised route to start
+                # accumulating audio while TTS is active.
+                if chunk_frames and cut_in_triggered_ts is None:
+                    # TTS started while a chunk was already in progress (race condition).
+                    # Discard the stale pre-TTS audio to avoid sending it as a new utterance.
+                    logger.debug(
+                        "TTS active: discarding stale in-progress chunk (%d frames, ~%dms)",
+                        len(chunk_frames),
+                        len(chunk_frames) * config.audio_frame_ms,
+                    )
+                    chunk_frames = []
+                    chunk_start_ts = None
+                    last_speech_ts = None
+                elif chunk_frames and cut_in_triggered_ts is not None:
+                    # Cut-in chunk in progress: keep appending frames and advance
+                    # last_speech_ts so silence detection times out correctly.
+                    chunk_frames.append(processed_frame)
+                    if speech_frame_count >= min_speech_frames:
+                        last_speech_ts = now
+                        last_activity_ts = now
+                # else: no chunk and no cut-in → nothing to do; cut-in detection loop
+                # will initiate chunk_frames when a genuine voice cut-in is confirmed.
+            else:
+                if speech_frame_count >= min_speech_frames:
+                    last_activity_ts = now
+                    last_speech_ts = now
+                    if not chunk_frames:
+                        chunk_start_ts = now
+                        chunk_frames = ring_buffer.get_frames()
+                    chunk_frames.append(processed_frame)
+                    if state == VoiceState.IDLE:
+                        state = VoiceState.LISTENING
+                        print("🎤 Speech detected → listening", flush=True)
+                        logger.info("Speech detected → listening")
+                elif chunk_frames:
+                    chunk_frames.append(processed_frame)
 
             alarm_ringing_active = bool(alarm_manager and alarm_manager.ringing_alarms)
             if alarm_ringing_active and not tts_playing:
@@ -3449,6 +3882,8 @@ async def run_orchestrator() -> None:
 
             await asyncio.sleep(0)
     finally:
+        if 'local_capture_paused_for_browser' in locals() and local_capture_paused_for_browser and hasattr(capture, "set_muted"):
+            capture.set_muted(local_capture_prev_muted)
         if web_service:
             logger.info("Stopping embedded web UI service...")
             await web_service.stop()

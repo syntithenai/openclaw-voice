@@ -18,12 +18,13 @@ import threading
 
 try:
     import evdev
-    from evdev import InputDevice, categorize, ecodes
+    from evdev import InputDevice, categorize, ecodes, UInput
     EVDEV_AVAILABLE = True
 except ImportError:
     evdev = None
     categorize = None
     ecodes = None
+    UInput = None
     EVDEV_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,24 @@ class MediaKeyDetector:
             ecodes.KEY_PHONE: "phone",  # Conference speaker phone button
             # Some devices map call controls to these keycodes instead of KEY_PHONE
             ecodes.KEY_FASTFORWARD: "phone",
+        }
+        if EVDEV_AVAILABLE
+        else {}
+    )
+
+    # Logical key names -> evdev key codes for optional OS passthrough when grabbed.
+    LOGICAL_KEY_TO_EV_CODE = (
+        {
+            "play_pause": ecodes.KEY_PLAYPAUSE,
+            "play": ecodes.KEY_PLAY,
+            "pause": ecodes.KEY_PAUSE,
+            "stop": ecodes.KEY_STOP,
+            "next": ecodes.KEY_NEXTSONG,
+            "previous": ecodes.KEY_PREVIOUSSONG,
+            "volume_up": ecodes.KEY_VOLUMEUP,
+            "volume_down": ecodes.KEY_VOLUMEDOWN,
+            "mute": ecodes.KEY_MUTE,
+            "phone": ecodes.KEY_PHONE,
         }
         if EVDEV_AVAILABLE
         else {}
@@ -195,6 +214,19 @@ class MediaKeyDetector:
                 logger.warning("Ignoring invalid media scan code value: %s", raw_part)
         return parsed
 
+    @staticmethod
+    def parse_key_name_list(keys: Optional[str]) -> Set[str]:
+        """Parse comma-separated logical key names (e.g., 'mute,phone')."""
+        if not keys:
+            return set()
+        parsed: Set[str] = set()
+        for raw_part in keys.split(","):
+            part = raw_part.strip().lower()
+            if not part:
+                continue
+            parsed.add(part)
+        return parsed
+
     def __init__(
         self,
         device_filter: Optional[str] = None,
@@ -202,8 +234,11 @@ class MediaKeyDetector:
         play_scan_codes: Optional[str] = "0xc00b6,0xc00cd",
         volume_up_scan_codes: Optional[str] = "0xc00e9",
         volume_down_scan_codes: Optional[str] = "0xc00ea",
+        mute_scan_codes: Optional[str] = "",
+        phone_scan_codes: Optional[str] = "",
         command_debounce_ms: int = 400,
         exclusive_grab: bool = False,
+        passthrough_keys: Optional[str] = "mute",
     ):
         """
         Args:
@@ -218,8 +253,11 @@ class MediaKeyDetector:
         self.play_scan_codes = self.parse_scan_code_list(play_scan_codes)
         self.volume_up_scan_codes = self.parse_scan_code_list(volume_up_scan_codes)
         self.volume_down_scan_codes = self.parse_scan_code_list(volume_down_scan_codes)
+        self.mute_scan_codes = self.parse_scan_code_list(mute_scan_codes)
+        self.phone_scan_codes = self.parse_scan_code_list(phone_scan_codes)
         self.command_debounce_s = max(0.0, command_debounce_ms / 1000.0)
         self.exclusive_grab = bool(exclusive_grab)
+        self.passthrough_keys = self.parse_key_name_list(passthrough_keys)
         self.callback: Optional[Callable[[MediaKeyEvent], None]] = None
         self.devices: List[Any] = []
         self.running = False
@@ -237,6 +275,70 @@ class MediaKeyDetector:
         # Suppress repeated safety warnings during periodic rescans.
         self._blocked_name_warned_paths: Set[str] = set()
         self._keyboard_like_warned_paths: Set[str] = set()
+        self._uinput: Any = None
+
+        self._init_passthrough_uinput()
+
+    def _init_passthrough_uinput(self) -> None:
+        """Initialize virtual input for selective key passthrough while device is grabbed."""
+        if not self.exclusive_grab or not self.passthrough_keys:
+            return
+        if UInput is None:
+            logger.warning(
+                "Selective media key passthrough requested but UInput is unavailable; keys remain blocked while grabbed"
+            )
+            return
+
+        key_codes = [
+            code
+            for key_name, code in self.LOGICAL_KEY_TO_EV_CODE.items()
+            if key_name in self.passthrough_keys
+        ]
+        if not key_codes:
+            logger.warning(
+                "MEDIA_KEYS_PASSTHROUGH_KEYS has no supported keys (%s)",
+                ",".join(sorted(self.passthrough_keys)),
+            )
+            return
+
+        try:
+            capabilities = {ecodes.EV_KEY: sorted(set(key_codes))}
+            self._uinput = UInput(capabilities, name="openclaw-media-keys-passthrough")
+            logger.info(
+                "Media key selective passthrough enabled for keys: %s",
+                ", ".join(sorted(self.passthrough_keys)),
+            )
+        except Exception as e:
+            self._uinput = None
+            logger.warning(
+                "Failed to initialize selective media key passthrough (%s); grabbed keys will stay blocked",
+                e,
+            )
+
+    def _should_passthrough_key(self, key_name: str) -> bool:
+        return bool(self.exclusive_grab and self._uinput is not None and key_name in self.passthrough_keys)
+
+    def _passthrough_raw_ev_key(self, key_code: int, value: int) -> None:
+        if self._uinput is None:
+            return
+        try:
+            self._uinput.write(ecodes.EV_KEY, key_code, value)
+            self._uinput.syn()
+        except Exception as e:
+            logger.debug("Failed raw passthrough key event code=%s value=%s: %s", key_code, value, e)
+
+    def _passthrough_logical_tap(self, key_name: str) -> None:
+        if self._uinput is None:
+            return
+        key_code = self.LOGICAL_KEY_TO_EV_CODE.get(key_name)
+        if key_code is None:
+            return
+        try:
+            self._uinput.write(ecodes.EV_KEY, key_code, 1)
+            self._uinput.write(ecodes.EV_KEY, key_code, 0)
+            self._uinput.syn()
+        except Exception as e:
+            logger.debug("Failed logical passthrough key tap key=%s: %s", key_name, e)
 
     async def _dispatch_media_event(self, media_event: MediaKeyEvent) -> None:
         """Dispatch a logical media event with per-command debounce."""
@@ -380,6 +482,13 @@ class MediaKeyDetector:
         # Close all devices
         for device in self.devices:
             device.close()
+
+        if self._uinput is not None:
+            try:
+                self._uinput.close()
+            except Exception:
+                pass
+            self._uinput = None
         
         self.devices.clear()
         self._tasks.clear()
@@ -481,6 +590,11 @@ class MediaKeyDetector:
                                 event.value,
                             )
                             continue
+
+                        if self._should_passthrough_key(key_name):
+                            # Re-inject selected keys so OS can still handle them while device is grabbed.
+                            if event.value in (0, 1, 2):
+                                self._passthrough_raw_ev_key(event.code, event.value)
                         
                         event_time = time.time()
                         key_state_key = (device.name, event.code)
@@ -536,6 +650,10 @@ class MediaKeyDetector:
                             mapped_key = "volume_up"
                         elif event.value in self.volume_down_scan_codes:
                             mapped_key = "volume_down"
+                        elif event.value in self.mute_scan_codes:
+                            mapped_key = "mute"
+                        elif event.value in self.phone_scan_codes:
+                            mapped_key = "phone"
 
                         if mapped_key is not None:
                             now = time.time()
@@ -557,6 +675,9 @@ class MediaKeyDetector:
                                 timestamp=now,
                                 event_type="press",
                             )
+                            if self._should_passthrough_key(mapped_key):
+                                # MSC_SCAN has no key-up event; synthesize a normal tap for OS consumers.
+                                self._passthrough_logical_tap(mapped_key)
                             await self._dispatch_media_event(media_event)
                 
                 except asyncio.CancelledError:

@@ -219,6 +219,11 @@ class VoiceConfig(BaseSettings):
     web_ui_ws_port: int = Field(18911)  # WebSocket bridge port
     web_ui_status_hz: int = Field(12)  # Status broadcast frequency to connected clients
     web_ui_hotword_active_ms: int = Field(2000)  # How long to keep hotword indicator active in UI after detection
+    web_ui_chat_history_limit: int = Field(200)  # Max chat messages retained in web UI memory
+    web_ui_music_poll_ms: int = Field(1000)  # How often to poll MPD for music state (ms)
+    web_ui_timer_poll_ms: int = Field(500)  # How often to push timer state to UI (ms)
+    web_ui_mic_starts_disabled: bool = Field(True)  # Mic button starts in disabled (red) state
+    web_ui_audio_authority: str = Field("native")  # native|browser|hybrid - which audio input is authoritative
 
     # Tool System
     tools_enabled: bool = Field(True)  # Enable timer/alarm tool system
@@ -250,10 +255,16 @@ class VoiceConfig(BaseSettings):
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
     media_keys_device_filter: str = Field("")  # Optional device name filter (e.g., "Anker", "USB", "Conference")
     media_keys_exclusive_grab: bool = Field(False)  # Grab input device exclusively (blocks OS media handling)
+    media_keys_passthrough_keys: str = Field("mute")  # Comma-separated logical keys to re-inject to OS when exclusive grab is enabled
     media_keys_control_music: bool = Field(True)  # Allow media keys to control MPD playback
     media_keys_suppress_system_play: bool = Field(True)  # Pause desktop media players on wake/play-button events
     media_keys_play_scan_codes: str = Field("0xc00b6,0xc00cd")  # Comma-separated MSC_SCAN values that should be treated as play button
+    media_keys_mute_scan_codes: str = Field("")  # Optional MSC_SCAN values to map to mute button
+    media_keys_phone_scan_codes: str = Field("")  # Optional MSC_SCAN values to map to phone button
     media_keys_command_debounce_ms: int = Field(400)  # Ignore duplicate logical button commands within this window
+    media_keys_sync_alsa_mic_switch: bool = Field(True)  # Also toggle ALSA capture switch on mute/unmute (may sync device LED)
+    media_keys_alsa_mic_control: str = Field("Mic")  # ALSA control name to toggle via amixer (e.g. Mic/Capture)
+    media_keys_alsa_card: str = Field("")  # Optional explicit ALSA card index/name for amixer; auto-detected from device name when empty
 
     # Wake/sleep feedback sounds
     wake_feedback_variant: str = Field("click")  # click|double|bright|soft|cluck|doublecluck|knock|knocklow|doubleknock
@@ -422,6 +433,12 @@ class VoiceConfig(BaseSettings):
                 errors.append(
                     f"WEB_UI_HOTWORD_ACTIVE_MS={self.web_ui_hotword_active_ms} must be between 100 and 60000"
                 )
+            if self.web_ui_audio_authority not in ("native", "browser", "hybrid"):
+                errors.append(f"WEB_UI_AUDIO_AUTHORITY must be 'native', 'browser', or 'hybrid'; got '{self.web_ui_audio_authority}'")
+            if self.web_ui_music_poll_ms < 100:
+                errors.append(f"WEB_UI_MUSIC_POLL_MS={self.web_ui_music_poll_ms} must be >= 100 ms")
+            if self.web_ui_timer_poll_ms < 100:
+                errors.append(f"WEB_UI_TIMER_POLL_MS={self.web_ui_timer_poll_ms} must be >= 100 ms")
 
         # Log and exit if critical errors found
         if errors:

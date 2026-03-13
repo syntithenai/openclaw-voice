@@ -91,20 +91,21 @@ docker-compose logs -f orchestrator
 
 ### AMD GPU (GMK EVO-X2)
 
-Whisper and Piper containers are configured for AMD GPU acceleration with the `amd` Docker runtime.
+Whisper and Piper now run from CPU-safe images by default and can prefer GPU when GPU devices are exposed to the container.
 
 ```bash
-# Verify AMD runtime is available
-docker info --format '{{json .Runtimes}}' | grep amd
+# CPU-safe default
+docker compose up -d whisper piper
 
-# Rebuild GPU-enabled STT/TTS containers after pulling changes
-docker-compose build whisper piper
-
-# Start with STT + TTS profiles (plus your audio profile if running orchestrator in Docker)
-docker-compose --profile stt --profile tts up -d
+# Optional AMD/Vulkan acceleration override
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d whisper piper
 ```
 
-If your ROCm stack is healthy, the containers will use `/dev/kfd` and `/dev/dri` automatically.
+With the GPU override enabled:
+- `whisper` gets `/dev/dri` and will prefer Vulkan, then retry on CPU if GPU init fails.
+- `piper` gets `/dev/kfd` and `/dev/dri` and will prefer ROCm, then retry on CPU if ROCm init fails.
+
+Without the override, both services stay in the same images and run on CPU.
 
 ### Option 2: Native Installation (Raspberry Pi / Low Latency)
 

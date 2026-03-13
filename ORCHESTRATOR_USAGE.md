@@ -8,8 +8,8 @@ docker compose up -d
 ```
 
 This starts:
-- ✅ whisper (Vulkan GPU)
-- ✅ piper (ROCm GPU)  
+- ✅ whisper (auto backend: CPU by default, GPU if exposed)
+- ✅ piper (auto backend: CPU by default, GPU if exposed)
 - ✅ mpd
 - ✅ **orchestrator-linux-alsa** (ALSA direct hardware)
 

@@ -1,0 +1,6 @@
+services:
+  whisper:
+    environment:
+      - WHISPER_BACKEND_PREFERENCE=${WHISPER_BACKEND_PREFERENCE:-gpu}
+    devices:
+      - /dev/dri:/dev/dri

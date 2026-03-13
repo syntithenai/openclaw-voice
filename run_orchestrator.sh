@@ -22,6 +22,15 @@ if [ -z "$ENV_FILE_PATH" ]; then
 fi
 export OPENCLAW_ENV_FILE="$ENV_FILE_PATH"
 
+# Resolve optional preferred PipeWire sink from environment (or env file fallback).
+# This helps keep output routing stable across USB hotplug/reboots when using
+# AUDIO_PLAYBACK_DEVICE=pipewire.
+PREFERRED_SINK_VALUE="${AUDIO_PREFERRED_SINK:-}"
+if [ -z "$PREFERRED_SINK_VALUE" ] && [ -f "$ENV_FILE_PATH" ]; then
+  PREFERRED_SINK_VALUE="$(grep -E '^AUDIO_PREFERRED_SINK=' "$ENV_FILE_PATH" | tail -n1 | cut -d= -f2-)"
+fi
+PREFERRED_SINK_VALUE="$(printf '%s' "$PREFERRED_SINK_VALUE" | xargs)"
+
 # PipeWire: ensure PortAudio ALSA plugin can locate the PipeWire session socket.
 # Without this, opening the 'pipewire' ALSA device hangs indefinitely.
 export PIPEWIRE_RUNTIME_DIR="/run/user/$(id -u)"
@@ -125,6 +134,21 @@ fi
 if [ "$MEDIA_KEYS_CAPTURE_ENABLED" = true ] && [ -f "$ENV_FILE_PATH" ] && ! grep -qE '^MEDIA_KEYS_DEVICE_FILTER=' "$ENV_FILE_PATH"; then
   echo "WARN: MEDIA_KEYS_ENABLED=true but MEDIA_KEYS_DEVICE_FILTER is not set."
   echo "      Set MEDIA_KEYS_DEVICE_FILTER to your speaker name (e.g. Burr-Brown/Anker) to avoid grabbing non-speaker devices."
+fi
+
+# Best-effort preferred sink pinning for host PipeWire usage.
+if [ -n "$PREFERRED_SINK_VALUE" ] && command -v pactl >/dev/null 2>&1; then
+  if pactl list short sinks 2>/dev/null | awk '{print $2}' | grep -Fxq "$PREFERRED_SINK_VALUE"; then
+    echo "INFO: Pinning preferred sink: $PREFERRED_SINK_VALUE"
+    pactl set-default-sink "$PREFERRED_SINK_VALUE" >/dev/null 2>&1 || true
+    pactl set-sink-mute "$PREFERRED_SINK_VALUE" 0 >/dev/null 2>&1 || true
+    pactl set-sink-volume "$PREFERRED_SINK_VALUE" 100% >/dev/null 2>&1 || true
+    for sink_input_id in $(pactl list short sink-inputs 2>/dev/null | awk '{print $1}'); do
+      pactl move-sink-input "$sink_input_id" "$PREFERRED_SINK_VALUE" >/dev/null 2>&1 || true
+    done
+  else
+    echo "WARN: Preferred sink '$PREFERRED_SINK_VALUE' not found; leaving PipeWire default unchanged"
+  fi
 fi
 
 # Run orchestrator with any passed arguments (tee output to log)

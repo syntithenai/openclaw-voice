@@ -10,10 +10,63 @@ app = FastAPI()
 
 WHISPER_CPP_PATH = os.getenv("WHISPER_CPP_PATH", "/app/build/bin/whisper-cli")
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/ggml-base.en.bin")
+BACKEND_PREFERENCE = os.getenv("WHISPER_BACKEND_PREFERENCE", "auto").strip().lower() or "auto"
+CPU_FALLBACK_ENABLED = os.getenv("WHISPER_CPU_FALLBACK", "true").strip().lower() not in {"0", "false", "no"}
+
+
+def _gpu_device_visible() -> bool:
+    return Path("/dev/dri").exists()
+
+
+def _backend_attempts() -> list[str]:
+    if BACKEND_PREFERENCE == "cpu":
+        return ["cpu"]
+    if BACKEND_PREFERENCE == "gpu":
+        return ["gpu", "cpu"] if CPU_FALLBACK_ENABLED else ["gpu"]
+
+    if _gpu_device_visible():
+        return ["gpu", "cpu"] if CPU_FALLBACK_ENABLED else ["gpu"]
+    return ["cpu"]
+
+
+def _run_whisper(temp_audio_path: str, backend: str) -> tuple[subprocess.CompletedProcess[str], str]:
+    env = os.environ.copy()
+    cmd = [
+        WHISPER_CPP_PATH,
+        "-m",
+        MODEL_PATH,
+        "-f",
+        temp_audio_path,
+        "-oj",
+        "-of",
+        temp_audio_path,
+    ]
+
+    # The Vulkan build can still run on CPU; explicitly disable Vulkan when retrying
+    # the fallback path so a bad GPU stack does not repeatedly poison requests.
+    if backend == "cpu":
+        env["GGML_VK_DISABLE"] = "1"
+    else:
+        env.pop("GGML_VK_DISABLE", None)
+
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env=env,
+    )
+    return result, backend
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "backend": "whisper.cpp+Vulkan"}
+    return {
+        "status": "healthy",
+        "backend_preference": BACKEND_PREFERENCE,
+        "cpu_fallback_enabled": CPU_FALLBACK_ENABLED,
+        "gpu_device_visible": _gpu_device_visible(),
+        "runtime": "whisper.cpp-vulkan-image",
+    }
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile):
@@ -33,25 +86,23 @@ async def transcribe(file: UploadFile):
     temp_json_path = temp_audio_path + ".json"
 
     try:
-        # Run whisper.cpp CLI with JSON output
-        cmd = [
-            WHISPER_CPP_PATH,
-            "-m", MODEL_PATH,
-            "-f", temp_audio_path,
-            "-oj",  # JSON output
-            "-of", temp_audio_path  # Output file prefix
-        ]
+        result = None
+        active_backend = "unknown"
+        last_error = ""
+        for backend in _backend_attempts():
+            result, active_backend = _run_whisper(temp_audio_path, backend)
+            if result.returncode == 0:
+                break
+            last_error = result.stderr or result.stdout or f"whisper.cpp {backend} attempt failed"
+            print(f"whisper.cpp {backend} error: {last_error}")
         
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=300  # 5 minute timeout
-        )
-        
-        if result.returncode != 0:
-            print(f"whisper.cpp error: {result.stderr}")
-            return {"text": "", "language": "", "error": result.stderr}
+        if result is None or result.returncode != 0:
+            return {
+                "text": "",
+                "language": "",
+                "error": last_error or "transcription failed",
+                "backend": active_backend,
+            }
         
         # Read JSON output
         if Path(temp_json_path).exists():
@@ -63,12 +114,13 @@ async def transcribe(file: UploadFile):
             
             return {
                 "text": text,
-                "language": "en"  # whisper.cpp doesn't auto-detect in this mode
+                "language": "en",  # whisper.cpp doesn't auto-detect in this mode
+                "backend": active_backend,
             }
         else:
             # Fallback: parse stderr for text output
             text = result.stdout.strip() if result.stdout else ""
-            return {"text": text, "language": "en"}
+            return {"text": text, "language": "en", "backend": active_backend}
             
     except subprocess.TimeoutExpired:
         return {"text": "", "language": "", "error": "Transcription timeout"}
