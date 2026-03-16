@@ -207,7 +207,19 @@ ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && sudo OPENCLAW_BT_USER='$PI_USER' OPE
 
 echo ""
 echo -e "${YELLOW}Step 3c: Verifying Bluetooth host smoke checks...${NC}"
-if ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && sudo OPENCLAW_BT_USER='$PI_USER' OPENCLAW_BT_ALIAS='Pi Two Bluetooth' OPENCLAW_BT_AUTOFIX=true bash ./scripts/pi/verify_bluetooth_audio_host.sh"; then
+set +e
+BT_VERIFY_OUTPUT="$(ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && sudo OPENCLAW_BT_USER='$PI_USER' OPENCLAW_BT_ALIAS='Pi Two Bluetooth' OPENCLAW_BT_AUTOFIX=true bash ./scripts/pi/verify_bluetooth_audio_host.sh" 2>&1)"
+BT_VERIFY_RC=$?
+set -e
+
+printf '%s\n' "$BT_VERIFY_OUTPUT"
+
+BT_SUMMARY_LINE="$(printf '%s\n' "$BT_VERIFY_OUTPUT" | grep '^BT_SMOKE_SUMMARY ' | tail -n1 || true)"
+if [ -n "$BT_SUMMARY_LINE" ]; then
+    echo -e "${GREEN}  ↳ $BT_SUMMARY_LINE${NC}"
+fi
+
+if [ "$BT_VERIFY_RC" -eq 0 ]; then
     echo -e "${GREEN}  ✓ Bluetooth host smoke checks passed${NC}"
 else
     echo -e "${YELLOW}  ⚠ Bluetooth host smoke checks reported issues${NC}"

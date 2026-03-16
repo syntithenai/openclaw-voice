@@ -196,9 +196,20 @@ if [ -f "$BT_SETUP_SCRIPT" ]; then
     BT_VERIFY_SCRIPT="$SCRIPT_DIR/scripts/pi/verify_bluetooth_audio_host.sh"
     if [ -f "$BT_VERIFY_SCRIPT" ]; then
         echo -e "${BLUE}Running Bluetooth audio host smoke test...${NC}"
-        sudo OPENCLAW_BT_USER="${USER}" OPENCLAW_BT_ALIAS="${BT_ALIAS_VALUE}" OPENCLAW_BT_AUTOFIX=true bash "$BT_VERIFY_SCRIPT" || {
+        set +e
+        BT_VERIFY_OUTPUT="$(sudo OPENCLAW_BT_USER="${USER}" OPENCLAW_BT_ALIAS="${BT_ALIAS_VALUE}" OPENCLAW_BT_AUTOFIX=true bash "$BT_VERIFY_SCRIPT" 2>&1)"
+        BT_VERIFY_RC=$?
+        set -e
+
+        printf '%s\n' "$BT_VERIFY_OUTPUT"
+        BT_SUMMARY_LINE="$(printf '%s\n' "$BT_VERIFY_OUTPUT" | grep '^BT_SMOKE_SUMMARY ' | tail -n1 || true)"
+        if [ -n "$BT_SUMMARY_LINE" ]; then
+            echo -e "${GREEN}  ↳ $BT_SUMMARY_LINE${NC}"
+        fi
+
+        if [ "$BT_VERIFY_RC" -ne 0 ]; then
             echo -e "${YELLOW}Warning: Bluetooth audio smoke test reported issues. Pairing may still require manual retry.${NC}"
-        }
+        fi
     fi
 else
     echo -e "${YELLOW}Warning: Bluetooth setup script not found at $BT_SETUP_SCRIPT${NC}"

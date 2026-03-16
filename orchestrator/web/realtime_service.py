@@ -667,7 +667,8 @@ function applyMicState(){{
   const bw=S.micEnabled?Math.round(2+Math.min(8,Math.pow(rms,0.55)*40)):4;
   btn.style.borderWidth=bw+'px';
   btn.classList.remove('bg-red-900','border-red-600','bg-green-900','border-green-500','bg-gray-700','border-gray-500');
-  if(!S.micEnabled) btn.classList.add('bg-red-900','border-red-600');
+    btn.classList.remove('border-transparent');
+    if(!S.micEnabled) btn.classList.add('bg-red-900','border-red-600');
   else if(S.wake_state==='awake'||S.hotword_active) btn.classList.add('bg-green-900','border-green-500');
   else btn.classList.add('bg-red-900','border-red-600');
 }}
@@ -1517,11 +1518,16 @@ function handleMsg(msg){{
         case 'chat_append':
             if(msg.message){{
                 const nextMsg = normalizeChatMessage(msg.message);
-                if(nextMsg) S.chat.push(nextMsg);
+                if(nextMsg) {{
+                    S.chat.push(nextMsg);
+                    const msgRole=String(nextMsg.role||'');
+                    if(msgRole==='user'||msgRole==='assistant') S.selectedChatId='active';
+                }}
                 persistChatCache();
                 if(S.page==='home'&&(!S.selectedChatId||S.selectedChatId==='active')) renderChatMessages('active');
             }}
             break;
+
         case 'chat_threads_update':
             applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
             if(S.page==='home') renderPage();
@@ -1590,15 +1596,6 @@ function handleMsg(msg){{
         case 'music_playlists':
             if(Array.isArray(msg.playlists)) S.musicPlaylists = msg.playlists;
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
-            break;
-    case 'timers_state':
-            if(msg.timers_rev!==undefined){{
-                const rev=Number(msg.timers_rev)||0;
-                if(rev<=S.lastTimersRev) break;
-                S.lastTimersRev=rev;
-            }}
-            S.pendingTimerActions={{}};
-            applyTimers(msg.timers||[]);
             break;
         case 'timer_action_ack':
             if(msg.action){{
@@ -1735,24 +1732,24 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
         }} finally {{
                 URL.revokeObjectURL(url);
         }}
-}}
-
-async function startBrowserCapture(){{
-    if(!S.browserAudioEnabled) return;
-    const hasLiveTrack = !!(S.mediaStream && S.mediaStream.getAudioTracks().some(t=>t.readyState==='live'));
-    if (hasLiveTrack && S.processor) {{
-        if (S.audioCtx && S.audioCtx.state === 'suspended') await S.audioCtx.resume();
-        clearCaptureRetry();
-        return;
     }}
 
-    // Cleanup stale graph if present, then rebuild.
-    try{{ if(S.processor) S.processor.disconnect(); }}catch(_ ){{}}
-    try{{ if(S.audioCtx) await S.audioCtx.close(); }}catch(_ ){{}}
-    if(S.mediaStream){{
-        try{{ S.mediaStream.getTracks().forEach(t=>t.stop()); }}catch(_ ){{}}
-    }}
-    S.processor=null; S.audioCtx=null; S.mediaStream=null; S.captureWorkletModuleReady=false;
+    async function startBrowserCapture(){{
+  if(!S.browserAudioEnabled) return;
+  const hasLiveTrack = !!(S.mediaStream && S.mediaStream.getAudioTracks().some(t=>t.readyState==='live'));
+  if (hasLiveTrack && S.processor) {{
+      if (S.audioCtx && S.audioCtx.state === 'suspended') await S.audioCtx.resume();
+      clearCaptureRetry();
+      return;
+  }}
+
+  // Cleanup stale graph if present, then rebuild.
+  try{{ if(S.processor) S.processor.disconnect(); }}catch(_ ){{}}
+  try{{ if(S.audioCtx) await S.audioCtx.close(); }}catch(_ ){{}}
+  if(S.mediaStream){{
+      try{{ S.mediaStream.getTracks().forEach(t=>t.stop()); }}catch(_ ){{}}
+  }}
+  S.processor=null; S.audioCtx=null; S.mediaStream=null; S.captureWorkletModuleReady=false;
 
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){{
       throw new Error('Browser mediaDevices.getUserMedia is unavailable');
