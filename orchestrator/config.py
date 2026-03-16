@@ -221,6 +221,7 @@ class VoiceConfig(BaseSettings):
     web_ui_status_hz: int = Field(12)  # Status broadcast frequency to connected clients
     web_ui_hotword_active_ms: int = Field(2000)  # How long to keep hotword indicator active in UI after detection
     web_ui_chat_history_limit: int = Field(200)  # Max chat messages retained in web UI memory
+    web_ui_chat_persist_path: str = Field("")  # Path to JSON file for durable chat thread storage; empty = ~/.openclaw/chat_state.json
     web_ui_music_poll_ms: int = Field(1000)  # How often to poll MPD for music state (ms)
     web_ui_timer_poll_ms: int = Field(500)  # How often to push timer state to UI (ms)
     web_ui_mic_starts_disabled: bool = Field(True)  # Mic button starts in disabled (red) state
@@ -258,7 +259,7 @@ class VoiceConfig(BaseSettings):
     # Media Keys (Hardware button detection)
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection
     media_keys_device_filter: str = Field("")  # Optional device name filter (e.g., "Anker", "USB", "Conference")
-    media_keys_exclusive_grab: bool = Field(False)  # Grab input device exclusively (blocks OS media handling)
+    media_keys_exclusive_grab: bool = Field(True)  # Grab input device exclusively (blocks OS media handling)
     media_keys_passthrough_keys: str = Field("mute")  # Comma-separated logical keys to re-inject to OS when exclusive grab is enabled
     media_keys_control_music: bool = Field(True)  # Allow media keys to control MPD playback
     media_keys_suppress_system_play: bool = Field(True)  # Pause desktop media players on wake/play-button events

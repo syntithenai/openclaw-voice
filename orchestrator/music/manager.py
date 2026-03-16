@@ -338,6 +338,10 @@ class MusicManager:
             return []
     
     # ========== Queue Management ==========
+
+    @staticmethod
+    def _quote(value: str) -> str:
+        return str(value).replace('\\', '\\\\').replace('"', '\\"')
     
     async def clear_queue(self) -> str:
         """Clear the playback queue."""
@@ -371,6 +375,116 @@ class MusicManager:
             return await self.pool.execute_list("playlistinfo")
         except Exception as e:
             logger.error(f"Failed to get queue: {e}")
+            return []
+
+    async def remove_from_queue_positions(self, positions: List[int]) -> str:
+        """Remove multiple queue positions (0-based), safely from highest to lowest."""
+        try:
+            uniq = sorted({int(p) for p in positions if int(p) >= 0}, reverse=True)
+            if not uniq:
+                return "No queue items selected"
+            for pos in uniq:
+                await self.pool.execute(f"delete {pos}")
+            return f"Removed {len(uniq)} queue item(s)"
+        except Exception as e:
+            logger.error(f"Failed to remove queue items: {e}")
+            return f"Error: {e}"
+
+    async def add_files_to_queue(self, files: List[str]) -> str:
+        """Add multiple file URIs to the queue."""
+        try:
+            cleaned = [str(f).strip() for f in files if str(f).strip()]
+            if not cleaned:
+                return "No tracks selected"
+            for file_uri in cleaned:
+                await self.pool.execute(f'add "{self._quote(file_uri)}"')
+            return f"Added {len(cleaned)} track(s) to queue"
+        except Exception as e:
+            logger.error(f"Failed to add files to queue: {e}")
+            return f"Error: {e}"
+
+    async def create_playlist_from_queue_positions(self, name: str, positions: List[int]) -> str:
+        """Create/replace playlist from selected queue positions."""
+        try:
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Playlist name is required"
+
+            selected = {int(p) for p in positions if int(p) >= 0}
+            if not selected:
+                return "No queue items selected"
+
+            queue = await self.get_queue()
+            files: List[str] = []
+            for item in queue:
+                try:
+                    pos = int(item.get("pos", item.get("Pos", -1)))
+                except Exception:
+                    pos = -1
+                if pos in selected:
+                    file_uri = str(item.get("file", "")).strip()
+                    if file_uri:
+                        files.append(file_uri)
+
+            if not files:
+                return "No valid files found for selected queue items"
+
+            try:
+                await self.pool.execute(f'rm "{self._quote(playlist_name)}"')
+            except Exception:
+                pass
+
+            for file_uri in files:
+                await self.pool.execute(
+                    f'playlistadd "{self._quote(playlist_name)}" "{self._quote(file_uri)}"'
+                )
+
+            return f"Created playlist '{playlist_name}' with {len(files)} track(s)"
+        except Exception as e:
+            logger.error(f"Failed to create playlist from queue positions: {e}")
+            return f"Error: {e}"
+
+    async def search_library_for_ui(self, query: str, limit: int = 300) -> List[Dict[str, str]]:
+        """Search library and return normalized results for Web UI selection list."""
+        q = str(query or "").strip()
+        if not q:
+            return []
+        try:
+            rows: List[Dict[str, str]] = []
+            for call in (self.search_any, self.search_title, self.search_artist, self.search_album):
+                try:
+                    part = await call(q)
+                    if part:
+                        rows.extend(part)
+                except Exception:
+                    pass
+
+            if not rows:
+                try:
+                    rows = await self.pool.execute_list(f'search file "{self._quote(q)}"')
+                except Exception:
+                    rows = []
+
+            out: List[Dict[str, str]] = []
+            seen: set[str] = set()
+            for item in rows:
+                file_uri = str(item.get("file", "")).strip()
+                if not file_uri or file_uri in seen:
+                    continue
+                seen.add(file_uri)
+                out.append(
+                    {
+                        "file": file_uri,
+                        "title": str(item.get("title") or item.get("Title") or file_uri.split("/")[-1]),
+                        "artist": str(item.get("artist") or item.get("Artist") or ""),
+                        "album": str(item.get("album") or item.get("Album") or ""),
+                    }
+                )
+                if len(out) >= max(1, int(limit)):
+                    break
+            return out
+        except Exception as e:
+            logger.error(f"Failed UI library search: {e}")
             return []
     
     # ========== Playlist Management ==========

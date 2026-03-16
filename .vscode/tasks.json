@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "run-desktop-client",
+			"type": "shell",
+			"command": "/home/stever/.pyenv/versions/3.12.9/bin/python",
+			"args": [
+				"-m",
+				"client"
+			],
+			"isBackground": true
+		}
+	]
+}

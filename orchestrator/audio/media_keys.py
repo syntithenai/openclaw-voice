@@ -80,6 +80,9 @@ class MediaKeyDetector:
             ecodes.KEY_PHONE: "phone",  # Conference speaker phone button
             # Some devices map call controls to these keycodes instead of KEY_PHONE
             ecodes.KEY_FASTFORWARD: "phone",
+            # AVRCP profile uses PLAYCD/PAUSECD instead of PLAYPAUSE on some BT devices
+            ecodes.KEY_PLAYCD: "play",
+            ecodes.KEY_PAUSECD: "pause",
         }
         if EVDEV_AVAILABLE
         else {}
@@ -186,6 +189,11 @@ class MediaKeyDetector:
             return False
         return any(token in normalized for token in self.BLOCKED_DEVICE_NAME_TOKENS)
 
+    def _is_allowed_speaker_name(self, device_name: str) -> bool:
+        """True if device name matches a known conference speaker / audio device hint."""
+        normalized = (device_name or "").strip().lower()
+        return any(token in normalized for token in self.ALLOWED_SPEAKER_HINT_TOKENS)
+
     def _looks_like_keyboard_device(self, key_codes: List[int]) -> bool:
         """Heuristic guardrail to reject full keyboard-like input devices."""
         if not key_codes:
@@ -196,11 +204,15 @@ class MediaKeyDetector:
 
         indicator_count = sum(1 for code in self.KEYBOARD_INDICATOR_KEYS if code in key_codes)
         return indicator_count >= 6
+
+    @staticmethod
+    def _is_avrcp_device_name(device_name: str) -> bool:
+        return "avrcp" in (device_name or "").strip().lower()
     
     @staticmethod
     def parse_scan_code_list(scan_codes: Optional[str]) -> Set[int]:
         """Parse comma-separated scan codes (supports decimal or hex like 0xc00b6)."""
-            if not scan_codes:
+        if not scan_codes:
             return set()
 
         parsed: Set[int] = set()
@@ -272,6 +284,16 @@ class MediaKeyDetector:
         self._scan_debounce_s: float = 0.1  # 100ms - filters duplicate events from single press, allows rapid taps
         # Debounce emitted commands: {(device_name, logical_key): last_timestamp}
         self._command_last_seen_ts: Dict[tuple, float] = {}
+        # For some AVRCP devices key-up can be delayed/missing; dispatch selected keys on key-down.
+        self._avrcp_down_dispatch_ts: Dict[tuple, float] = {}
+        self._avrcp_immediate_keys: Set[str] = {
+            "play_pause",
+            "play",
+            "pause",
+            "next",
+            "previous",
+            "phone",
+        }
         # Suppress repeated safety warnings during periodic rescans.
         self._blocked_name_warned_paths: Set[str] = set()
         self._keyboard_like_warned_paths: Set[str] = set()
@@ -405,7 +427,7 @@ class MediaKeyDetector:
                     device.close()
                     continue
 
-                if self._looks_like_keyboard_device(key_codes):
+                if self._looks_like_keyboard_device(key_codes) and not self._is_allowed_speaker_name(device.name):
                     if path not in self._keyboard_like_warned_paths:
                         logger.warning(
                             "Skipping keyboard-like input device for media capture safety: %s (%s)",
@@ -603,8 +625,30 @@ class MediaKeyDetector:
                             # KEY PRESS: Record the press time (don't fire callback yet)
                             self._key_press_times[key_state_key] = event_time
                             logger.debug(f"Key pressed: {key_name} on {device.name}")
+
+                            # AVRCP fallback: dispatch selected keys on DOWN so single tap works
+                            # even when KEY_UP is delayed/missing on Bluetooth profile transitions.
+                            if self._is_avrcp_device_name(device.name) and key_name in self._avrcp_immediate_keys:
+                                self._avrcp_down_dispatch_ts[key_state_key] = event_time
+                                media_event = MediaKeyEvent(
+                                    key=key_name,
+                                    device_name=device.name,
+                                    timestamp=event_time,
+                                    event_type="press",
+                                )
+                                await self._dispatch_media_event(media_event)
                         
                         elif event.value == 0:
+                            if key_state_key in self._avrcp_down_dispatch_ts:
+                                self._avrcp_down_dispatch_ts.pop(key_state_key, None)
+                                self._key_press_times.pop(key_state_key, None)
+                                logger.debug(
+                                    "Ignoring AVRCP key release after immediate down-dispatch: %s on %s",
+                                    key_name,
+                                    device.name,
+                                )
+                                continue
+
                             # KEY RELEASE: Determine if short or long press, then fire callback
                             if key_state_key in self._key_press_times:
                                 press_time = self._key_press_times[key_state_key]

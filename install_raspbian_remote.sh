@@ -199,6 +199,21 @@ n
 EOF
 " || echo -e "${YELLOW}Note: Install script completed with warnings${NC}"
 
+echo ""
+echo -e "${YELLOW}Step 3b: Enabling automatic Bluetooth audio host mode...${NC}"
+ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && sudo OPENCLAW_BT_USER='$PI_USER' OPENCLAW_BT_ALIAS='Pi Two Bluetooth' bash ./scripts/pi/setup_bluetooth_audio_host.sh" || {
+    echo -e "${YELLOW}Note: Bluetooth host setup completed with warnings${NC}"
+}
+
+echo ""
+echo -e "${YELLOW}Step 3c: Verifying Bluetooth host smoke checks...${NC}"
+if ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && sudo OPENCLAW_BT_USER='$PI_USER' OPENCLAW_BT_ALIAS='Pi Two Bluetooth' OPENCLAW_BT_AUTOFIX=true bash ./scripts/pi/verify_bluetooth_audio_host.sh"; then
+    echo -e "${GREEN}  ✓ Bluetooth host smoke checks passed${NC}"
+else
+    echo -e "${YELLOW}  ⚠ Bluetooth host smoke checks reported issues${NC}"
+    echo -e "${YELLOW}    Check on Pi: sudo journalctl -u bluetooth -u bluez-auto-agent -u bluetooth-host-mode --no-pager -n 80${NC}"
+fi
+
 # Step 4: Detect and configure audio devices
 echo ""
 echo -e "${YELLOW}Step 4: Detecting audio devices...${NC}"

@@ -183,6 +183,27 @@ sudo systemctl enable snapserver snapclient >/dev/null 2>&1 || true
 sudo systemctl restart snapserver snapclient >/dev/null 2>&1 || true
 echo -e "${GREEN}✓ PulseAudio/Snapcast defaults configured${NC}"
 
+echo -e "${BLUE}Configuring Bluetooth audio host (auto-pair + auto-route)...${NC}"
+BT_SETUP_SCRIPT="$SCRIPT_DIR/scripts/pi/setup_bluetooth_audio_host.sh"
+BT_ALIAS_VALUE="${OPENCLAW_BT_ALIAS:-$(hostname)}"
+BT_ALIAS_VALUE="${BT_ALIAS_VALUE:-Pi Two Bluetooth}"
+if [ -f "$BT_SETUP_SCRIPT" ]; then
+    sudo OPENCLAW_BT_USER="${USER}" OPENCLAW_BT_ALIAS="${BT_ALIAS_VALUE}" bash "$BT_SETUP_SCRIPT" || {
+        echo -e "${YELLOW}Warning: Bluetooth audio host setup reported issues; continuing install.${NC}"
+    }
+    echo -e "${GREEN}✓ Bluetooth audio host setup complete${NC}"
+
+    BT_VERIFY_SCRIPT="$SCRIPT_DIR/scripts/pi/verify_bluetooth_audio_host.sh"
+    if [ -f "$BT_VERIFY_SCRIPT" ]; then
+        echo -e "${BLUE}Running Bluetooth audio host smoke test...${NC}"
+        sudo OPENCLAW_BT_USER="${USER}" OPENCLAW_BT_ALIAS="${BT_ALIAS_VALUE}" OPENCLAW_BT_AUTOFIX=true bash "$BT_VERIFY_SCRIPT" || {
+            echo -e "${YELLOW}Warning: Bluetooth audio smoke test reported issues. Pairing may still require manual retry.${NC}"
+        }
+    fi
+else
+    echo -e "${YELLOW}Warning: Bluetooth setup script not found at $BT_SETUP_SCRIPT${NC}"
+fi
+
 ################################################################################
 # STEP 5: Create Python virtual environment
 ################################################################################

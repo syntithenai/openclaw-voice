@@ -7,11 +7,14 @@ from collections import deque
 import json
 import logging
 import math
+import os
 import ssl
+import tempfile
 import threading
 import time
 import uuid
 from http.server import HTTPServer
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import websockets
@@ -98,15 +101,15 @@ def _build_ui_html(
         <button id="micMenuBtn" class="w-7 h-7 flex items-center justify-center rounded-full text-gray-300 bg-gray-800/60 border border-gray-700 hover:bg-gray-700 transition-colors" title="Microphone options">&#9662;</button>
         <div id="micControlDropdown" class="hidden absolute right-0 top-12 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-50 p-2 flex flex-col gap-2">
             <div class="flex items-center justify-between px-2 py-1">
-                <span class="text-xs text-gray-300">Mute TTS output</span>
+                <span id="ttsMuteLabel" class="text-xs text-gray-300">Mute TTS output</span>
                 <button id="ttsMuteToggle" data-action="toggle-tts-mute" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
             </div>
             <div class="flex items-center justify-between px-2 py-1">
-                <span class="text-xs text-gray-300">Browser audio streaming</span>
+                <span id="browserAudioLabel" class="text-xs text-gray-300">Browser audio streaming</span>
                 <button id="browserAudioToggle" data-action="toggle-browser-audio" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
             </div>
             <div class="flex items-center justify-between px-2 py-1">
-                <span class="text-xs text-gray-300">Continuous mode</span>
+                <span id="continuousModeLabel" class="text-xs text-gray-300">Continuous mode</span>
                 <button id="continuousModeToggle" data-action="toggle-continuous-mode" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
             </div>
         </div>
@@ -131,6 +134,12 @@ const WS_PORT = {ws_port};
 const MIC_STARTS_DISABLED = {mic_disabled_js};
 const AUDIO_AUTHORITY = '{audio_authority}';
 const SERVER_INSTANCE_ID = '{server_instance_id}';
+const PREF_TTS_MUTED = 'openclaw.ui.ttsMuted';
+const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
+const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
+const CHAT_CACHE_VERSION = 1;
+const PENDING_ACTION_TIMEOUT_MS = 8000;
+const INLINE_ERROR_TTL_MS = 7000;
 
 const S = {{
   ws:null, wsConnected:false,
@@ -138,10 +147,24 @@ const S = {{
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
   chat:[], music:{{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1}},
     chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
-  musicQueue:[], timers:[], page:'home',
+    musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
+        musicQueueFilter:'', musicQueueSelection:{{}}, musicQueueLastCheckedPos:null,
+        musicAddMode:false, musicAddQuery:'', musicAddSelection:{{}}, musicAddLastCheckedFile:'',
+        musicNewPlaylistName:'', musicDeletePlaylistName:'',
+        musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'',
+        musicLibrarySearchTimer:null,
+        timers:[], page:'home',
     audioCtx:null, mediaStream:null, processor:null, lastLevel:0,
-    ttsMuted:false, browserAudioEnabled:true, continuousMode:false,
+    feedbackAudioCtx:null,
+    captureWorkletModuleReady:false,
+    ttsMuted:true, browserAudioEnabled:true, continuousMode:false,
     pendingChatSends:new Set(), nextClientMsgId:1,
+    nextMusicActionId:1, pendingMusicActions:{{}},
+    nextTimerActionId:1, pendingTimerActions:{{}},
+    nextSettingActionId:1, pendingSettingActions:{{}},
+    settingActionErrors:{{}}, timerActionErrors:{{}},
+    musicActionError:'', musicActionErrorTs:0,
+    lastStatusRev:0, lastMusicRev:0, lastTimersRev:0, lastUiControlRev:0,
     wsDebug:{{ status:'init', lastCloseCode:null, lastCloseReason:'', lastError:'' }},
     wsManualDisconnect:false, wsReconnectTimer:null,
     captureRetryTimer:null,
@@ -159,10 +182,125 @@ function applyToggle(btn, enabled){{
         btn.setAttribute('aria-checked', enabled ? 'true' : 'false');
 }}
 
+function readBoolPref(key, fallback){{
+    try {{
+        const raw = localStorage.getItem(key);
+        if (raw === null || raw === undefined || raw === '') return !!fallback;
+        return String(raw).toLowerCase() === 'true';
+    }} catch(_) {{
+        return !!fallback;
+    }}
+}}
+
+function writeBoolPref(key, value){{
+    try {{ localStorage.setItem(key, value ? 'true' : 'false'); }} catch(_) {{}}
+}}
+
+function getChatCacheKey(){{
+    return 'openclaw.ui.chatCache.v'+CHAT_CACHE_VERSION+'::'+location.origin+'::'+WS_PORT;
+}}
+
+function normalizeChatMessage(m){{
+    if(!m || typeof m!=='object') return null;
+    const msg=Object.assign({{}}, m);
+    if(msg.id===undefined||msg.id===null) msg.id = 'msg-'+Math.random().toString(36).slice(2,10);
+    if(msg.ts===undefined||msg.ts===null) msg.ts = Date.now()/1000;
+    return msg;
+}}
+
+function normalizeChatThread(t){{
+    if(!t || typeof t!=='object') return null;
+    const thread=Object.assign({{}}, t);
+    thread.id = String(thread.id || ('thread-'+Math.random().toString(36).slice(2,10)));
+    thread.title = String(thread.title || 'Untitled');
+    thread.messages = Array.isArray(thread.messages) ? thread.messages.map(normalizeChatMessage).filter(Boolean) : [];
+    const now = Date.now()/1000;
+    thread.created_ts = Number(thread.created_ts || thread.updated_ts || now) || now;
+    thread.updated_ts = Number(thread.updated_ts || thread.created_ts || now) || now;
+    return thread;
+}}
+
+function mergeChatThreads(serverThreads, cachedThreads){{
+    const merged = new Map();
+    (Array.isArray(cachedThreads)?cachedThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>merged.set(t.id, t));
+    (Array.isArray(serverThreads)?serverThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>{{
+        const existing = merged.get(t.id);
+        if(!existing || Number(t.updated_ts||0) >= Number(existing.updated_ts||0)) merged.set(t.id, t);
+    }});
+    return [...merged.values()].sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+}}
+
+function persistChatCache(){{
+    try {{
+        const payload = {{
+            version: CHAT_CACHE_VERSION,
+            saved_ts: Date.now()/1000,
+            activeChatId: String(S.activeChatId||'active'),
+            selectedChatId: String(S.selectedChatId||'active'),
+            chat: (Array.isArray(S.chat)?S.chat:[]).map(normalizeChatMessage).filter(Boolean),
+            chatThreads: (Array.isArray(S.chatThreads)?S.chatThreads:[]).map(normalizeChatThread).filter(Boolean),
+        }};
+        localStorage.setItem(getChatCacheKey(), JSON.stringify(payload));
+    }} catch(_) {{}}
+}}
+
+function hydrateChatCache(){{
+    try {{
+        const raw = localStorage.getItem(getChatCacheKey());
+        if(!raw) return;
+        const data = JSON.parse(raw);
+        if(!data || typeof data!=='object') return;
+        if(Array.isArray(data.chat)) S.chat = data.chat.map(normalizeChatMessage).filter(Boolean);
+        if(Array.isArray(data.chatThreads)) S.chatThreads = data.chatThreads.map(normalizeChatThread).filter(Boolean);
+        if(data.activeChatId) S.activeChatId = String(data.activeChatId);
+        if(data.selectedChatId) S.selectedChatId = String(data.selectedChatId);
+    }} catch(_) {{}}
+}}
+
+function applyServerChatState(chat, chatThreads, activeChatId){{
+    if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
+    if(Array.isArray(chatThreads)) S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
+    if(activeChatId) S.activeChatId = String(activeChatId);
+    if(!S.selectedChatId) S.selectedChatId = 'active';
+    const selected = String(S.selectedChatId||'active');
+    if(selected!=='active' && !(S.chatThreads||[]).some(t=>String(t.id||'')===selected)) S.selectedChatId = 'active';
+    persistChatCache();
+}}
+
+function loadUiPrefs(){{
+    S.ttsMuted = readBoolPref(PREF_TTS_MUTED, true);
+    S.browserAudioEnabled = readBoolPref(PREF_BROWSER_AUDIO, true);
+    S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
+}}
+
+function pushUiPrefsToServer(){{
+    if(!S.ws || S.ws.readyState!==WebSocket.OPEN) return;
+    if(!S.pendingSettingActions['tts_mute_set']) sendSettingAction('tts_mute_set', !!S.ttsMuted);
+    if(!S.pendingSettingActions['browser_audio_set']) sendSettingAction('browser_audio_set', !!S.browserAudioEnabled);
+    if(!S.pendingSettingActions['continuous_mode_set']) sendSettingAction('continuous_mode_set', !!S.continuousMode);
+}}
+
 function applyMicControlToggles(){{
         applyToggle(document.getElementById('ttsMuteToggle'), !!S.ttsMuted);
         applyToggle(document.getElementById('browserAudioToggle'), !!S.browserAudioEnabled);
         applyToggle(document.getElementById('continuousModeToggle'), !!S.continuousMode);
+    const ttsBtn=document.getElementById('ttsMuteToggle');
+    const browserBtn=document.getElementById('browserAudioToggle');
+    const contBtn=document.getElementById('continuousModeToggle');
+    const pend=S.pendingSettingActions||{{}};
+    const ttsPending=!!pend['tts_mute_set'];
+    const browserPending=!!pend['browser_audio_set'];
+    const contPending=!!pend['continuous_mode_set'];
+    [[ttsBtn,ttsPending],[browserBtn,browserPending],[contBtn,contPending]].forEach(([btn,pending])=>{{ if(!btn) return; btn.disabled=!!pending; btn.classList.toggle('opacity-60',!!pending); btn.classList.toggle('cursor-not-allowed',!!pending); }});
+    const ttsErr=(S.settingActionErrors&&S.settingActionErrors['tts_mute_set'])?S.settingActionErrors['tts_mute_set'].msg:'';
+    const browserErr=(S.settingActionErrors&&S.settingActionErrors['browser_audio_set'])?S.settingActionErrors['browser_audio_set'].msg:'';
+    const contErr=(S.settingActionErrors&&S.settingActionErrors['continuous_mode_set'])?S.settingActionErrors['continuous_mode_set'].msg:'';
+    const ttsLabel=document.getElementById('ttsMuteLabel');
+    const browserLabel=document.getElementById('browserAudioLabel');
+    const contLabel=document.getElementById('continuousModeLabel');
+    if(ttsLabel) ttsLabel.textContent='Mute TTS output'+(ttsErr?' ⚠ '+ttsErr:'');
+    if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:'');
+    if(contLabel) contLabel.textContent='Continuous mode'+(contErr?' ⚠ '+contErr:'');
 }}
 
 function updateWsDebugBanner(){{
@@ -249,66 +387,223 @@ document.addEventListener('click', e => {{
     if (selectThreadBtn) {{
         const tid = selectThreadBtn.dataset.threadId || 'active';
         S.selectedChatId = tid;
+        persistChatCache();
         renderPage();
         return;
     }}
 
     const timerBtn = e.target.closest('[data-action="timer-cancel"]');
     if (timerBtn) {{
-        sendAction({{type:'timer_cancel', timer_id: timerBtn.dataset.timerId}});
+        sendTimerAction('timer_cancel','timer_id', timerBtn.dataset.timerId);
         return;
     }}
 
     const alarmBtn = e.target.closest('[data-action="alarm-cancel"]');
     if (alarmBtn) {{
-        sendAction({{type:'alarm_cancel', alarm_id: alarmBtn.dataset.alarmId}});
+        sendTimerAction('alarm_cancel','alarm_id', alarmBtn.dataset.alarmId);
         return;
     }}
 
     const browserAudioToggle = e.target.closest('[data-action="toggle-browser-audio"]');
     if (browserAudioToggle) {{
         e.stopPropagation();
-        S.browserAudioEnabled = !S.browserAudioEnabled;
-        sendAction({{type:'browser_audio_set', enabled: !!S.browserAudioEnabled}});
-        if (!S.browserAudioEnabled) {{
-            try{{ if(S.processor) S.processor.disconnect(); }}catch(_){{}}
-            try{{ if(S.audioCtx) S.audioCtx.close(); }}catch(_){{}}
-            if(S.mediaStream) try{{ S.mediaStream.getTracks().forEach(t=>t.stop()); }}catch(_){{}}
-            S.processor=null; S.audioCtx=null; S.mediaStream=null;
-        }} else {{
-            startBrowserCapture().catch(err=>reportCaptureFailure(err,'browserAudioToggle'));
-        }}
-        applyMicControlToggles();
+        if(S.pendingSettingActions['browser_audio_set']) return;
+        sendSettingAction('browser_audio_set', !S.browserAudioEnabled);
         return;
     }}
 
     const ttsMuteToggle = e.target.closest('[data-action="toggle-tts-mute"]');
     if (ttsMuteToggle) {{
         e.stopPropagation();
-        S.ttsMuted = !S.ttsMuted;
-        sendAction({{type:'tts_mute_set', enabled: !!S.ttsMuted}});
-        applyMicControlToggles();
+        if(S.pendingSettingActions['tts_mute_set']) return;
+        sendSettingAction('tts_mute_set', !S.ttsMuted);
         return;
     }}
 
     const continuousToggle = e.target.closest('[data-action="toggle-continuous-mode"]');
     if (continuousToggle) {{
         e.stopPropagation();
-        S.continuousMode = !S.continuousMode;
-        sendAction({{type:'continuous_mode_set', enabled: !!S.continuousMode}});
-        applyMicControlToggles();
+        if(S.pendingSettingActions['continuous_mode_set']) return;
+        sendSettingAction('continuous_mode_set', !S.continuousMode);
+        return;
+    }}
+
+    const queueCb = e.target.closest('[data-action="music-queue-select"]');
+    if (queueCb) {{
+        e.stopPropagation();
+        const pos = Number(queueCb.dataset.position);
+        const checked = !!queueCb.checked;
+        if (e.shiftKey && S.musicQueueLastCheckedPos !== null) {{
+            const boxes = [...document.querySelectorAll('[data-action="music-queue-select"]')];
+            const ordered = boxes.map(x=>Number(x.dataset.position));
+            const a = ordered.indexOf(Number(S.musicQueueLastCheckedPos));
+            const b = ordered.indexOf(pos);
+            if (a >= 0 && b >= 0) {{
+                const lo = Math.min(a,b), hi = Math.max(a,b);
+                for (let i=lo;i<=hi;i++) S.musicQueueSelection[String(ordered[i])] = checked;
+            }} else {{
+                S.musicQueueSelection[String(pos)] = checked;
+            }}
+        }} else {{
+            S.musicQueueSelection[String(pos)] = checked;
+        }}
+        S.musicQueueLastCheckedPos = pos;
+        if(!checked) delete S.musicQueueSelection[String(pos)];
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const addCb = e.target.closest('[data-action="music-add-select"]');
+    if (addCb) {{
+        const file = String(addCb.dataset.file || '');
+        const checked = !!addCb.checked;
+        if (e.shiftKey && S.musicAddLastCheckedFile) {{
+            const boxes = [...document.querySelectorAll('[data-action="music-add-select"]')];
+            const ordered = boxes.map(x=>String(x.dataset.file||''));
+            const a = ordered.indexOf(String(S.musicAddLastCheckedFile));
+            const b = ordered.indexOf(file);
+            if (a >= 0 && b >= 0) {{
+                const lo = Math.min(a,b), hi = Math.max(a,b);
+                for (let i=lo;i<=hi;i++) {{ const k = ordered[i]; if(k) S.musicAddSelection[k] = checked; }}
+            }} else if (file) {{
+                S.musicAddSelection[file] = checked;
+            }}
+        }} else if (file) {{
+            S.musicAddSelection[file] = checked;
+        }}
+        S.musicAddLastCheckedFile = file;
+        if(!checked && file) delete S.musicAddSelection[file];
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const selectAllBtn = e.target.closest('[data-action="music-select-all"]');
+    if (selectAllBtn) {{
+        const boxes=[...document.querySelectorAll('[data-action="music-queue-select"]')];
+        boxes.forEach(cb=>{{ S.musicQueueSelection[String(cb.dataset.position)] = true; }});
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const selectNoneBtn = e.target.closest('[data-action="music-select-none"]');
+    if (selectNoneBtn) {{
+        S.musicQueueSelection={{}};
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const addModeBtn = e.target.closest('[data-action="music-add-open"]');
+    if (addModeBtn) {{
+        S.musicAddMode = true;
+        S.musicAddSelection = {{}};
+        sendAction({{type:'music_search_library', query: S.musicAddQuery||''}});
+        sendAction({{type:'music_list_playlists'}});
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const addModeCancel = e.target.closest('[data-action="music-add-cancel"]');
+    if (addModeCancel) {{
+        S.musicAddMode = false;
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const addSelectedBtn = e.target.closest('[data-action="music-add-selected"]');
+    if (addSelectedBtn) {{
+        const files = Object.keys(S.musicAddSelection).filter(k=>S.musicAddSelection[k]);
+        if(files.length) sendMusicAction('music_add_files', {{files}});
+        S.musicAddMode = false;
+        S.musicAddSelection = {{}};
+        return;
+    }}
+
+    const removeSelectedBtn = e.target.closest('[data-action="music-remove-selected"]');
+    if (removeSelectedBtn) {{
+        const positions = Object.keys(S.musicQueueSelection).filter(k=>S.musicQueueSelection[k]).map(Number);
+        if(positions.length) sendMusicAction('music_remove_selected', {{positions}});
+        S.musicQueueSelection = {{}};
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const openSavePlaylistBtn = e.target.closest('[data-action="music-open-save-playlist"]');
+    if (openSavePlaylistBtn) {{
+        S.musicPlaylistModalOpen = true;
+        S.musicPlaylistModalMode = 'save';
+        S.musicPlaylistModalName = '';
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const openCreateSelectedBtn = e.target.closest('[data-action="music-open-create-selected"]');
+    if (openCreateSelectedBtn) {{
+        const positions = Object.keys(S.musicQueueSelection).filter(k=>S.musicQueueSelection[k]).map(Number);
+        if(!positions.length) return;
+        S.musicPlaylistModalOpen = true;
+        S.musicPlaylistModalMode = 'selected';
+        S.musicPlaylistModalName = '';
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const modalCancelBtn = e.target.closest('[data-action="music-modal-cancel"]');
+    if (modalCancelBtn) {{
+        S.musicPlaylistModalOpen = false;
+        S.musicPlaylistModalMode = '';
+        S.musicPlaylistModalName = '';
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const modalConfirmBtn = e.target.closest('[data-action="music-modal-confirm"]');
+    if (modalConfirmBtn) {{
+        const name = String(S.musicPlaylistModalName||'').trim();
+        if(!name) return;
+        if(S.musicPlaylistModalMode==='save'){{
+            sendMusicAction('music_save_playlist', {{name}});
+        }}else if(S.musicPlaylistModalMode==='selected'){{
+            const positions = Object.keys(S.musicQueueSelection).filter(k=>S.musicQueueSelection[k]).map(Number);
+            if(positions.length) sendMusicAction('music_create_playlist', {{name, positions}});
+        }}
+        sendAction({{type:'music_list_playlists'}});
+        S.musicPlaylistModalOpen = false;
+        S.musicPlaylistModalMode = '';
+        S.musicPlaylistModalName = '';
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const deletePlaylistBtn = e.target.closest('[data-action="music-delete-playlist"]');
+    if (deletePlaylistBtn) {{
+        const name = String(S.musicDeletePlaylistName||'').trim();
+        if(name){{
+            sendMusicAction('music_delete_playlist', {{name}});
+            sendAction({{type:'music_list_playlists'}});
+            S.musicDeletePlaylistName='';
+        }}
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+
+    const refreshPlaylistsBtn = e.target.closest('[data-action="music-refresh-playlists"]');
+    if (refreshPlaylistsBtn) {{
+        sendAction({{type:'music_list_playlists'}});
         return;
     }}
 
     const musicRow = e.target.closest('[data-action="music-play-track"]');
     if (musicRow) {{
-        sendAction({{type:'music_play_track', position: Number(musicRow.dataset.position)}});
+        if (e.target.closest('input[type="checkbox"]')) return;
+        const pos = Number(musicRow.dataset.position);
+        sendMusicAction('music_play_track', {{position: pos}});
         return;
     }}
 
     const musicToggle = e.target.closest('[data-action="music-toggle"]');
     if (musicToggle) {{
-        sendAction({{type: (S.music.state === 'play' ? 'music_stop' : 'music_toggle')}});
+        const isPlay = normalizeMusicState(S.music.state)==='play';
+        sendMusicAction(isPlay ? 'music_stop' : 'music_toggle');
     }}
 }});
 
@@ -327,7 +622,36 @@ document.addEventListener('submit', e => {{
     input.value = '';
     if (S.selectedChatId !== 'active') {{
         S.selectedChatId = 'active';
+        persistChatCache();
         renderPage();
+    }}
+}});
+
+document.addEventListener('input', e => {{
+    const t = e.target;
+    if(!t) return;
+    if(t.id==='musicQueueSearch'){{
+        S.musicQueueFilter = String(t.value||'');
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }}
+    if(t.id==='musicAddSearch'){{
+        S.musicAddQuery = String(t.value||'');
+        if(S.musicLibrarySearchTimer) clearTimeout(S.musicLibrarySearchTimer);
+        S.musicLibrarySearchTimer = setTimeout(()=>sendAction({{type:'music_search_library', query:S.musicAddQuery||''}}), 180);
+        return;
+    }}
+    if(t.id==='musicNewPlaylistName'){{
+        S.musicNewPlaylistName = String(t.value||'');
+        return;
+    }}
+    if(t.id==='musicDeletePlaylistName'){{
+        S.musicDeletePlaylistName = String(t.value||'');
+        return;
+    }}
+    if(t.id==='musicPlaylistModalName'){{
+        S.musicPlaylistModalName = String(t.value||'');
+        return;
     }}
 }});
 
@@ -344,7 +668,7 @@ function applyMicState(){{
   btn.style.borderWidth=bw+'px';
   btn.classList.remove('bg-red-900','border-red-600','bg-green-900','border-green-500','bg-gray-700','border-gray-500');
   if(!S.micEnabled) btn.classList.add('bg-red-900','border-red-600');
-  else if(S.wake_state==='awake') btn.classList.add('bg-green-900','border-green-500');
+  else if(S.wake_state==='awake'||S.hotword_active) btn.classList.add('bg-green-900','border-green-500');
   else btn.classList.add('bg-red-900','border-red-600');
 }}
 document.getElementById('micBtn').addEventListener('click',()=>{{
@@ -368,14 +692,31 @@ document.getElementById('micBtn').addEventListener('click',()=>{{
   applyMicState();
 }});
 
-document.getElementById('musicToggleBtn').addEventListener('click',()=>sendAction({{type: (S.music.state === 'play' ? 'music_stop' : 'music_toggle')}}));
+document.getElementById('musicToggleBtn').addEventListener('click',()=>sendMusicAction((String(S.music.state||'').toLowerCase()==='play' ? 'music_stop' : 'music_toggle')));
+function normalizeMusicState(v){{
+    const s=String(v||'').trim().toLowerCase();
+    if(s==='play'||s==='playing') return 'play';
+    if(s==='pause'||s==='paused') return 'pause';
+    if(s==='stop'||s==='stopped'||s==='idle') return 'stop';
+    return s||'stop';
+}}
 function applyMusicHeader(){{
-  const m=S.music;
-  const active=m.state==='play'||(m.state==='pause'&&(m.title||m.queue_length>0));
-  document.getElementById('musicHeader').classList.toggle('hidden',!active);
-  document.getElementById('musicTitle').textContent=m.title||'\u2014';
-  document.getElementById('musicArtist').textContent=m.artist||'\u2014';
-    document.getElementById('musicToggleBtn').textContent=m.state==='play'?'\u23f9':'\u25b6';
+    const m=S.music;
+    m.state=normalizeMusicState(m.state);
+    const header=document.getElementById('musicHeader');
+    const titleEl=document.getElementById('musicTitle');
+    const artistEl=document.getElementById('musicArtist');
+    const btn=document.getElementById('musicToggleBtn');
+    if(!header||!titleEl||!artistEl||!btn) return;
+    const pendingCount=Object.keys(S.pendingMusicActions||{{}}).length;
+    const active=m.state==='play'||(m.state==='pause'&&((m.title&&String(m.title).trim())||Number(m.queue_length||0)>0));
+    header.classList.toggle('hidden',!active);
+    titleEl.textContent=(m.title&&String(m.title).trim())||'\u2014';
+    artistEl.textContent=(m.artist&&String(m.artist).trim())||'\u2014';
+    btn.textContent=pendingCount>0?'\u2026':(m.state==='play'?'\u23f9':'\u25b6');
+    btn.disabled=pendingCount>0;
+    btn.classList.toggle('opacity-60', pendingCount>0);
+    btn.classList.toggle('cursor-not-allowed', pendingCount>0);
 }}
 
 function renderTimerBar(){{
@@ -389,12 +730,18 @@ function renderTimerBar(){{
         const isAlarm=kind==='alarm';
         const actionAttr=isAlarm?'alarm-cancel':'timer-cancel';
         const idAttr=isAlarm?' data-alarm-id="'+esc(t.id)+'"':' data-timer-id="'+esc(t.id)+'"';
+                const pendingKey=(isAlarm?'alarm_cancel:':'timer_cancel:')+String(t.id||'');
+                const isPending=!!(S.pendingTimerActions&&S.pendingTimerActions[pendingKey]);
+                const timerErr=(S.timerActionErrors&&S.timerActionErrors[pendingKey])?S.timerActionErrors[pendingKey].msg:'';
         const icon=isAlarm?'\u23f0':'\u23f1';
         const baseCls=isAlarm
             ?'flex items-center gap-1 px-3 py-1 rounded-full bg-red-800 hover:bg-red-700 text-xs transition-colors'
             :'flex items-center gap-1 px-3 py-1 rounded-full bg-amber-700 hover:bg-amber-600 text-xs transition-colors';
         const label=isAlarm?(t.label||'Alarm'):(t.label||'Timer');
-        return '<button class="'+baseCls+'" data-action="'+actionAttr+'"'+idAttr+' title="Click to cancel">'+icon+' '+esc(label)+' '+mm+':'+ss+'</button>';
+                const disabledAttr=isPending?' disabled style="opacity:.55;cursor:not-allowed"':'';
+                const pendingTxt=isPending?' \u2026':'';
+                const errTxt=timerErr?' ⚠':'';
+                return '<button class="'+baseCls+'" data-action="'+actionAttr+'"'+idAttr+disabledAttr+' title="'+esc(timerErr||'Click to cancel')+'">'+icon+' '+esc(label)+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
   }}).join('');
 }}
 
@@ -404,11 +751,13 @@ function renderPage(){{
     if(S.page==='music'){{
         if(dock) dock.classList.add('hidden');
         renderMusicPage(main);
+        sendAction({{type:'music_list_playlists'}});
     }} else {{
         if(dock) dock.classList.remove('hidden');
         renderHomePage(main);
         updateChatComposerState();
     }}
+    applyMusicHeader();
 }}
 
 function renderHomePage(main){{
@@ -537,21 +886,20 @@ function mkBubble(m){{
         wrap.className='max-w-xs sm:max-w-sm lg:max-w-md';
 
         const b=document.createElement('div');
-        b.className='px-4 py-2 rounded-2xl rounded-bl-md text-sm leading-relaxed bg-gray-700 text-gray-100';
-        b.textContent=(m.text||'');
+        b.className='px-4 py-2 rounded-2xl rounded-bl-md text-sm leading-relaxed bg-gray-700 text-gray-100 md-content';
+        const _rawText=(m.text||'');
+        if(typeof marked!=='undefined'&&typeof DOMPurify!=='undefined'&&_rawText){{
+            marked.setOptions({{breaks:true,gfm:true}});
+            b.innerHTML=DOMPurify.sanitize(marked.parse(_rawText),{{ALLOWED_TAGS:['p','strong','em','h1','h2','h3','h4','h5','h6','ul','ol','li','code','pre','blockquote','a','hr','table','thead','tbody','tr','th','td','br','del','s'],ALLOWED_ATTR:['href','title']}});
+        }}else{{
+            b.textContent=_rawText;
+        }}
         wrap.appendChild(b);
-
         d.appendChild(wrap);
         return d;
-            const b=document.createElement('div');
-            b.className='px-4 py-2 rounded-2xl rounded-bl-md text-sm leading-relaxed bg-gray-700 text-gray-100 md-content';
-            const _rawText=(m.text||'');
-            if(typeof marked!=='undefined'&&typeof DOMPurify!=='undefined'&&_rawText){{
-                marked.setOptions({{breaks:true,gfm:true}});
-                b.innerHTML=DOMPurify.sanitize(marked.parse(_rawText),{{ALLOWED_TAGS:['p','strong','em','h1','h2','h3','h4','h5','h6','ul','ol','li','code','pre','blockquote','a','hr','table','thead','tbody','tr','th','td','br','del','s'],ALLOWED_ATTR:['href','title']}});
-            }}else{{
-                b.textContent=_rawText;
-            }}
+    }}
+
+    if(role==='context_group'){{
         const wrap=document.createElement('div');
         wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
 
@@ -775,12 +1123,106 @@ function mkBubble(m){{
 
 function renderMusicPage(main){{
   main.dataset.page='music';
-  const m=S.music, q=S.musicQueue||[];
-  const rows=q.map(item=>{{
+    const m=S.music, q=S.musicQueue||[];
+    m.state=normalizeMusicState(m.state);
+    const pendingMusicCount=Object.keys(S.pendingMusicActions||{{}}).length;
+  const qFilter=String(S.musicQueueFilter||'').trim().toLowerCase();
+  const filtered=q.filter(item=>{{
+    if(!qFilter) return true;
+    const hay=[item.title,item.artist,item.album,item.file].map(v=>String(v||'').toLowerCase()).join(' | ');
+    return hay.includes(qFilter);
+  }});
+    const selectedCount=Object.keys(S.musicQueueSelection||{{}}).filter(k=>S.musicQueueSelection[k]).length;
+  const playlistOptions=(S.musicPlaylists||[]).map(name=>'<option value="'+esc(name)+'">'+esc(name)+'</option>').join('');
+
+  if(S.musicAddMode){{
+    const addRows=(S.musicLibraryResults||[]).map(item=>{{
+      const file=String(item.file||'');
+      const checked=!!S.musicAddSelection[file];
+      return '<tr class="hover:bg-gray-800">'
+        +'<td class="px-2 py-2 w-8"><input type="checkbox" data-action="music-add-select" data-file="'+esc(file)+'" '+(checked?'checked':'')+'></td>'
+        +'<td class="px-2 py-2 text-sm truncate max-w-xs">'+esc(item.title||file.split('/').pop()||'\u2014')+'</td>'
+        +'<td class="px-2 py-2 text-xs text-gray-400 truncate">'+esc(item.artist||'')+'</td>'
+        +'<td class="px-2 py-2 text-xs text-gray-500 truncate">'+esc(item.album||'')+'</td>'
+      +'</tr>';
+    }}).join('');
+    const addSelectedCount=Object.keys(S.musicAddSelection||{{}}).filter(k=>S.musicAddSelection[k]).length;
+    main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
+      +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
+        +'<h2 class="font-semibold text-lg">Add Songs</h2>'
+        +'<div class="flex items-center gap-2">'
+          +'<button data-action="music-add-cancel" class="px-3 py-1 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Back to Queue</button>'
+          +'<button data-action="music-add-selected" class="px-3 py-1 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors" '+(addSelectedCount? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>Add Selected ('+addSelectedCount+')</button>'
+        +'</div>'
+      +'</div>'
+      +'<div class="px-2">'
+        +'<input id="musicAddSearch" data-action="music-add-search" value="'+esc(S.musicAddQuery||'')+'" placeholder="Search library by title, artist, album" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+      +'</div>'
+      +(addRows
+        ? '<div class="overflow-x-auto rounded-xl border border-gray-800"><table class="w-full text-left"><thead><tr class="text-xs text-gray-400 border-b border-gray-800"><th class="px-2 py-2">#</th><th class="px-2 py-2">Title</th><th class="px-2 py-2">Artist</th><th class="px-2 py-2">Album</th></tr></thead><tbody>'+addRows+'</tbody></table></div>'
+        : '<p class="text-gray-500 text-center py-10 text-sm">Search to find songs to add</p>')
+      +'</div>';
+    return;
+  }}
+
+  const rows=filtered.map(item=>{{
     const active=item.pos===m.position;
-    return '<tr class="hover:bg-gray-800 cursor-pointer '+(active?'bg-gray-800 font-semibold text-green-400':'')+'" data-action="music-play-track" data-position="'+item.pos+'"><td class="px-4 py-2 w-8 text-gray-500 text-xs">'+(item.pos+1)+'</td><td class="px-2 py-2 text-sm truncate max-w-xs">'+esc(item.title||item.file||'\u2014')+'</td><td class="px-2 py-2 text-xs text-gray-400 truncate">'+esc(item.artist||'')+'</td><td class="px-2 py-2 text-xs text-gray-500 text-right pr-4">'+fmtDur(item.duration)+'</td></tr>';
+    const checked=!!S.musicQueueSelection[String(item.pos)];
+    return '<tr class="hover:bg-gray-800 cursor-pointer '+(active?'bg-gray-800 font-semibold text-green-400':'')+'" data-action="music-play-track" data-position="'+item.pos+'">'
+      +'<td class="px-2 py-2 w-8"><input type="checkbox" data-action="music-queue-select" data-position="'+item.pos+'" '+(checked?'checked':'')+'></td>'
+      +'<td class="px-2 py-2 w-8 text-gray-500 text-xs">'+(item.pos+1)+'</td>'
+      +'<td class="px-2 py-2 text-sm truncate max-w-xs">'+esc(item.title||item.file||'\u2014')+'</td>'
+      +'<td class="px-2 py-2 text-xs text-gray-400 truncate">'+esc(item.artist||'')+'</td>'
+      +'<td class="px-2 py-2 text-xs text-gray-500 truncate">'+esc(item.album||'')+'</td>'
+      +'<td class="px-2 py-2 text-xs text-gray-500 text-right pr-4">'+fmtDur(item.duration)+'</td>'
+    +'</tr>';
   }}).join('');
-    main.innerHTML='<div class="max-w-2xl mx-auto px-2 py-4"><div class="flex items-center justify-between mb-4 px-2"><h2 class="font-semibold text-lg">Queue <span class="text-gray-400 font-normal text-sm ml-1">'+m.queue_length+' tracks</span></h2><button data-action="music-toggle" class="px-3 py-1 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">'+(m.state==='play'?'\u23f9 Stop':'\u25b6 Play')+'</button></div>'+(q.length?'<div class="overflow-x-auto rounded-xl border border-gray-800"><table class="w-full text-left"><tbody>'+rows+'</tbody></table></div>':'<p class="text-gray-500 text-center py-8 text-sm">No tracks in queue</p>')+'</div>';
+
+  main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
+    +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
+      +'<h2 class="font-semibold text-lg">Queue <span class="text-gray-400 font-normal text-sm ml-1">'+m.queue_length+' tracks</span></h2>'
+      +'<div class="flex items-center gap-2">'
+        +'<button data-action="music-add-open" class="px-3 py-1 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Add Songs</button>'
+                +'<button data-action="music-open-save-playlist" class="px-3 py-1 rounded-lg text-sm bg-emerald-700 hover:bg-emerald-600 transition-colors">Add Playlist</button>'
+                +'<button data-action="music-toggle" class="px-3 py-1 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors" '+(pendingMusicCount? 'disabled style="opacity:.5;cursor:not-allowed"' : '')+'>'+(pendingMusicCount?'\u2026 Pending':(m.state==='play'?'\u23f9 Stop':'\u25b6 Play'))+'</button>'
+      +'</div>'
+    +'</div>'
+        +'<div class="px-2">'
+            +'<input id="musicQueueSearch" data-action="music-queue-search" value="'+esc(S.musicQueueFilter||'')+'" placeholder="Filter queue: title, artist, album" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+        +'</div>'
+    +'<div class="px-2 grid grid-cols-1 md:grid-cols-3 gap-2">'
+      +'<input id="musicDeletePlaylistName" list="musicPlaylistList" value="'+esc(S.musicDeletePlaylistName||'')+'" placeholder="Playlist to delete" class="rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+      +'<datalist id="musicPlaylistList">'+playlistOptions+'</datalist>'
+      +'<button data-action="music-delete-playlist" class="px-3 py-2 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Delete Playlist</button>'
+      +'<button data-action="music-refresh-playlists" class="px-3 py-2 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Refresh Playlists</button>'
+    +'</div>'
+    +(S.musicActionError? '<div class="px-2 text-xs text-red-300">⚠ '+esc(S.musicActionError)+'</div>' : '')
+        +(selectedCount
+            ? '<div class="px-2 flex items-center gap-2">'
+                    +'<button data-action="music-remove-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors">Remove Selected ('+selectedCount+')</button>'
+                    +'<button data-action="music-open-create-selected" class="px-3 py-1.5 rounded-lg text-sm bg-emerald-700 hover:bg-emerald-600 transition-colors">Create Playlist from Selected</button>'
+                +'</div>'
+            : '')
+    +(rows
+            ? '<div class="px-2 flex items-center justify-end gap-1 text-xs text-gray-400">'
+                    +'<button data-action="music-select-all" title="Select all" class="w-7 h-7 rounded border border-gray-700 hover:bg-gray-800">☑</button>'
+                    +'<button data-action="music-select-none" title="Select none" class="w-7 h-7 rounded border border-gray-700 hover:bg-gray-800">☐</button>'
+                +'</div>'
+                +'<div class="overflow-x-auto rounded-xl border border-gray-800"><table class="w-full text-left"><thead><tr class="text-xs text-gray-400 border-b border-gray-800"><th class="px-2 py-2">Sel</th><th class="px-2 py-2">#</th><th class="px-2 py-2">Title</th><th class="px-2 py-2">Artist</th><th class="px-2 py-2">Album</th><th class="px-2 py-2 text-right pr-4">Dur</th></tr></thead><tbody>'+rows+'</tbody></table></div>'
+      : '<p class="text-gray-500 text-center py-8 text-sm">No tracks match your filter</p>')
+        +(S.musicPlaylistModalOpen
+            ? '<div class="fixed inset-0 z-40 bg-black/60 flex items-center justify-center px-4">'
+                    +'<div class="w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-4 space-y-3">'
+                        +'<div class="text-sm font-semibold">'+(S.musicPlaylistModalMode==='save'?'Add Playlist':'Create Playlist from Selected')+'</div>'
+                        +'<input id="musicPlaylistModalName" value="'+esc(S.musicPlaylistModalName||'')+'" placeholder="Playlist name" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+                        +'<div class="flex justify-end gap-2">'
+                            +'<button data-action="music-modal-cancel" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Cancel</button>'
+                            +'<button data-action="music-modal-confirm" class="px-3 py-1.5 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Save</button>'
+                        +'</div>'
+                    +'</div>'
+                +'</div>'
+            : '')
+  +'</div>';
 }}
 
 function fmtDur(s){{ if(!s) return '\u2014'; const t=Math.round(Number(s)); return Math.floor(t/60)+':'+String(t%60).padStart(2,'0'); }}
@@ -788,6 +1230,107 @@ function esc(s){{ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 
 function wsUrl(){{ return (location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+WS_PORT+'/ws'; }}
 function sendAction(payload){{ if(S.ws&&S.ws.readyState===WebSocket.OPEN) S.ws.send(JSON.stringify(payload)); }}
+function sendMusicAction(actionType, extraPayload={{}}){{
+    const actionId='m'+(S.nextMusicActionId++);
+    S.pendingMusicActions[actionId]={{type:actionType, ts:Date.now()}};
+    sendAction(Object.assign({{type:actionType, action_id:actionId}}, extraPayload||{{}}));
+    if(S.page==='music') renderMusicPage(document.getElementById('main'));
+    applyMusicHeader();
+    return actionId;
+}}
+function sendTimerAction(actionType, idKey, idValue){{
+    const actionId='t'+(S.nextTimerActionId++);
+    const pendingKey=String(actionType||'')+':'+String(idValue||'');
+    S.pendingTimerActions[pendingKey]={{type:actionType, action_id:actionId, ts:Date.now()}};
+    const payload={{type:actionType, action_id:actionId}};
+    payload[String(idKey||'id')]=idValue;
+    sendAction(payload);
+    renderTimerBar();
+    return actionId;
+}}
+function sendSettingAction(actionType, enabled){{
+    const actionId='s'+(S.nextSettingActionId++);
+    S.pendingSettingActions[String(actionType)]={{action_id:actionId, enabled:!!enabled, ts:Date.now()}};
+    sendAction({{type:String(actionType), action_id:actionId, enabled:!!enabled}});
+    applyMicControlToggles();
+    return actionId;
+}}
+
+function recordInlineError(kind, key, message){{
+    const msg=String(message||'Action failed');
+    const now=Date.now();
+    if(kind==='music'){{
+        S.musicActionError=msg;
+        S.musicActionErrorTs=now;
+        return;
+    }}
+    if(kind==='setting'){{
+        S.settingActionErrors[String(key||'unknown')]={{msg, ts:now}};
+        return;
+    }}
+    if(kind==='timer'){{
+        S.timerActionErrors[String(key||'unknown')]={{msg, ts:now}};
+    }}
+}}
+
+function expirePendingActions(){{
+    const now=Date.now();
+    let touchMusic=false, touchTimer=false, touchSettings=false;
+
+    Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
+        const item=S.pendingMusicActions[actionId];
+        if(!item) return;
+        if((now-Number(item.ts||0))>PENDING_ACTION_TIMEOUT_MS){{
+            delete S.pendingMusicActions[actionId];
+            recordInlineError('music','', 'Music action timed out');
+            touchMusic=true;
+        }}
+    }});
+
+    Object.keys(S.pendingTimerActions||{{}}).forEach((k)=>{{
+        const item=S.pendingTimerActions[k];
+        if(!item) return;
+        if((now-Number(item.ts||0))>PENDING_ACTION_TIMEOUT_MS){{
+            delete S.pendingTimerActions[k];
+            recordInlineError('timer', k, 'Timer/alarm action timed out');
+            touchTimer=true;
+        }}
+    }});
+
+    Object.keys(S.pendingSettingActions||{{}}).forEach((k)=>{{
+        const item=S.pendingSettingActions[k];
+        if(!item) return;
+        if((now-Number(item.ts||0))>PENDING_ACTION_TIMEOUT_MS){{
+            delete S.pendingSettingActions[k];
+            recordInlineError('setting', k, 'Setting update timed out');
+            touchSettings=true;
+        }}
+    }});
+
+    if(S.musicActionErrorTs && (now-S.musicActionErrorTs)>INLINE_ERROR_TTL_MS){{
+        S.musicActionError='';
+        S.musicActionErrorTs=0;
+        touchMusic=true;
+    }}
+    Object.keys(S.settingActionErrors||{{}}).forEach((k)=>{{
+        const it=S.settingActionErrors[k];
+        if(it && (now-Number(it.ts||0))>INLINE_ERROR_TTL_MS){{
+            delete S.settingActionErrors[k];
+            touchSettings=true;
+        }}
+    }});
+    Object.keys(S.timerActionErrors||{{}}).forEach((k)=>{{
+        const it=S.timerActionErrors[k];
+        if(it && (now-Number(it.ts||0))>INLINE_ERROR_TTL_MS){{
+            delete S.timerActionErrors[k];
+            touchTimer=true;
+        }}
+    }});
+
+    if(touchMusic){{ applyMusicHeader(); if(S.page==='music') renderMusicPage(document.getElementById('main')); }}
+    if(touchTimer) renderTimerBar();
+    if(touchSettings) applyMicControlToggles();
+}}
 
 function formatCaptureError(err){{
     const name=(err&&err.name)?String(err.name):'';
@@ -820,7 +1363,7 @@ function reportCaptureFailure(err, phase='capture'){{
     updateWsDebugBanner();
     try{{ console.error('Browser capture '+phase+' failed:', err); }}catch(_ ){{}}
     try{{ sendCaptureDiagnostics(err, phase); }}catch(_ ){{}}
-    const retryMs=(err&&err.name==='NotFoundError'&&S.lastAudioInputCount===0)?10000:2500;
+    const retryMs=(err&&err.name==='NotFoundError'&&S.lastAudioInputCount===0)?10000:(err&&err.name==='InvalidStateError')?8000:2500;
     scheduleCaptureRetry(retryMs);
 }}
 
@@ -908,6 +1451,7 @@ function connectWs(){{
                 updateMicInteractivity();
             if(S.browserAudioEnabled) ensureBrowserCapture().catch((err)=>reportCaptureFailure(err,'connect'));
             S.ws.send(JSON.stringify({{type:'ui_ready'}}));
+                setTimeout(pushUiPrefsToServer, 60);
     }};
     S.ws.onclose=(evt)=>{{
         S.wsConnected=false;
@@ -934,50 +1478,187 @@ function handleMsg(msg){{
   switch(msg.type){{
     case 'hello': break;
     case 'state_snapshot':
-      if(msg.orchestrator) applyOrch(msg.orchestrator);
+    if(msg.orchestrator){{
+        const rev = Number(msg.orchestrator.status_rev||0);
+        if(!Number.isNaN(rev) && rev>0) S.lastStatusRev = Math.max(S.lastStatusRev, rev);
+        applyOrch(msg.orchestrator);
+    }}
             if(msg.ui_control){{
+                const uiRev = Number(msg.ui_control_rev||0);
+                const staleUi = (!Number.isNaN(uiRev) && uiRev>0 && uiRev<S.lastUiControlRev);
+                if(!staleUi){{
+                if(!Number.isNaN(uiRev) && uiRev>0) S.lastUiControlRev = uiRev;
                 if(msg.ui_control.mic_enabled!==undefined) S.micEnabled=!!msg.ui_control.mic_enabled;
                 if(msg.ui_control.tts_muted!==undefined) S.ttsMuted=!!msg.ui_control.tts_muted;
                 if(msg.ui_control.browser_audio_enabled!==undefined) S.browserAudioEnabled=!!msg.ui_control.browser_audio_enabled;
                 if(msg.ui_control.continuous_mode!==undefined) S.continuousMode=!!msg.ui_control.continuous_mode;
+                S.settingActionErrors={{}};
                 applyMicState();
                 applyMicControlToggles();
+                }}
             }}
-      if(msg.music){{ applyMusic(msg.music); if(msg.music.queue) S.musicQueue=msg.music.queue; }}
-      if(msg.timers) applyTimers(msg.timers);
-            if(msg.chat) S.chat=msg.chat;
-            if(Array.isArray(msg.chat_threads)) S.chatThreads=msg.chat_threads;
-            if(msg.active_chat_id) S.activeChatId=msg.active_chat_id;
-            if(!S.selectedChatId) S.selectedChatId='active';
+    if(msg.music) applyMusic(msg.music);
+    if(Array.isArray(msg.music_queue)) S.musicQueue=msg.music_queue;
+    if(msg.music_rev!==undefined) S.lastMusicRev=Math.max(S.lastMusicRev, Number(msg.music_rev)||0);
+    if(msg.timers) applyTimers(msg.timers);
+    if(msg.timers_rev!==undefined) S.lastTimersRev=Math.max(S.lastTimersRev, Number(msg.timers_rev)||0);
+            applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id);
             renderPage();
       break;
-    case 'orchestrator_status': applyOrch(msg); break;
+    case 'orchestrator_status':
+        if(msg.status_rev!==undefined){{
+            const rev=Number(msg.status_rev)||0;
+            if(rev<=S.lastStatusRev) break;
+            S.lastStatusRev=rev;
+        }}
+        applyOrch(msg);
+        break;
     case 'status': if(msg.orchestrator) applyOrch(msg.orchestrator); break;
-        case 'chat_append': if(msg.message){{ S.chat.push(msg.message); if(S.page==='home'&&(!S.selectedChatId||S.selectedChatId==='active')) renderChatMessages('active'); }} break;
+        case 'chat_append':
+            if(msg.message){{
+                const nextMsg = normalizeChatMessage(msg.message);
+                if(nextMsg) S.chat.push(nextMsg);
+                persistChatCache();
+                if(S.page==='home'&&(!S.selectedChatId||S.selectedChatId==='active')) renderChatMessages('active');
+            }}
+            break;
         case 'chat_threads_update':
-            if(Array.isArray(msg.chat_threads)) S.chatThreads=msg.chat_threads;
-            if(msg.active_chat_id) S.activeChatId=msg.active_chat_id;
+            applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id);
             if(S.page==='home') renderPage();
             break;
         case 'chat_reset':
             S.chat=[];
-            if(Array.isArray(msg.chat_threads)) S.chatThreads=msg.chat_threads;
-            if(msg.active_chat_id) S.activeChatId=msg.active_chat_id;
+            applyServerChatState([], msg.chat_threads, msg.active_chat_id);
             S.selectedChatId='active';
+            persistChatCache();
             if(S.page==='home') renderPage();
             break;
         case 'chat_text_ack':
             if(msg.client_msg_id) S.pendingChatSends.delete(String(msg.client_msg_id));
             if(S.page==='home') updateChatComposerState();
             break;
-    case 'music_state': applyMusic(msg); if(msg.queue!==undefined) S.musicQueue=msg.queue; if(S.page==='music') renderPage(); else applyMusicHeader(); break;
-    case 'timers_state': applyTimers(msg.timers||[]); break;
+        case 'music_transport':
+            if(msg.music_rev!==undefined){{
+                const rev=Number(msg.music_rev)||0;
+                if(rev<=S.lastMusicRev) break;
+                S.lastMusicRev=rev;
+            }}
+            applyMusic(msg.music||msg);
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            applyMusicHeader();
+            break;
+        case 'music_queue':
+            if(msg.music_rev!==undefined){{
+                const rev=Number(msg.music_rev)||0;
+                if(rev<=S.lastMusicRev) break;
+                S.lastMusicRev=rev;
+            }}
+            if(msg.queue!==undefined) S.musicQueue=msg.queue;
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            break;
+        case 'music_state':
+            if(msg.music_rev!==undefined){{
+                const rev=Number(msg.music_rev)||0;
+                if(rev<=S.lastMusicRev) break;
+                S.lastMusicRev=rev;
+            }}
+            applyMusic(msg.music||msg);
+            if(msg.queue!==undefined) S.musicQueue=msg.queue;
+            else if(msg.music&&msg.music.queue!==undefined) S.musicQueue=msg.music.queue;
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            applyMusicHeader();
+            break;
+        case 'music_action_ack':
+            if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
+            S.musicActionError='';
+            S.musicActionErrorTs=0;
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            applyMusicHeader();
+            break;
+        case 'music_action_error':
+            if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
+            recordInlineError('music', '', String(msg.error||'Music action failed'));
+            S.wsDebug.lastError='music action failed: '+String(msg.error||msg.action||'unknown');
+            updateWsDebugBanner();
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            applyMusicHeader();
+            break;
+        case 'music_library_results':
+            if(Array.isArray(msg.results)) S.musicLibraryResults = msg.results;
+            if(S.page==='music' && S.musicAddMode) renderMusicPage(document.getElementById('main'));
+            break;
+        case 'music_playlists':
+            if(Array.isArray(msg.playlists)) S.musicPlaylists = msg.playlists;
+            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            break;
+    case 'timers_state':
+            if(msg.timers_rev!==undefined){{
+                const rev=Number(msg.timers_rev)||0;
+                if(rev<=S.lastTimersRev) break;
+                S.lastTimersRev=rev;
+            }}
+            S.pendingTimerActions={{}};
+            applyTimers(msg.timers||[]);
+            break;
+        case 'timer_action_ack':
+            if(msg.action){{
+                const key=String(msg.action)+':'+String(msg.id||'');
+                delete S.pendingTimerActions[key];
+                delete S.timerActionErrors[key];
+            }}
+            renderTimerBar();
+            break;
+        case 'timer_action_error':
+            if(msg.action){{
+                const key=String(msg.action)+':'+String(msg.id||'');
+                delete S.pendingTimerActions[key];
+                recordInlineError('timer', key, String(msg.error||'Timer/alarm action failed'));
+            }}
+            S.wsDebug.lastError='timer/alarm action failed: '+String(msg.error||msg.action||'unknown');
+            updateWsDebugBanner();
+            renderTimerBar();
+            break;
         case 'ui_control':
+            if(msg.ui_control_rev!==undefined){{
+                const uiRev=Number(msg.ui_control_rev)||0;
+                if(uiRev<=S.lastUiControlRev) break;
+                S.lastUiControlRev=uiRev;
+            }}
+            const prevBrowserAudio=!!S.browserAudioEnabled;
             if(msg.mic_enabled!==undefined) S.micEnabled=!!msg.mic_enabled;
             if(msg.tts_muted!==undefined) S.ttsMuted=!!msg.tts_muted;
             if(msg.browser_audio_enabled!==undefined) S.browserAudioEnabled=!!msg.browser_audio_enabled;
             if(msg.continuous_mode!==undefined) S.continuousMode=!!msg.continuous_mode;
+            writeBoolPref(PREF_TTS_MUTED, !!S.ttsMuted);
+            writeBoolPref(PREF_BROWSER_AUDIO, !!S.browserAudioEnabled);
+            writeBoolPref(PREF_CONTINUOUS, !!S.continuousMode);
+            if(prevBrowserAudio && !S.browserAudioEnabled){{
+                try{{ if(S.processor) S.processor.disconnect(); }}catch(_ ){{}}
+                try{{ if(S.audioCtx) S.audioCtx.close(); }}catch(_ ){{}}
+                if(S.mediaStream) try{{ S.mediaStream.getTracks().forEach(t=>t.stop()); }}catch(_ ){{}}
+                S.processor=null; S.audioCtx=null; S.mediaStream=null;
+            }} else if(!prevBrowserAudio && S.browserAudioEnabled){{
+                startBrowserCapture().catch(err=>reportCaptureFailure(err,'browserAudioToggle'));
+            }}
+            S.pendingSettingActions={{}};
+            S.settingActionErrors={{}};
             applyMicState();
+            applyMicControlToggles();
+            break;
+        case 'setting_action_ack':
+            if(msg.action){{
+                delete S.pendingSettingActions[String(msg.action)];
+                delete S.settingActionErrors[String(msg.action)];
+            }}
+            applyMicControlToggles();
+            break;
+        case 'setting_action_error':
+            if(msg.action){{
+                delete S.pendingSettingActions[String(msg.action)];
+                recordInlineError('setting', String(msg.action), String(msg.error||'Setting update failed'));
+            }}
+            S.wsDebug.lastError='setting action failed: '+String(msg.error||msg.action||'unknown');
+            updateWsDebugBanner();
             applyMicControlToggles();
             break;
             case 'feedback_sound':
@@ -990,7 +1671,9 @@ async function playFeedbackSound(b64, gain) {{
     try {{
         if (!b64) return;
         const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
+        const ctx = S.feedbackAudioCtx || new (window.AudioContext || window.webkitAudioContext)();
+        S.feedbackAudioCtx = ctx;
+        if (ctx.state === 'suspended') await ctx.resume();
         const buf = await ctx.decodeAudioData(bytes.buffer.slice(0));
         const src = ctx.createBufferSource();
         src.buffer = buf;
@@ -998,7 +1681,6 @@ async function playFeedbackSound(b64, gain) {{
         gainNode.gain.value = Math.max(0, Math.min(4, Number(gain) || 1.0));
         src.connect(gainNode);
         gainNode.connect(ctx.destination);
-        src.onended = () => ctx.close();
         src.start();
     }} catch(e) {{
         console.debug('Feedback sound error:', e);
@@ -1007,16 +1689,52 @@ async function playFeedbackSound(b64, gain) {{
 function applyOrch(o){{
   if(o.voice_state!==undefined) S.voice_state=o.voice_state;
   if(o.wake_state!==undefined)  S.wake_state=o.wake_state;
+  if(o.hotword_active!==undefined) S.hotword_active=!!o.hotword_active;
   if(o.tts_playing!==undefined) S.tts_playing=!!o.tts_playing;
   if(o.mic_rms!==undefined)     S.mic_rms=Number(o.mic_rms)||0;
   if(o.mic_enabled!==undefined) S.micEnabled=!!o.mic_enabled;
   applyMicState();
 }}
-function applyMusic(m){{ Object.assign(S.music,m); applyMusicHeader(); }}
+function applyMusic(m){{
+    const payload=(m&&typeof m==='object'&&m.music&&typeof m.music==='object')?m.music:m;
+    if(!payload||typeof payload!=='object') return;
+    Object.assign(S.music,payload);
+    S.music.state=normalizeMusicState(S.music.state);
+    applyMusicHeader();
+}}
 function applyTimers(t){{
   const now=Date.now()/1000;
   S.timers=t.map(timer=>Object.assign({{}},timer,{{_clientAnchorTs:now, _clientAnchorRem:timer.remaining_seconds}}));
   renderTimerBar();
+}}
+
+async function ensureCaptureWorkletModule(ctx){{
+        if (S.captureWorkletModuleReady) return true;
+        if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') return false;
+        const source = `
+class CaptureProcessor extends AudioWorkletProcessor {{
+    process(inputs) {{
+        const input = inputs && inputs[0] && inputs[0][0] ? inputs[0][0] : null;
+        if (input) {{
+            let sum = 0;
+            for (let i = 0; i < input.length; i++) sum += input[i] * input[i];
+            const rms = Math.sqrt(sum / Math.max(1, input.length));
+            this.port.postMessage({{ rms, samples: input.slice(0) }});
+        }}
+        return true;
+    }}
+}}
+registerProcessor('openclaw-capture-processor', CaptureProcessor);
+`;
+        const blob = new Blob([source], {{ type: 'application/javascript' }});
+        const url = URL.createObjectURL(blob);
+        try {{
+                await ctx.audioWorklet.addModule(url);
+                S.captureWorkletModuleReady = true;
+                return true;
+        }} finally {{
+                URL.revokeObjectURL(url);
+        }}
 }}
 
 async function startBrowserCapture(){{
@@ -1034,7 +1752,7 @@ async function startBrowserCapture(){{
     if(S.mediaStream){{
         try{{ S.mediaStream.getTracks().forEach(t=>t.stop()); }}catch(_ ){{}}
     }}
-    S.processor=null; S.audioCtx=null; S.mediaStream=null;
+    S.processor=null; S.audioCtx=null; S.mediaStream=null; S.captureWorkletModuleReady=false;
 
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){{
       throw new Error('Browser mediaDevices.getUserMedia is unavailable');
@@ -1059,22 +1777,49 @@ async function startBrowserCapture(){{
   S.audioCtx=new(window.AudioContext||window.webkitAudioContext)();
     if (S.audioCtx.state === 'suspended') await S.audioCtx.resume();
   const src=S.audioCtx.createMediaStreamSource(S.mediaStream);
-  const proc=S.audioCtx.createScriptProcessor(2048,1,1);
-  const mute=S.audioCtx.createGain(); mute.gain.value=0;
-  src.connect(proc); proc.connect(mute); mute.connect(S.audioCtx.destination);
-  proc.onaudioprocess=evt=>{{
-    const inp=evt.inputBuffer.getChannelData(0);
-    let ss=0; for(let i=0;i<inp.length;i++) ss+=inp[i]*inp[i];
-    const rms=Math.sqrt(ss/Math.max(1,inp.length));
-        if(!S.ws||S.ws.readyState!==WebSocket.OPEN) return;
-        if(!S.browserAudioEnabled) return;
-    const now=performance.now();
-        if(now-S.lastLevel>=120){{ S.lastLevel=now; S.ws.send(JSON.stringify({{type:'browser_audio_level',rms,peak:rms}})); }}
-        const out=new Int16Array(inp.length);
-        for(let i=0;i<inp.length;i++){{const s=Math.max(-1,Math.min(1,inp[i]));out[i]=s<0?s*0x8000:s*0x7fff;}}
-        S.ws.send(out.buffer);
-  }};
-  S.processor=proc;
+    const mute=S.audioCtx.createGain(); mute.gain.value=0;
+
+    let proc=null;
+    const workletReady = await ensureCaptureWorkletModule(S.audioCtx);
+    if (workletReady) {{
+            proc = new AudioWorkletNode(S.audioCtx, 'openclaw-capture-processor', {{
+                    numberOfInputs: 1,
+                    numberOfOutputs: 1,
+                    outputChannelCount: [1],
+                    channelCount: 1,
+            }});
+            proc.port.onmessage = (evt) => {{
+                    const data = evt && evt.data ? evt.data : null;
+                    if (!data || !data.samples) return;
+                    if(!S.ws||S.ws.readyState!==WebSocket.OPEN) return;
+                    if(!S.browserAudioEnabled) return;
+                    const inp = data.samples;
+                    const rms = Number(data.rms) || 0;
+                    const now=performance.now();
+                    if(now-S.lastLevel>=120){{ S.lastLevel=now; S.ws.send(JSON.stringify({{type:'browser_audio_level',rms,peak:rms}})); }}
+                    const out=new Int16Array(inp.length);
+                    for(let i=0;i<inp.length;i++){{const s=Math.max(-1,Math.min(1,inp[i]));out[i]=s<0?s*0x8000:s*0x7fff;}}
+                    S.ws.send(out.buffer);
+            }};
+            src.connect(proc); proc.connect(mute); mute.connect(S.audioCtx.destination);
+    }} else {{
+            const scriptProc=S.audioCtx.createScriptProcessor(2048,1,1);
+            src.connect(scriptProc); scriptProc.connect(mute); mute.connect(S.audioCtx.destination);
+            scriptProc.onaudioprocess=evt=>{{
+                const inp=evt.inputBuffer.getChannelData(0);
+                let ss=0; for(let i=0;i<inp.length;i++) ss+=inp[i]*inp[i];
+                const rms=Math.sqrt(ss/Math.max(1,inp.length));
+                if(!S.ws||S.ws.readyState!==WebSocket.OPEN) return;
+                if(!S.browserAudioEnabled) return;
+                const now=performance.now();
+                if(now-S.lastLevel>=120){{ S.lastLevel=now; S.ws.send(JSON.stringify({{type:'browser_audio_level',rms,peak:rms}})); }}
+                const out=new Int16Array(inp.length);
+                for(let i=0;i<inp.length;i++){{const s=Math.max(-1,Math.min(1,inp[i]));out[i]=s<0?s*0x8000:s*0x7fff;}}
+                S.ws.send(out.buffer);
+            }};
+            proc = scriptProc;
+    }}
+    S.processor=proc;
     clearCaptureRetry();
 }}
 
@@ -1117,9 +1862,11 @@ function setupServerRefreshWatcher(){{
     }}, 2000);
 }}
 
+loadUiPrefs();
+hydrateChatCache();
 S.page=getPage(); renderPage(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); connectWs();
 setupServerRefreshWatcher();
-setInterval(()=>{{ if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{{ if(t._clientAnchorTs===undefined){{ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; }} t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }}); renderTimerBar(); }},500);
+setInterval(()=>{{ expirePendingActions(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{{ if(t._clientAnchorTs===undefined){{ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; }} t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }}); renderTimerBar(); }},500);
 startBrowserCapture().catch((err)=>{{
     reportCaptureFailure(err,'startup');
 }});
@@ -1145,6 +1892,7 @@ class EmbeddedVoiceWebService:
         ssl_certfile: str = "",
         ssl_keyfile: str = "",
         http_redirect_port: int = 0,
+        chat_persist_path: str = "",
     ):
         self.host = host
         self.ui_port = ui_port
@@ -1182,28 +1930,43 @@ class EmbeddedVoiceWebService:
             "mic_rms": 0.0,
             "queue_depth": 0,
         }
+        self._status_rev: int = 0
 
         self._chat_messages: list[dict[str, Any]] = []
         self._chat_seq: int = 0
         self._chat_threads: list[dict[str, Any]] = []
         self._active_chat_id: str = "active"
         self._chat_thread_limit = 100
+        _default_persist = Path.home() / ".config" / "openclaw" / "chat_state.json"
+        self._chat_persist_path = Path(chat_persist_path) if chat_persist_path else _default_persist
+        self._load_chat_state()
         self._music_state: dict[str, Any] = {
             "state": "stop", "title": "", "artist": "", "album": "",
             "queue_length": 0, "elapsed": 0.0, "duration": 0.0, "position": -1,
         }
+        self._music_queue: list[dict[str, Any]] = []
+        self._music_rev: int = 0
         self._timers_state: list[dict[str, Any]] = []
+        self._timers_rev: int = 0
         self._ui_control_state: dict[str, Any] = {
             "mic_enabled": not mic_starts_disabled,
             "tts_muted": False,
             "browser_audio_enabled": True,
             "continuous_mode": False,
         }
+        self._ui_control_rev: int = 0
 
         self._on_mic_toggle: Callable[[str], Awaitable[None]] | None = None
         self._on_music_toggle: Callable[[str], Awaitable[None]] | None = None
         self._on_music_stop: Callable[[str], Awaitable[None]] | None = None
         self._on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None
+        self._on_music_remove_selected: Callable[[list[int], str], Awaitable[None]] | None = None
+        self._on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None
+        self._on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None
+        self._on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None
+        self._on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None
         self._on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_chat_new: Callable[[str], Awaitable[None]] | None = None
@@ -1296,12 +2059,72 @@ class EmbeddedVoiceWebService:
 
     def update_orchestrator_status(self, **status: Any) -> None:
         self._orchestrator_status.update(status)
+        try:
+            loop = asyncio.get_running_loop()
+            if loop.is_running() and self._clients:
+                asyncio.ensure_future(self.broadcast(self._build_status_payload()))
+        except RuntimeError:
+            pass
 
     def note_hotword_detected(self) -> None:
         self._last_hotword_ts = time.monotonic()
 
+    def _load_chat_state(self) -> None:
+        """Load persisted chat threads and active messages from disk (best-effort)."""
+        try:
+            if not self._chat_persist_path.exists():
+                return
+            raw = self._chat_persist_path.read_text(encoding="utf-8")
+            data = json.loads(raw)
+            threads = data.get("threads")
+            if isinstance(threads, list):
+                self._chat_threads = threads[: self._chat_thread_limit]
+            active = data.get("active_messages")
+            if isinstance(active, list):
+                self._chat_messages = active[-self.chat_history_limit:]
+            seq = data.get("chat_seq")
+            if isinstance(seq, int):
+                self._chat_seq = seq
+            logger.info(
+                "Loaded %d chat thread(s) and %d active message(s) from %s",
+                len(self._chat_threads),
+                len(self._chat_messages),
+                self._chat_persist_path,
+            )
+        except Exception:
+            logger.debug("Could not load chat state from disk (will start fresh)", exc_info=True)
+
+    def _persist_chat_state(self) -> None:
+        """Atomically write chat threads and active messages to disk (best-effort)."""
+        try:
+            self._chat_persist_path.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "threads": self._chat_threads,
+                "active_messages": self._chat_messages,
+                "chat_seq": self._chat_seq,
+                "saved_ts": time.time(),
+            }
+            tmp_fd, tmp_path = tempfile.mkstemp(
+                dir=self._chat_persist_path.parent,
+                prefix=".chat_state_",
+                suffix=".tmp",
+            )
+            try:
+                with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False)
+                os.replace(tmp_path, self._chat_persist_path)
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception:
+            logger.debug("Could not persist chat state to disk", exc_info=True)
+
     def update_chat_history(self, messages: list[dict[str, Any]]) -> None:
         self._chat_messages = list(messages[-self.chat_history_limit:])
+        self._persist_chat_state()
 
     def _derive_chat_title(self, messages: list[dict[str, Any]]) -> str:
         for m in messages:
@@ -1325,11 +2148,13 @@ class EmbeddedVoiceWebService:
         self._chat_threads.insert(0, archived)
         if len(self._chat_threads) > self._chat_thread_limit:
             self._chat_threads = self._chat_threads[: self._chat_thread_limit]
+        self._persist_chat_state()
 
     def start_new_chat(self) -> None:
         self._archive_active_chat_if_needed()
         self._chat_messages = []
         self._active_chat_id = "active"
+        self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
                 {
@@ -1349,23 +2174,51 @@ class EmbeddedVoiceWebService:
         self._chat_messages.append(msg)
         if len(self._chat_messages) > self.chat_history_limit:
             self._chat_messages = self._chat_messages[-self.chat_history_limit:]
+        self._persist_chat_state()
         asyncio.create_task(self.broadcast({"type": "chat_append", "message": msg}))
 
-    def update_music_state(self, queue: list[dict[str, Any]] | None = None, **state: Any) -> None:
+    def update_music_transport(self, **state: Any) -> None:
         self._music_state.update(state)
-        payload: dict[str, Any] = {"type": "music_state"}
-        payload.update(self._music_state)
-        if queue is not None:
-            payload["queue"] = queue
+        self._music_rev += 1
+        payload: dict[str, Any] = {
+            "type": "music_transport",
+            "music_rev": self._music_rev,
+            "music": dict(self._music_state),
+        }
         asyncio.create_task(self.broadcast(payload))
+
+    def update_music_queue(self, queue: list[dict[str, Any]]) -> None:
+        self._music_queue = list(queue)
+        self._music_rev += 1
+        payload: dict[str, Any] = {
+            "type": "music_queue",
+            "music_rev": self._music_rev,
+            "queue": list(self._music_queue),
+        }
+        asyncio.create_task(self.broadcast(payload))
+
+    def update_music_state(self, queue: list[dict[str, Any]] | None = None, **state: Any) -> None:
+        self.update_music_transport(**state)
+        if queue is not None:
+            self.update_music_queue(queue)
 
     def update_timers_state(self, timers: list[dict[str, Any]]) -> None:
         self._timers_state = list(timers)
-        asyncio.create_task(self.broadcast({"type": "timers_state", "timers": self._timers_state}))
+        self._timers_rev += 1
+        asyncio.create_task(self.broadcast({
+            "type": "timers_state",
+            "timers_rev": self._timers_rev,
+            "timers": self._timers_state,
+        }))
 
     def update_ui_control_state(self, **state: Any) -> None:
         self._ui_control_state.update(state)
-        asyncio.create_task(self.broadcast({"type": "ui_control", **self._ui_control_state}))
+        self._ui_control_rev += 1
+        asyncio.create_task(self.broadcast({
+            "type": "ui_control",
+            "ui_control_rev": self._ui_control_rev,
+            **self._ui_control_state,
+        }))
 
     def has_active_client(self) -> bool:
         return self._active_client is not None and self._active_client in self._clients
@@ -1402,6 +2255,13 @@ class EmbeddedVoiceWebService:
         on_music_toggle: Callable[[str], Awaitable[None]] | None = None,
         on_music_stop: Callable[[str], Awaitable[None]] | None = None,
         on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None,
+        on_music_remove_selected: Callable[[list[int], str], Awaitable[None]] | None = None,
+        on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None,
+        on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None,
+        on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None,
+        on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None,
+        on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
+        on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None,
         on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_chat_new: Callable[[str], Awaitable[None]] | None = None,
@@ -1418,6 +2278,20 @@ class EmbeddedVoiceWebService:
             self._on_music_stop = on_music_stop
         if on_music_play_track is not None:
             self._on_music_play_track = on_music_play_track
+        if on_music_remove_selected is not None:
+            self._on_music_remove_selected = on_music_remove_selected
+        if on_music_add_files is not None:
+            self._on_music_add_files = on_music_add_files
+        if on_music_create_playlist is not None:
+            self._on_music_create_playlist = on_music_create_playlist
+        if on_music_save_playlist is not None:
+            self._on_music_save_playlist = on_music_save_playlist
+        if on_music_delete_playlist is not None:
+            self._on_music_delete_playlist = on_music_delete_playlist
+        if on_music_search_library is not None:
+            self._on_music_search_library = on_music_search_library
+        if on_music_list_playlists is not None:
+            self._on_music_list_playlists = on_music_list_playlists
         if on_timer_cancel is not None:
             self._on_timer_cancel = on_timer_cancel
         if on_alarm_cancel is not None:
@@ -1434,23 +2308,23 @@ class EmbeddedVoiceWebService:
             self._on_continuous_mode_set = on_continuous_mode_set
 
     # ------------------------------------------------------------------
+    # Feedback sound helper
+    # ------------------------------------------------------------------
+
+    def send_feedback_sound(self, wav_bytes: bytes, gain: float = 1.0) -> None:
+        """Broadcast a short feedback sound to all browser clients as base64-encoded WAV."""
+        import base64
+        asyncio.create_task(self.broadcast({
+            "type": "feedback_sound",
+            "audio_b64": base64.b64encode(wav_bytes).decode(),
+            "gain": float(gain),
+        }))
+
+    # ------------------------------------------------------------------
     # Broadcast helper
     # ------------------------------------------------------------------
 
     async def broadcast(self, payload: dict[str, Any]) -> None:
-        # ------------------------------------------------------------------
-        # Feedback sound helper
-        # ------------------------------------------------------------------
-
-        def send_feedback_sound(self, wav_bytes: bytes, gain: float = 1.0) -> None:
-            """Broadcast a short feedback sound to all browser clients as base64-encoded WAV."""
-            import base64
-            asyncio.create_task(self.broadcast({
-                "type": "feedback_sound",
-                "audio_b64": base64.b64encode(wav_bytes).decode(),
-                "gain": float(gain),
-            }))
-
         if not self._clients:
             return
         message = json.dumps(payload)
@@ -1551,68 +2425,327 @@ class EmbeddedVoiceWebService:
             return
 
         if msg_type == "music_toggle" and self._on_music_toggle:
+            action_id = payload.get("action_id")
             try:
                 await self._on_music_toggle(client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_ack",
+                        "action": "music_toggle",
+                        "action_id": str(action_id),
+                    }))
             except Exception as exc:
                 logger.warning("music_toggle handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_toggle",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
             return
 
         if msg_type == "music_stop" and self._on_music_stop:
+            action_id = payload.get("action_id")
             try:
                 await self._on_music_stop(client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_ack",
+                        "action": "music_stop",
+                        "action_id": str(action_id),
+                    }))
             except Exception as exc:
                 logger.warning("music_stop handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_stop",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
             return
 
         if msg_type == "music_play_track" and self._on_music_play_track:
+            action_id = payload.get("action_id")
             pos = payload.get("position")
             if pos is not None:
                 try:
                     await self._on_music_play_track(int(pos), client_id)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "music_action_ack",
+                            "action": "music_play_track",
+                            "action_id": str(action_id),
+                        }))
                 except Exception as exc:
                     logger.warning("music_play_track handler error: %s", exc)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "music_action_error",
+                            "action": "music_play_track",
+                            "action_id": str(action_id),
+                            "error": str(exc),
+                        }))
+            return
+
+        if msg_type == "music_remove_selected" and self._on_music_remove_selected:
+            action_id = payload.get("action_id")
+            positions = payload.get("positions")
+            try:
+                pos_list = [int(p) for p in positions] if isinstance(positions, list) else []
+                await self._on_music_remove_selected(pos_list, client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_ack",
+                        "action": "music_remove_selected",
+                        "action_id": str(action_id),
+                    }))
+            except Exception as exc:
+                logger.warning("music_remove_selected handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_remove_selected",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
+            return
+
+        if msg_type == "music_add_files" and self._on_music_add_files:
+            action_id = payload.get("action_id")
+            files = payload.get("files")
+            try:
+                file_list = [str(f) for f in files] if isinstance(files, list) else []
+                await self._on_music_add_files(file_list, client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_ack",
+                        "action": "music_add_files",
+                        "action_id": str(action_id),
+                    }))
+            except Exception as exc:
+                logger.warning("music_add_files handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_add_files",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
+            return
+
+        if msg_type == "music_create_playlist" and self._on_music_create_playlist:
+            action_id = payload.get("action_id")
+            name = str(payload.get("name", "")).strip()
+            positions = payload.get("positions")
+            try:
+                pos_list = [int(p) for p in positions] if isinstance(positions, list) else []
+                if name:
+                    await self._on_music_create_playlist(name, pos_list, client_id)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "music_action_ack",
+                            "action": "music_create_playlist",
+                            "action_id": str(action_id),
+                        }))
+            except Exception as exc:
+                logger.warning("music_create_playlist handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_create_playlist",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
+            return
+
+        if msg_type == "music_save_playlist" and self._on_music_save_playlist:
+            action_id = payload.get("action_id")
+            name = str(payload.get("name", "")).strip()
+            try:
+                if name:
+                    await self._on_music_save_playlist(name, client_id)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "music_action_ack",
+                            "action": "music_save_playlist",
+                            "action_id": str(action_id),
+                        }))
+            except Exception as exc:
+                logger.warning("music_save_playlist handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_save_playlist",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
+            return
+
+        if msg_type == "music_delete_playlist" and self._on_music_delete_playlist:
+            action_id = payload.get("action_id")
+            name = str(payload.get("name", "")).strip()
+            try:
+                if name:
+                    await self._on_music_delete_playlist(name, client_id)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "music_action_ack",
+                            "action": "music_delete_playlist",
+                            "action_id": str(action_id),
+                        }))
+            except Exception as exc:
+                logger.warning("music_delete_playlist handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "music_action_error",
+                        "action": "music_delete_playlist",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
+            return
+
+        if msg_type == "music_search_library" and self._on_music_search_library:
+            query = str(payload.get("query", "")).strip()
+            try:
+                rows = await self._on_music_search_library(query, client_id)
+                if websocket is not None:
+                    await websocket.send(json.dumps({
+                        "type": "music_library_results",
+                        "query": query,
+                        "results": rows or [],
+                    }))
+            except Exception as exc:
+                logger.warning("music_search_library handler error: %s", exc)
+            return
+
+        if msg_type == "music_list_playlists" and self._on_music_list_playlists:
+            try:
+                names = await self._on_music_list_playlists(client_id)
+                if websocket is not None:
+                    await websocket.send(json.dumps({
+                        "type": "music_playlists",
+                        "playlists": names or [],
+                    }))
+            except Exception as exc:
+                logger.warning("music_list_playlists handler error: %s", exc)
             return
 
         if msg_type == "timer_cancel" and self._on_timer_cancel:
+            action_id = payload.get("action_id")
             timer_id = payload.get("timer_id", "")
             if timer_id:
                 try:
                     await self._on_timer_cancel(str(timer_id), client_id)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "timer_action_ack",
+                            "action": "timer_cancel",
+                            "action_id": str(action_id),
+                            "id": str(timer_id),
+                        }))
                 except Exception as exc:
                     logger.warning("timer_cancel handler error: %s", exc)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "timer_action_error",
+                            "action": "timer_cancel",
+                            "action_id": str(action_id),
+                            "id": str(timer_id),
+                            "error": str(exc),
+                        }))
             return
 
         if msg_type == "alarm_cancel" and self._on_alarm_cancel:
+            action_id = payload.get("action_id")
             alarm_id = payload.get("alarm_id", "")
             if alarm_id:
                 try:
                     await self._on_alarm_cancel(str(alarm_id), client_id)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "timer_action_ack",
+                            "action": "alarm_cancel",
+                            "action_id": str(action_id),
+                            "id": str(alarm_id),
+                        }))
                 except Exception as exc:
                     logger.warning("alarm_cancel handler error: %s", exc)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "timer_action_error",
+                            "action": "alarm_cancel",
+                            "action_id": str(action_id),
+                            "id": str(alarm_id),
+                            "error": str(exc),
+                        }))
             return
 
         if msg_type == "tts_mute_set" and self._on_tts_mute_set:
+            action_id = payload.get("action_id")
             enabled = bool(payload.get("enabled", False))
             try:
                 await self._on_tts_mute_set(enabled, client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "setting_action_ack",
+                        "action": "tts_mute_set",
+                        "action_id": str(action_id),
+                    }))
             except Exception as exc:
                 logger.warning("tts_mute_set handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "setting_action_error",
+                        "action": "tts_mute_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
             return
 
         if msg_type == "browser_audio_set" and self._on_browser_audio_set:
+            action_id = payload.get("action_id")
             enabled = bool(payload.get("enabled", True))
             try:
                 await self._on_browser_audio_set(enabled, client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "setting_action_ack",
+                        "action": "browser_audio_set",
+                        "action_id": str(action_id),
+                    }))
             except Exception as exc:
                 logger.warning("browser_audio_set handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "setting_action_error",
+                        "action": "browser_audio_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
             return
 
         if msg_type == "continuous_mode_set" and self._on_continuous_mode_set:
+            action_id = payload.get("action_id")
             enabled = bool(payload.get("enabled", False))
             try:
                 await self._on_continuous_mode_set(enabled, client_id)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "setting_action_ack",
+                        "action": "continuous_mode_set",
+                        "action_id": str(action_id),
+                    }))
             except Exception as exc:
                 logger.warning("continuous_mode_set handler error: %s", exc)
+                if websocket is not None and action_id:
+                    await websocket.send(json.dumps({
+                        "type": "setting_action_error",
+                        "action": "continuous_mode_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    }))
             return
 
         if msg_type == "chat_new" and self._on_chat_new:
@@ -1705,9 +2838,11 @@ class EmbeddedVoiceWebService:
             self._last_hotword_ts is not None
             and (now - self._last_hotword_ts) <= self.hotword_active_s
         )
+        self._status_rev += 1
         orch = dict(self._orchestrator_status)
         orch["hotword_active"] = hotword_active
         orch["mic_enabled"] = self._ui_control_state.get("mic_enabled", False)
+        orch["status_rev"] = self._status_rev
         return {
             "type": "orchestrator_status",
             "ts": time.time(),
@@ -1723,12 +2858,17 @@ class EmbeddedVoiceWebService:
         )
         orch = dict(self._orchestrator_status)
         orch["hotword_active"] = hotword_active
+        orch["status_rev"] = self._status_rev
         return {
             "type": "state_snapshot",
             "orchestrator": orch,
             "ui_control": dict(self._ui_control_state),
+            "ui_control_rev": self._ui_control_rev,
             "music": dict(self._music_state),
+            "music_queue": list(self._music_queue),
+            "music_rev": self._music_rev,
             "timers": list(self._timers_state),
+            "timers_rev": self._timers_rev,
             "chat": list(self._chat_messages[-50:]),
             "chat_threads": list(self._chat_threads),
             "active_chat_id": self._active_chat_id,

@@ -860,6 +860,11 @@ async def run_orchestrator() -> None:
                     last_activity_ts = time.monotonic()
                     state = VoiceState.LISTENING
                     logger.info("🎙️ System woken by %s", source_label)
+                    if web_service:
+                        web_service.update_ui_control_state(mic_enabled=True)
+                        web_service.update_orchestrator_status(
+                            wake_state=wake_state.value, voice_state=state.value
+                        )
 
                     if wake_click_sound:
                         try:
@@ -959,6 +964,11 @@ async def run_orchestrator() -> None:
 
                     await restore_music_if_needed(source_label)
                     logger.info("😴 System put to sleep by %s", source_label)
+                    if web_service:
+                        web_service.update_orchestrator_status(
+                            wake_state=wake_state.value, voice_state=state.value
+                        )
+                        web_service.update_ui_control_state(mic_enabled=False)
                 
                 # Mute button -> force zero microphone input via capture mute.
                 if event.key == "mute":
@@ -984,17 +994,25 @@ async def run_orchestrator() -> None:
                         return
 
                     asyncio.create_task(pause_system_media_if_needed("play button"))
-                    continuous_mode = bool(web_service and web_service._ui_control_state.get("continuous_mode", False))
-
-                    if config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.AWAKE:
+                    if config.wake_word_enabled and wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
                     else:
                         await trigger_wake("play button")
                 
-                # Next/Previous track → Also trigger wake (instead of skipping tracks)
+                # Next/Previous should behave exactly like play-toggle for button parity
                 elif event.key in ("next", "previous"):
-                    asyncio.create_task(pause_system_media_if_needed("play button"))
-                    await trigger_wake("play button")
+                    dismissed = await stop_ringing_alarms_immediately(f"{event.key} button")
+                    if dismissed > 0:
+                        tts_stop_event.set()
+                        _tts_clear_all(f"alarm dismissed by {event.key} button")
+                        logger.info("🎛️ %s button consumed by alarm dismiss", event.key)
+                        return
+
+                    asyncio.create_task(pause_system_media_if_needed(f"{event.key} button"))
+                    if config.wake_word_enabled and wake_state == WakeState.AWAKE:
+                        await trigger_sleep(f"{event.key} button")
+                    else:
+                        await trigger_wake(f"{event.key} button")
                 
                 # Long press play button (0.5s+) → Alternative wake trigger (if supported)
                 elif event.key == "play_pause_long":
@@ -1325,6 +1343,7 @@ async def run_orchestrator() -> None:
                 ssl_certfile=config.web_ui_ssl_certfile,
                 ssl_keyfile=config.web_ui_ssl_keyfile,
                 http_redirect_port=config.web_ui_http_redirect_port,
+                chat_persist_path=config.web_ui_chat_persist_path,
             )
             await web_service.start()
             web_service.update_orchestrator_status(
@@ -1360,7 +1379,6 @@ async def run_orchestrator() -> None:
             # Register web UI action handlers
             async def _ui_mic_toggle(client_id: str) -> None:
                 nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts
-                continuous_mode = bool(web_service._ui_control_state.get("continuous_mode", False))
                 cur_mic = web_service._ui_control_state.get("mic_enabled", False)
                 if not cur_mic:
                     web_service.update_ui_control_state(mic_enabled=True)
@@ -1371,7 +1389,7 @@ async def run_orchestrator() -> None:
                     web_service.note_hotword_detected()
                     if config.music_enabled and music_manager:
                         asyncio.create_task(music_manager.pause_if_playing())
-                elif config.wake_word_enabled and (not continuous_mode) and wake_state == WakeState.AWAKE:
+                elif config.wake_word_enabled and wake_state == WakeState.AWAKE:
                     web_service.update_ui_control_state(mic_enabled=False)
                     wake_state = WakeState.ASLEEP
                     last_wake_detected_ts = None
@@ -1422,6 +1440,10 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.toggle_playback()
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
                     except Exception as exc:
                         logger.warning("Web UI music_toggle: %s", exc)
 
@@ -1429,6 +1451,10 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.stop()
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
                     except Exception as exc:
                         logger.warning("Web UI music_stop: %s", exc)
 
@@ -1436,8 +1462,73 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.play(position)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
                     except Exception as exc:
                         logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
+
+            async def _ui_music_remove_selected(positions: list[int], client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.remove_from_queue_positions(positions)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
+                    except Exception as exc:
+                        logger.warning("Web UI music_remove_selected: %s", exc)
+
+            async def _ui_music_add_files(files: list[str], client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.add_files_to_queue(files)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
+                    except Exception as exc:
+                        logger.warning("Web UI music_add_files: %s", exc)
+
+            async def _ui_music_create_playlist(name: str, positions: list[int], client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.create_playlist_from_queue_positions(name, positions)
+                    except Exception as exc:
+                        logger.warning("Web UI music_create_playlist '%s': %s", name, exc)
+
+            async def _ui_music_save_playlist(name: str, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.save_playlist(name)
+                    except Exception as exc:
+                        logger.warning("Web UI music_save_playlist '%s': %s", name, exc)
+
+            async def _ui_music_delete_playlist(name: str, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.delete_playlist(name)
+                    except Exception as exc:
+                        logger.warning("Web UI music_delete_playlist '%s': %s", name, exc)
+
+            async def _ui_music_search_library(query: str, client_id: str) -> list[dict[str, Any]]:
+                if not music_manager:
+                    return []
+                try:
+                    return await music_manager.search_library_for_ui(query, limit=400)
+                except Exception as exc:
+                    logger.warning("Web UI music_search_library '%s': %s", query, exc)
+                    return []
+
+            async def _ui_music_list_playlists(client_id: str) -> list[str]:
+                if not music_manager:
+                    return []
+                try:
+                    return await music_manager.list_playlists()
+                except Exception as exc:
+                    logger.warning("Web UI music_list_playlists: %s", exc)
+                    return []
 
             async def _ui_timer_cancel(timer_id: str, client_id: str) -> None:
                 if timer_manager:
@@ -1497,6 +1588,13 @@ async def run_orchestrator() -> None:
                 on_music_toggle=_ui_music_toggle,
                 on_music_stop=_ui_music_stop,
                 on_music_play_track=_ui_music_play_track,
+                on_music_remove_selected=_ui_music_remove_selected,
+                on_music_add_files=_ui_music_add_files,
+                on_music_create_playlist=_ui_music_create_playlist,
+                on_music_save_playlist=_ui_music_save_playlist,
+                on_music_delete_playlist=_ui_music_delete_playlist,
+                on_music_search_library=_ui_music_search_library,
+                on_music_list_playlists=_ui_music_list_playlists,
                 on_timer_cancel=_ui_timer_cancel,
                 on_alarm_cancel=_ui_alarm_cancel,
                 on_chat_new=_ui_chat_new,
@@ -1508,8 +1606,11 @@ async def run_orchestrator() -> None:
 
             # Start music + timer state publisher
             async def _web_ui_publisher() -> None:
-                last_music_hash = ""
+                last_music_transport_hash = ""
+                last_music_queue_hash = ""
                 last_schedule_hash = ""
+                music_failures = 0
+                timer_failures = 0
                 music_poll = config.web_ui_music_poll_ms / 1000.0
                 timer_poll = config.web_ui_timer_poll_ms / 1000.0
                 music_tick = 0.0
@@ -1523,13 +1624,34 @@ async def run_orchestrator() -> None:
                         music_tick = now
                         try:
                             ms = await music_manager.get_ui_music_state()
-                            mh = str(sorted(ms.items()))
-                            if mh != last_music_hash:
-                                last_music_hash = mh
-                                q = await music_manager.get_ui_playlist()
-                                web_service.update_music_state(queue=q, **ms)
-                        except Exception:
-                            pass
+                            q = await music_manager.get_ui_playlist()
+                            th = str(sorted(ms.items()))
+                            qh = str([
+                                (
+                                    item.get("id", ""),
+                                    item.get("pos", -1),
+                                    item.get("file", ""),
+                                    item.get("title", ""),
+                                    item.get("artist", ""),
+                                    item.get("album", ""),
+                                )
+                                for item in q
+                            ])
+                            if th != last_music_transport_hash:
+                                last_music_transport_hash = th
+                                web_service.update_music_transport(**ms)
+                            if qh != last_music_queue_hash:
+                                last_music_queue_hash = qh
+                                web_service.update_music_queue(q)
+                            music_failures = 0
+                        except Exception as exc:
+                            music_failures += 1
+                            if music_failures <= 3 or music_failures % 20 == 0:
+                                logger.warning(
+                                    "Web UI music publisher failed (%d): %s",
+                                    music_failures,
+                                    exc,
+                                )
                     if timer_manager and (now - timer_tick) >= timer_poll:
                         timer_tick = now
                         try:
@@ -1555,8 +1677,15 @@ async def run_orchestrator() -> None:
                             if sh != last_schedule_hash:
                                 last_schedule_hash = sh
                                 web_service.update_timers_state(entries)
-                        except Exception:
-                            pass
+                            timer_failures = 0
+                        except Exception as exc:
+                            timer_failures += 1
+                            if timer_failures <= 3 or timer_failures % 20 == 0:
+                                logger.warning(
+                                    "Web UI timer publisher failed (%d): %s",
+                                    timer_failures,
+                                    exc,
+                                )
 
             asyncio.create_task(_web_ui_publisher())
 
@@ -2170,6 +2299,9 @@ async def run_orchestrator() -> None:
                 "thankyou",
                 "thanks you",
                 "thank you very much",
+                "subtitles by the amara org community",
+                "subtitles by amara org community",
+                "subtitles by the amara org",
                 "sigh",
                 "sighs",
                 "sighing",
