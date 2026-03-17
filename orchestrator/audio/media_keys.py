@@ -180,6 +180,14 @@ class MediaKeyDetector:
         "usb audio",
     }
 
+    FILTER_ALIAS_TOKENS = {
+        "anker": {"powerconf", "burr-brown", "conference", "speakerphone"},
+        "powerconf": {"anker", "burr-brown", "conference", "speakerphone"},
+        "burr-brown": {"anker", "powerconf", "conference", "speakerphone"},
+        "conference": {"speakerphone", "powerconf", "anker", "burr-brown"},
+        "speakerphone": {"conference", "powerconf", "anker", "burr-brown"},
+    }
+
     def _is_blocked_device_name(self, device_name: str) -> bool:
         """Explicit name blocklist for keyboard/mouse-like devices."""
         normalized = (device_name or "").strip().lower()
@@ -204,6 +212,38 @@ class MediaKeyDetector:
 
         indicator_count = sum(1 for code in self.KEYBOARD_INDICATOR_KEYS if code in key_codes)
         return indicator_count >= 6
+
+    @classmethod
+    def _expand_filter_token_aliases(cls, token: str) -> Set[str]:
+        expanded = {token}
+        expanded.update(cls.FILTER_ALIAS_TOKENS.get(token, set()))
+        return expanded
+
+    @classmethod
+    def _parse_device_filter_tokens(cls, device_filter: Optional[str]) -> List[Set[str]]:
+        if not device_filter:
+            return []
+
+        groups: List[Set[str]] = []
+        for raw_part in str(device_filter).split(","):
+            token = raw_part.strip().lower()
+            if not token:
+                continue
+            groups.append(cls._expand_filter_token_aliases(token))
+        return groups
+
+    def _device_filter_matches(self, device_name: str) -> bool:
+        if not self._device_filter_token_groups:
+            return True
+
+        normalized_name = (device_name or "").strip().lower()
+        if not normalized_name:
+            return False
+
+        return any(
+            any(candidate in normalized_name for candidate in token_group)
+            for token_group in self._device_filter_token_groups
+        )
 
     @staticmethod
     def _is_avrcp_device_name(device_name: str) -> bool:
@@ -261,6 +301,7 @@ class MediaKeyDetector:
             raise ImportError("evdev library not installed. Run: pip install evdev")
         
         self.device_filter = device_filter
+        self._device_filter_token_groups = self._parse_device_filter_tokens(device_filter)
         self.long_press_threshold = long_press_threshold
         self.play_scan_codes = self.parse_scan_code_list(play_scan_codes)
         self.volume_up_scan_codes = self.parse_scan_code_list(volume_up_scan_codes)
@@ -284,6 +325,9 @@ class MediaKeyDetector:
         self._scan_debounce_s: float = 0.1  # 100ms - filters duplicate events from single press, allows rapid taps
         # Debounce emitted commands: {(device_name, logical_key): last_timestamp}
         self._command_last_seen_ts: Dict[tuple, float] = {}
+        # Also debounce same logical command globally across devices; some speakerphones
+        # emit duplicate events from AVRCP + USB HID for a single physical press.
+        self._global_command_last_seen_ts: Dict[str, float] = {}
         # For some AVRCP devices key-up can be delayed/missing; dispatch selected keys on key-down.
         self._avrcp_down_dispatch_ts: Dict[tuple, float] = {}
         self._avrcp_immediate_keys: Set[str] = {
@@ -378,7 +422,18 @@ class MediaKeyDetector:
             )
             return
 
+        global_last_seen = self._global_command_last_seen_ts.get(media_event.key, 0.0)
+        if self.command_debounce_s > 0 and (media_event.timestamp - global_last_seen) < self.command_debounce_s:
+            logger.info(
+                "Debounced cross-device media command: %s from %s (%.0fms window)",
+                media_event.key,
+                media_event.device_name,
+                self.command_debounce_s * 1000.0,
+            )
+            return
+
         self._command_last_seen_ts[debounce_key] = media_event.timestamp
+        self._global_command_last_seen_ts[media_event.key] = media_event.timestamp
 
         try:
             result = self.callback(media_event)
@@ -411,10 +466,7 @@ class MediaKeyDetector:
                 key_codes = caps[ecodes.EV_KEY]
                 has_media_keys = any(code in self.KEY_MAP for code in key_codes)
                 has_misc_scan = ecodes.EV_MSC in caps
-                filter_matches = (
-                    self.device_filter is not None
-                    and self.device_filter.lower() in device.name.lower()
-                )
+                filter_matches = self._device_filter_matches(device.name)
 
                 if self._is_blocked_device_name(device.name):
                     if path not in self._blocked_name_warned_paths:

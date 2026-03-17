@@ -33,3 +33,4 @@ orchestrator.log
 
 # SSL certificates (generated locally, never commit private keys)
 certs/*.pem
+benchmarks/

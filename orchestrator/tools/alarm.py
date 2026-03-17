@@ -21,6 +21,7 @@ class Alarm:
     enabled: bool = True
     triggered: bool = False
     ringing: bool = False
+    triggered_at: Optional[float] = None  # Unix timestamp when alarm actually started ringing
     callback: Optional[Callable] = None
     
     def to_dict(self) -> dict:
@@ -34,6 +35,7 @@ class Alarm:
             'enabled': self.enabled,
             'triggered': self.triggered,
             'ringing': self.ringing,
+            'triggered_at': self.triggered_at,
         }
     
     @classmethod
@@ -47,6 +49,7 @@ class Alarm:
             enabled=data.get('enabled', True),
             triggered=data.get('triggered', False),
             ringing=data.get('ringing', False),
+            triggered_at=data.get('triggered_at'),
         )
     
     def should_trigger(self) -> bool:
@@ -241,6 +244,7 @@ class AlarmManager:
         
         alarm.triggered = True
         alarm.ringing = True
+        alarm.triggered_at = time.time()
         self.ringing_alarms.add(alarm_id)
         
         # Write triggered immediately
@@ -288,7 +292,7 @@ class AlarmManager:
         return [
             alarm.to_ui_dict(now)
             for alarm in self.alarms.values()
-            if alarm.enabled or alarm.ringing
+            if (alarm.enabled and not alarm.triggered) or alarm.ringing
         ]
     
     async def load_from_disk(self):

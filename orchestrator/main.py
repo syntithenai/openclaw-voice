@@ -1378,28 +1378,59 @@ async def run_orchestrator() -> None:
 
             # Register web UI action handlers
             async def _ui_mic_toggle(client_id: str) -> None:
-                nonlocal wake_state, state, last_wake_detected_ts, last_activity_ts
+                nonlocal wake_state, state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
+
+                def _play_wake_feedback() -> None:
+                    if not wake_click_sound:
+                        return
+                    try:
+                        play_feedback_async(
+                            wake_click_sound,
+                            float(max(0.1, config.wake_feedback_gain)),
+                            "wake click (web mic)",
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to play wake click (web mic): %s", exc)
+
+                def _play_sleep_feedback() -> None:
+                    if not timeout_swoosh_sound:
+                        return
+                    try:
+                        play_feedback_async(
+                            timeout_swoosh_sound,
+                            float(max(0.1, config.sleep_feedback_gain)),
+                            "sleep swoosh (web mic)",
+                        )
+                    except Exception as exc:
+                        logger.debug("Failed to play sleep swoosh (web mic): %s", exc)
+
                 cur_mic = web_service._ui_control_state.get("mic_enabled", False)
                 if not cur_mic:
                     web_service.update_ui_control_state(mic_enabled=True)
                     wake_state = WakeState.AWAKE
+                    wake_sleep_ts = None
                     last_wake_detected_ts = time.monotonic()
                     last_activity_ts = time.monotonic()
                     state = VoiceState.LISTENING
                     web_service.note_hotword_detected()
+                    _play_wake_feedback()
                     if config.music_enabled and music_manager:
                         asyncio.create_task(music_manager.pause_if_playing())
                 elif config.wake_word_enabled and wake_state == WakeState.AWAKE:
                     web_service.update_ui_control_state(mic_enabled=False)
                     wake_state = WakeState.ASLEEP
+                    wake_sleep_ts = time.monotonic()
                     last_wake_detected_ts = None
                     state = VoiceState.IDLE
+                    _play_sleep_feedback()
                 else:
                     web_service.note_hotword_detected()
                     wake_state = WakeState.AWAKE
+                    wake_sleep_ts = None
                     last_wake_detected_ts = time.monotonic()
                     last_activity_ts = time.monotonic()
                     state = VoiceState.LISTENING
+                    _play_wake_feedback()
                     if config.music_enabled and music_manager:
                         asyncio.create_task(music_manager.pause_if_playing())
                 web_service.update_orchestrator_status(
@@ -3004,6 +3035,12 @@ async def run_orchestrator() -> None:
         local_capture_paused_for_browser = False
         local_capture_prev_muted = False
         browser_no_audio_logged = False
+        browser_last_signal_ts: float | None = None
+        browser_hybrid_using_browser = False
+        browser_pcm_buffer = bytearray()
+        browser_pcm_frames_count = 0
+        local_mic_frames_count = 0
+        last_audio_source_log_ts = time.monotonic()
         while True:
             now = time.monotonic()  # Always advance time, even when no audio frame arrives
 
@@ -3011,13 +3048,30 @@ async def run_orchestrator() -> None:
             browser_audio_enabled = bool(web_service and web_service._ui_control_state.get("browser_audio_enabled", True))
             continuous_mode = bool(web_service and web_service._ui_control_state.get("continuous_mode", False))
             browser_audio_ready = bool(web_service and web_service.has_recent_browser_audio(max_age_s=1.2))
+            browser_level_rms = 0.0
+            if web_service:
+                try:
+                    browser_level_rms = float(web_service.latest_browser_audio().get("rms", 0.0) or 0.0)
+                except Exception:
+                    browser_level_rms = 0.0
             audio_authority = str(getattr(config, "web_ui_audio_authority", "native") or "native").lower()
             if not browser_audio_enabled:
                 use_browser_audio = False
             elif audio_authority == "browser":
                 use_browser_audio = browser_connected and browser_audio_ready
             elif audio_authority == "hybrid":
-                use_browser_audio = browser_connected and browser_audio_ready
+                if browser_connected and browser_audio_ready and browser_level_rms >= max(0.001, float(config.vad_min_rms) * 0.6):
+                    browser_last_signal_ts = now
+
+                browser_signal_recent = browser_last_signal_ts is not None and (now - browser_last_signal_ts) <= 1.8
+                use_browser_audio = browser_connected and browser_audio_ready and browser_signal_recent
+
+                if use_browser_audio and not browser_hybrid_using_browser:
+                    logger.info("🌐 Hybrid audio: switching to browser input (rms=%.4f)", browser_level_rms)
+                    browser_hybrid_using_browser = True
+                elif not use_browser_audio and browser_hybrid_using_browser:
+                    logger.info("🎤 Hybrid audio: falling back to local mic (browser rms=%.4f)", browser_level_rms)
+                    browser_hybrid_using_browser = False
             else:  # native (default)
                 use_browser_audio = False
             if use_browser_audio:
@@ -3026,7 +3080,23 @@ async def run_orchestrator() -> None:
                     capture.set_muted(True)
                     local_capture_paused_for_browser = True
                     logger.info("🌐 Browser client connected: pausing local mic stream")
-                frame = await web_service.read_browser_frame(timeout=1.0)
+                target_frame_bytes = frame_samples * 2
+                if len(browser_pcm_buffer) < target_frame_bytes:
+                    chunk = await web_service.read_browser_frame(timeout=1.0)
+                    if chunk:
+                        browser_pcm_buffer.extend(chunk)
+                while len(browser_pcm_buffer) < target_frame_bytes:
+                    chunk = await web_service.read_browser_frame(timeout=0.02)
+                    if not chunk:
+                        break
+                    browser_pcm_buffer.extend(chunk)
+
+                if len(browser_pcm_buffer) >= target_frame_bytes:
+                    frame = bytes(browser_pcm_buffer[:target_frame_bytes])
+                    del browser_pcm_buffer[:target_frame_bytes]
+                else:
+                    frame = None
+                frame_source = "browser_pcm"
             else:
                 if browser_connected and not browser_audio_ready and not browser_no_audio_logged:
                     logger.info("🌐 Browser client connected but no PCM frames yet; continuing to use local mic")
@@ -3037,7 +3107,10 @@ async def run_orchestrator() -> None:
                     capture.set_muted(local_capture_prev_muted)
                     local_capture_paused_for_browser = False
                     logger.info("🌐 Browser client disconnected: resuming local mic stream")
+                if browser_pcm_buffer:
+                    browser_pcm_buffer.clear()
                 frame = capture.read_frame(timeout=1.0)
+                frame_source = "local_mic"
 
             if frame is None:
                 # Still run period tasks so logs/heartbeat appear even when mic is silent/blocked
@@ -3046,6 +3119,25 @@ async def run_orchestrator() -> None:
                     last_heartbeat_ts = now
                 await asyncio.sleep(0.01)
                 continue
+
+            if frame_source == "browser_pcm":
+                browser_pcm_frames_count += 1
+            else:
+                local_mic_frames_count += 1
+
+            if now - last_audio_source_log_ts >= 2.0:
+                logger.info(
+                    "📦 Audio frame source summary: browser_pcm=%d local_mic=%d (connected=%s ready=%s enabled=%s authority=%s)",
+                    browser_pcm_frames_count,
+                    local_mic_frames_count,
+                    browser_connected,
+                    browser_audio_ready,
+                    browser_audio_enabled,
+                    audio_authority,
+                )
+                browser_pcm_frames_count = 0
+                local_mic_frames_count = 0
+                last_audio_source_log_ts = now
 
             frame_count += 1
 
@@ -3316,7 +3408,8 @@ async def run_orchestrator() -> None:
                             last_nonzero_sample_ts = now
                             logger.warning("Capture rebind recovery succeeded; monitoring mic levels")
 
-            if aec and tts_playing and last_playback_frame:
+            _alarm_ringing = bool(alarm_manager and alarm_manager.ringing_alarms)
+            if aec and (tts_playing or _alarm_ringing) and last_playback_frame:
                 try:
                     processed_frame = aec.process(frame, last_playback_frame)
                 except NotImplementedError:
@@ -3466,6 +3559,7 @@ async def run_orchestrator() -> None:
                             last_wake_detected_ts = now
                             if web_service:
                                 web_service.note_hotword_detected()
+                                web_service.update_ui_control_state(mic_enabled=True)
                             last_activity_ts = now
                             state = VoiceState.LISTENING
                             chunk_start_ts = now

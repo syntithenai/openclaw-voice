@@ -118,7 +118,7 @@ class VoiceConfig(BaseSettings):
 
     # Wake word - Global settings
     wake_word_enabled: bool = Field(False)
-    wake_word_timeout_ms: int = Field(120000)
+    wake_word_timeout_ms: int = Field(4000)
     wake_sleep_cooldown_ms: int = Field(2500)  # Ignore wake detections briefly after going to sleep
     wake_min_detect_rms: float = Field(0.0015)  # Reject wake detections on near-silence frames
     wake_clear_ring_buffer: bool = Field(False)  # Clear ring buffer on wake to avoid ghost transcripts (ARM/Pi only)

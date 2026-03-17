@@ -668,8 +668,9 @@ function applyMicState(){{
   btn.style.borderWidth=bw+'px';
   btn.classList.remove('bg-red-900','border-red-600','bg-green-900','border-green-500','bg-gray-700','border-gray-500');
     btn.classList.remove('border-transparent');
-    if(!S.micEnabled) btn.classList.add('bg-red-900','border-red-600');
-  else if(S.wake_state==='awake'||S.hotword_active) btn.classList.add('bg-green-900','border-green-500');
+        if(S.hotword_active) btn.classList.add('bg-green-900','border-green-500');
+    else if(!S.micEnabled) btn.classList.add('bg-red-900','border-red-600');
+    else if(S.wake_state==='awake') btn.classList.add('bg-green-900','border-green-500');
   else btn.classList.add('bg-red-900','border-red-600');
 }}
 document.getElementById('micBtn').addEventListener('click',()=>{{
@@ -722,9 +723,16 @@ function applyMusicHeader(){{
 
 function renderTimerBar(){{
   const bar=document.getElementById('timerBar');
-  if(!S.timers.length){{ bar.classList.add('hidden'); bar.innerHTML=''; return; }}
+    const visibleTimers=S.timers.filter(t=>{{
+        const kind=String(t.kind||'timer').toLowerCase();
+        const rem=Number(t.remaining_seconds);
+        if(!Number.isFinite(rem)) return false;
+        if(kind==='alarm' && rem<=0 && !t.ringing) return false;
+        return true;
+    }});
+    if(!visibleTimers.length){{ bar.classList.add('hidden'); bar.innerHTML=''; return; }}
   bar.classList.remove('hidden');
-  bar.innerHTML=S.timers.map(t=>{{
+    bar.innerHTML=visibleTimers.map(t=>{{
     const rem=Math.max(0,Math.round(t.remaining_seconds));
     const mm=String(Math.floor(rem/60)).padStart(2,'0'),ss=String(rem%60).padStart(2,'0');
         const kind=String(t.kind||'timer').toLowerCase();
@@ -817,64 +825,68 @@ function renderChatMessages(selectedId){{
 function scrollChat(){{ const a=document.getElementById('chatArea'); if(a) a.scrollTop=a.scrollHeight; }}
 function collateChatMessages(msgs){{
     const out=[];
-    const groupOrder=[];
-    const groups={{}};
+    let activeBucket=null;
 
-    const ensureReqBucket=(reqId)=>{{
-        const key='req:'+(reqId===null?'_null':reqId);
-        if(!groups[key]){{
-            groups[key]={{type:'request',reqId,streams:[],steps:[],interim:[],events:[],finals:[]}};
-            groupOrder.push(key);
+    const flushBucket=()=>{{
+        if(!activeBucket) return;
+        if(activeBucket.events.length>0){{
+            out.push({{role:'context_group',request_id:activeBucket.reqId,events:activeBucket.events,steps:activeBucket.steps,interim:activeBucket.interim}});
         }}
-        return groups[key];
-    }};
-
-    (msgs||[]).forEach(m=>{{
-        const role=(m&&m.role)||'';
-        const reqId=(m.request_id===undefined||m.request_id===null)?null:String(m.request_id);
-        if(role==='user'||role==='system'){{
-            const key='standalone:'+groupOrder.length;
-            groups[key]={{type:'raw',item:m}};
-            groupOrder.push(key);
-        }} else if(role==='step'){{
-            const bucket=ensureReqBucket(reqId);
-            bucket.steps.push(m);
-            bucket.events.push({{kind:'tool',payload:m}});
-        }} else if(role==='interim'){{
-            const bucket=ensureReqBucket(reqId);
-            bucket.interim.push(m);
-            bucket.events.push({{kind:'lifecycle',payload:m}});
-        }} else if(role==='assistant'){{
-            const segKind=String((m&&m.segment_kind)||'final').toLowerCase();
-            if(segKind==='stream'){{ ensureReqBucket(reqId).streams.push(m); }}
-            else {{ ensureReqBucket(reqId).finals.push(m); }}
-        }}
-    }});
-
-    groupOrder.forEach(key=>{{
-        const g=groups[key];
-        if(!g) return;
-        if(g.type==='raw'){{ out.push(g.item); return; }}
-
-        if(g.events.length>0){{
-            out.push({{role:'context_group',request_id:g.reqId,events:g.events,steps:g.steps,interim:g.interim}});
-        }}
-
-        const validStreams=g.streams.filter(s=>String(s.text||'').trim().length>0);
-        if(validStreams.length>0 && g.finals.length===0){{
+        const validStreams=activeBucket.streams.filter(s=>String(s.text||'').trim().length>0);
+        if(validStreams.length>0 && activeBucket.finals.length===0){{
             out.push({{
                 role:'assistant_stream_group',
-                request_id:g.reqId,
+                request_id:activeBucket.reqId,
                 source:validStreams[0].source||'assistant',
                 text:validStreams.map(s=>String(s.text||'').trim()).filter(Boolean).join(' '),
                 segments:validStreams,
                 latest:validStreams[validStreams.length-1],
             }});
         }}
+        activeBucket.finals.forEach(f=>out.push(f));
+        activeBucket=null;
+    }};
 
-        g.finals.forEach(f=>out.push(f));
+    const ensureActiveBucket=(reqId)=>{{
+        if(!activeBucket || activeBucket.reqId!==reqId){{
+            flushBucket();
+            activeBucket={{reqId,streams:[],steps:[],interim:[],events:[],finals:[]}};
+        }}
+        return activeBucket;
+    }};
+
+    (msgs||[]).forEach(m=>{{
+        const role=(m&&m.role)||'';
+        const reqId=(m&&m.request_id!==undefined&&m.request_id!==null)?String(m.request_id):null;
+        if(role==='user'||role==='system'){{
+            flushBucket();
+            out.push(m);
+            return;
+        }}
+        if(role==='step'){{
+            const bucket=ensureActiveBucket(reqId);
+            bucket.steps.push(m);
+            bucket.events.push({{kind:'tool',payload:m}});
+            return;
+        }}
+        if(role==='interim'){{
+            const bucket=ensureActiveBucket(reqId);
+            bucket.interim.push(m);
+            bucket.events.push({{kind:'lifecycle',payload:m}});
+            return;
+        }}
+        if(role==='assistant'){{
+            const bucket=ensureActiveBucket(reqId);
+            const segKind=String((m&&m.segment_kind)||'final').toLowerCase();
+            if(segKind==='stream') bucket.streams.push(m);
+            else bucket.finals.push(m);
+            return;
+        }}
+        flushBucket();
+        out.push(m);
     }});
 
+    flushBucket();
     return out;
 }}
 function mkBubble(m){{
@@ -1409,6 +1421,7 @@ async function stopBrowserCapture(){{
     S.processor=null;
     S.audioCtx=null;
     S.mediaStream=null;
+    S.captureWorkletModuleReady=false;
 }}
 
 async function disconnectWs(manual=true){{
@@ -1501,7 +1514,7 @@ function handleMsg(msg){{
     if(msg.music) applyMusic(msg.music);
     if(Array.isArray(msg.music_queue)) S.musicQueue=msg.music_queue;
     if(msg.music_rev!==undefined) S.lastMusicRev=Math.max(S.lastMusicRev, Number(msg.music_rev)||0);
-    if(msg.timers) applyTimers(msg.timers);
+    if(Array.isArray(msg.timers)) applyTimers(msg.timers);
     if(msg.timers_rev!==undefined) S.lastTimersRev=Math.max(S.lastTimersRev, Number(msg.timers_rev)||0);
             applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id);
             renderPage();
@@ -1518,13 +1531,13 @@ function handleMsg(msg){{
         case 'chat_append':
             if(msg.message){{
                 const nextMsg = normalizeChatMessage(msg.message);
-                if(nextMsg) {{
-                    S.chat.push(nextMsg);
-                    const msgRole=String(nextMsg.role||'');
-                    if(msgRole==='user'||msgRole==='assistant') S.selectedChatId='active';
-                }}
+                if(nextMsg) S.chat.push(nextMsg);
+                S.selectedChatId='active';
                 persistChatCache();
-                if(S.page==='home'&&(!S.selectedChatId||S.selectedChatId==='active')) renderChatMessages('active');
+                if(S.page==='home'){{
+                    renderThreadList('active');
+                    renderChatMessages('active');
+                }}
             }}
             break;
 
@@ -1573,6 +1586,14 @@ function handleMsg(msg){{
             else if(msg.music&&msg.music.queue!==undefined) S.musicQueue=msg.music.queue;
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
+            break;
+        case 'timers_state':
+            if(msg.timers_rev!==undefined){{
+                const rev=Number(msg.timers_rev)||0;
+                if(rev<=S.lastTimersRev) break;
+                S.lastTimersRev=rev;
+            }}
+            if(Array.isArray(msg.timers)) applyTimers(msg.timers);
             break;
         case 'music_action_ack':
             if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
@@ -1633,7 +1654,7 @@ function handleMsg(msg){{
                 try{{ if(S.processor) S.processor.disconnect(); }}catch(_ ){{}}
                 try{{ if(S.audioCtx) S.audioCtx.close(); }}catch(_ ){{}}
                 if(S.mediaStream) try{{ S.mediaStream.getTracks().forEach(t=>t.stop()); }}catch(_ ){{}}
-                S.processor=null; S.audioCtx=null; S.mediaStream=null;
+                S.processor=null; S.audioCtx=null; S.mediaStream=null; S.captureWorkletModuleReady=false;
             }} else if(!prevBrowserAudio && S.browserAudioEnabled){{
                 startBrowserCapture().catch(err=>reportCaptureFailure(err,'browserAudioToggle'));
             }}
@@ -1701,7 +1722,16 @@ function applyMusic(m){{
 }}
 function applyTimers(t){{
   const now=Date.now()/1000;
-  S.timers=t.map(timer=>Object.assign({{}},timer,{{_clientAnchorTs:now, _clientAnchorRem:timer.remaining_seconds}}));
+    S.timers=(Array.isArray(t)?t:[])
+        .filter(timer=>{{
+            if(!timer||typeof timer!=='object') return false;
+            const kind=String(timer.kind||'timer').toLowerCase();
+            const rem=Number(timer.remaining_seconds);
+            if(!Number.isFinite(rem)) return false;
+            if(kind==='alarm' && rem<=0 && !timer.ringing) return false;
+            return true;
+        }})
+        .map(timer=>Object.assign({{}},timer,{{_clientAnchorTs:now, _clientAnchorRem:Number(timer.remaining_seconds)||0}}));
   renderTimerBar();
 }}
 
@@ -1756,8 +1786,8 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
   }}
 
   const captureConstraints=[
-      {{audio:{{echoCancellation:false,noiseSuppression:false,autoGainControl:false}},video:false}},
       {{audio:true,video:false}},
+      {{audio:{{echoCancellation:false,noiseSuppression:false,autoGainControl:false}},video:false}},
   ];
 
   let lastErr=null;
@@ -1917,6 +1947,10 @@ class EmbeddedVoiceWebService:
         self._latest_browser_audio: dict[str, float] = {"rms": 0.0, "peak": 0.0}
         self._browser_pcm_frames: deque[bytes] = deque(maxlen=400)
         self._last_browser_pcm_ts: float | None = None
+        self._browser_pcm_packet_count: int = 0
+        self._browser_pcm_packet_bytes: int = 0
+        self._browser_level_packet_count: int = 0
+        self._last_audio_packet_log_ts: float = 0.0
         self._last_hotword_ts: float | None = None
 
         self._orchestrator_status: dict[str, Any] = {
@@ -2390,6 +2424,20 @@ class EmbeddedVoiceWebService:
             try:
                 self._latest_browser_audio["rms"] = float(payload.get("rms", 0.0))
                 self._latest_browser_audio["peak"] = float(payload.get("peak", 0.0))
+                self._browser_level_packet_count += 1
+                now = time.monotonic()
+                if now - self._last_audio_packet_log_ts >= 2.0:
+                    logger.info(
+                        "📦 Audio packet source summary: browser_audio_level=%d browser_pcm=%d (%d bytes queued=%d)",
+                        self._browser_level_packet_count,
+                        self._browser_pcm_packet_count,
+                        self._browser_pcm_packet_bytes,
+                        len(self._browser_pcm_frames),
+                    )
+                    self._browser_level_packet_count = 0
+                    self._browser_pcm_packet_count = 0
+                    self._browser_pcm_packet_bytes = 0
+                    self._last_audio_packet_log_ts = now
             except Exception:
                 pass
             return
@@ -2808,6 +2856,24 @@ class EmbeddedVoiceWebService:
         self._latest_browser_audio["rms"] = max(0.0, min(1.0, rms))
         self._latest_browser_audio["peak"] = max(0.0, min(1.0, float(peak) / 32768.0))
         self._browser_pcm_frames.append(pcm_bytes)
+        self._browser_pcm_packet_count += 1
+        self._browser_pcm_packet_bytes += len(pcm_bytes)
+
+        now = time.monotonic()
+        if now - self._last_audio_packet_log_ts >= 2.0:
+            logger.info(
+                "📦 Audio packet source summary: browser_pcm=%d (%d bytes, rms=%.4f peak=%.4f queued=%d) browser_audio_level=%d",
+                self._browser_pcm_packet_count,
+                self._browser_pcm_packet_bytes,
+                self._latest_browser_audio["rms"],
+                self._latest_browser_audio["peak"],
+                len(self._browser_pcm_frames),
+                self._browser_level_packet_count,
+            )
+            self._browser_level_packet_count = 0
+            self._browser_pcm_packet_count = 0
+            self._browser_pcm_packet_bytes = 0
+            self._last_audio_packet_log_ts = now
 
     # ------------------------------------------------------------------
     # Status broadcast loop

@@ -4,6 +4,10 @@
 # Activates isolated Python 3.11 venv and runs orchestrator
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+cd "$SCRIPT_DIR" || {
+  echo "ERROR: Failed to change directory to $SCRIPT_DIR"
+  exit 1
+}
 
 # Select env file in the same priority as orchestrator/config.py.
 # 1) OPENCLAW_ENV_FILE, 2) .env.docker (in container), 3) .env.pi (ARM), 4) .env
@@ -173,4 +177,4 @@ fi
 
 # Run orchestrator with any passed arguments (tee output to log)
 set -o pipefail
-"$VENV_PATH/bin/python" -m orchestrator.main "$@" 2>&1 | tee -a "$SCRIPT_DIR/orchestrator_output.log"
+"$VENV_PATH/bin/python" -m orchestrator.main "$@" 2>&1 | tee -a "$SCRIPT_DIR/orchestrator_output.log" /tmp/orch.log

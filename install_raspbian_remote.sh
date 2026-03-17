@@ -352,6 +352,12 @@ echo ""
 echo -e "${YELLOW}Step 5b: Ensuring wakeword resources...${NC}"
 ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice && bash ./ensure_wakeword_resources.sh all || true"
 
+
+# Step 5c: Setup VNC for Remmina remote desktop access
+echo ""
+echo -e "${YELLOW}Step 5c: Setting up VNC for Remmina support...${NC}"
+ssh "$PI_SSH_ALIAS" "cd ~/openclaw-voice &&   if [ -f setup_vnc_remmina.sh ]; then     sudo bash setup_vnc_remmina.sh || echo 'Warning: VNC setup had issues';     echo '  ✓ VNC setup complete';   else     echo '  ⚠ VNC setup script not found';   fi"
+
 # Step 6: Clear Python cache and restart
 echo ""
 echo -e "${YELLOW}Step 6: Clearing Python cache...${NC}"

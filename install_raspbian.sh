@@ -182,6 +182,22 @@ fi
 sudo systemctl enable snapserver snapclient >/dev/null 2>&1 || true
 sudo systemctl restart snapserver snapclient >/dev/null 2>&1 || true
 echo -e "${GREEN}✓ PulseAudio/Snapcast defaults configured${NC}"
+################################################################################
+# STEP 3b: Setup VNC for Remmina remote desktop access
+################################################################################
+
+echo ""
+echo -e "${BLUE}Setting up VNC for Remmina support...${NC}"
+VNC_SETUP_SCRIPT="$SCRIPT_DIR/setup_vnc_remmina.sh"
+if [ -f "$VNC_SETUP_SCRIPT" ]; then
+    sudo bash "$VNC_SETUP_SCRIPT" || {
+        echo -e "${YELLOW}Warning: VNC setup reported issues; continuing install.${NC}"
+    }
+    echo -e "${GREEN}✓ VNC setup complete${NC}"
+else
+    echo -e "${YELLOW}Warning: VNC setup script not found at $VNC_SETUP_SCRIPT${NC}"
+fi
+
 
 echo -e "${BLUE}Configuring Bluetooth audio host (auto-pair + auto-route)...${NC}"
 BT_SETUP_SCRIPT="$SCRIPT_DIR/scripts/pi/setup_bluetooth_audio_host.sh"

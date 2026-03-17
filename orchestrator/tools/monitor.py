@@ -154,6 +154,16 @@ class ToolMonitor:
             
             # Check if alarm is ringing (for continuous sound loop)
             elif alarm.ringing:
+                # Auto-stop alarm after 1 minute of ringing
+                max_ring_secs = 60.0
+                if alarm.triggered_at is not None and (time.time() - alarm.triggered_at) > max_ring_secs:
+                    logger.info(
+                        f"ToolMonitor: Alarm {alarm.id} ({alarm.label}) auto-stopped after "
+                        f"{max_ring_secs:.0f}s of ringing"
+                    )
+                    await self.alarm_manager.stop_alarm(alarm.id)
+                    continue
+
                 if self.on_alarm_ringing:
                     try:
                         await self._invoke_monitor_callback(self.on_alarm_ringing, alarm)
