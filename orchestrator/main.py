@@ -1847,7 +1847,18 @@ async def run_orchestrator() -> None:
                 domain = domain.split(":", 1)[0]
             return domain or raw_url
 
+        def _spaced_url_to_domain(raw_url: str) -> str:
+            compact = re.sub(r"\s*([:/?#=&])\s*", r"\1", raw_url)
+            compact = re.sub(r"\s+", "", compact)
+            return _url_to_domain(compact)
+
         # Convert full links to domains only for speech.
+        text = re.sub(
+            r"\bhttps?\s*:\s*/\s*/\s*[^\s<>\"']+(?:\s*/\s*[^\s<>\"']*)*",
+            lambda m: _spaced_url_to_domain(m.group(0)),
+            text,
+            flags=re.IGNORECASE,
+        )
         text = re.sub(r"https?://[^\s<>\"']+", lambda m: _url_to_domain(m.group(0)), text, flags=re.IGNORECASE)
         text = re.sub(r"\bwww\.[^\s<>\"']+", lambda m: _url_to_domain(m.group(0)), text, flags=re.IGNORECASE)
 

@@ -137,6 +137,7 @@ const SERVER_INSTANCE_ID = '{server_instance_id}';
 const PREF_TTS_MUTED = 'openclaw.ui.ttsMuted';
 const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
 const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
+const PREF_CHAT_FOLLOW = 'openclaw.ui.chatFollowLatest';
 const CHAT_CACHE_VERSION = 1;
 const PENDING_ACTION_TIMEOUT_MS = 8000;
 const INLINE_ERROR_TTL_MS = 7000;
@@ -147,6 +148,7 @@ const S = {{
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
   chat:[], music:{{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1}},
     chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
+        chatFollowLatest:true,
     musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
         musicQueueFilter:'', musicQueueSelection:{{}}, musicQueueLastCheckedPos:null,
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{{}}, musicAddLastCheckedFile:'',
@@ -271,6 +273,18 @@ function loadUiPrefs(){{
     S.ttsMuted = readBoolPref(PREF_TTS_MUTED, true);
     S.browserAudioEnabled = readBoolPref(PREF_BROWSER_AUDIO, true);
     S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
+    S.chatFollowLatest = readBoolPref(PREF_CHAT_FOLLOW, true);
+}}
+
+function updateChatFollowToggleState(){{
+    const btn=document.getElementById('chatFollowToggle');
+    if(!btn) return;
+    const on=!!S.chatFollowLatest;
+    btn.textContent=on?'Follow latest: On':'Follow latest: Off';
+    btn.classList.toggle('bg-emerald-700', on);
+    btn.classList.toggle('hover:bg-emerald-600', on);
+    btn.classList.toggle('bg-gray-800', !on);
+    btn.classList.toggle('hover:bg-gray-700', !on);
 }}
 
 function pushUiPrefsToServer(){{
@@ -389,6 +403,15 @@ document.addEventListener('click', e => {{
         S.selectedChatId = tid;
         persistChatCache();
         renderPage();
+        return;
+    }}
+
+    const followLatestBtn = e.target.closest('[data-action="chat-follow-toggle"]');
+    if (followLatestBtn) {{
+        S.chatFollowLatest = !S.chatFollowLatest;
+        writeBoolPref(PREF_CHAT_FOLLOW, !!S.chatFollowLatest);
+        updateChatFollowToggleState();
+        if(S.chatFollowLatest) scrollChat();
         return;
     }}
 
@@ -763,7 +786,14 @@ function renderPage(){{
         sendAction({{type:'music_list_playlists'}});
     }} else {{
         if(dock) dock.classList.remove('hidden');
-        renderHomePage(main);
+        if(main && main.dataset.page==='home'){{
+            const selected = S.selectedChatId || 'active';
+            renderThreadList(selected);
+            renderChatMessages(selected);
+            updateChatFollowToggleState();
+        }} else {{
+            renderHomePage(main);
+        }}
         updateChatComposerState();
     }}
     applyMusicHeader();
@@ -785,7 +815,10 @@ function renderHomePage(main){{
         +'</aside>'
         +'<div class="flex-1 min-w-0 flex flex-col h-full">'
             +'<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
-                +'<button data-action="chat-sidebar-toggle" class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleText+'</button>'
+                +'<div class="flex items-center gap-2">'
+                    +'<button data-action="chat-sidebar-toggle" class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleText+'</button>'
+                    +'<button id="chatFollowToggle" data-action="chat-follow-toggle" class="px-2.5 py-1.5 rounded-lg text-xs transition-colors"></button>'
+                +'</div>'
                 +'<button data-action="chat-new" class="px-3 py-1.5 rounded-lg text-xs bg-blue-700 hover:bg-blue-600 transition-colors">New</button>'
             +'</div>'
             +'<div id="chatArea" class="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0"></div>'
@@ -794,6 +827,7 @@ function renderHomePage(main){{
 
     renderThreadList(selected);
     renderChatMessages(selected);
+    updateChatFollowToggleState();
 }}
 function getSelectedMessages(selectedId){{
     if(!selectedId || selectedId==='active') return S.chat;
@@ -816,11 +850,29 @@ function renderThreadList(selectedId){{
 function renderChatMessages(selectedId){{
     const area=document.getElementById('chatArea');
     if(!area) return;
+    const prevScrollTop=area.scrollTop;
+    const prevScrollHeight=area.scrollHeight;
+    const nearBottom=(prevScrollHeight-area.clientHeight-prevScrollTop)<=80;
+    const openDetailKeys=new Set();
+    area.querySelectorAll('details[data-detail-key]').forEach((el)=>{{
+        if(el.open){{
+            const k=el.getAttribute('data-detail-key');
+            if(k) openDetailKeys.add(k);
+        }}
+    }});
     area.innerHTML='';
     const msgs = getSelectedMessages(selectedId);
         const collated = collateChatMessages(msgs);
         collated.forEach(m=>area.appendChild(mkBubble(m)));
-    scrollChat();
+    area.querySelectorAll('details[data-detail-key]').forEach((el)=>{{
+        const k=el.getAttribute('data-detail-key');
+        if(k && openDetailKeys.has(k)) el.open=true;
+    }});
+    if(S.chatFollowLatest && nearBottom){{
+        scrollChat();
+    }} else {{
+        area.scrollTop=prevScrollTop;
+    }}
 }}
 function scrollChat(){{ const a=document.getElementById('chatArea'); if(a) a.scrollTop=a.scrollHeight; }}
 function collateChatMessages(msgs){{
@@ -915,6 +967,7 @@ function mkBubble(m){{
     if(role==='context_group'){{
         const wrap=document.createElement('div');
         wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
+        const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
 
         const parseDetails=(raw)=>{{
             const txt=String(raw||'').trim();
@@ -958,6 +1011,17 @@ function mkBubble(m){{
             }}
             return String(val);
         }};
+        const renderMarkdown=(raw)=>{{
+            const txt=String(raw||'');
+            if(!txt.trim()) return '';
+            if(typeof marked==='undefined' || typeof DOMPurify==='undefined') return '';
+            try{{
+                marked.setOptions({{breaks:true,gfm:true}});
+                return DOMPurify.sanitize(marked.parse(txt),{{ALLOWED_TAGS:['p','strong','em','h1','h2','h3','h4','h5','h6','ul','ol','li','code','pre','blockquote','a','hr','table','thead','tbody','tr','th','td','br','del','s'],ALLOWED_ATTR:['href','title']}});
+            }}catch(_){{
+                return '';
+            }}
+        }};
 
         const summarizeRequest=(toolName, parsed)=>{{
             if(!parsed||typeof parsed!=='object') return '';
@@ -982,7 +1046,7 @@ function mkBubble(m){{
 
         const extractResult=(parsed)=>{{
             if(!parsed||typeof parsed!=='object') return '';
-            const outCandidates=[parsed.result, parsed.partialResult, parsed.output, parsed.stdout, parsed.stderr, parsed.message, parsed.text, parsed.meta, parsed.content];
+            const outCandidates=[parsed.result, parsed.partialResult, parsed.output, parsed.stdout, parsed.stderr, parsed.message, parsed.text, parsed.content];
             for(const c of outCandidates){{
                 const rendered=toPretty(c);
                 if(rendered&&String(rendered).trim()) return rendered;
@@ -1072,15 +1136,18 @@ function mkBubble(m){{
                             const errTxt=pickText(errVal).trim();
                             if(errTxt) g.errorText=errTxt;
                         }}
-                        if(isReadTool(toolName) && !g.fileContent){{
-                            const readBody=parsed.result!==undefined?parsed.result:(parsed.content!==undefined?parsed.content:(parsed.output!==undefined?parsed.output:undefined));
-                            const readTxt=pickText(readBody).trim();
-                            if(readTxt) g.fileContent=readTxt;
+                        if((isReadTool(toolName)||isWriteTool(toolName)) && !g.fileContent && parsed.outputText){{
+                            const textContent=pickText(parsed.outputText).trim();
+                            if(textContent) g.fileContent=textContent;
                         }}
                     }}
 
                     const resultText=extractResult(parsed) || '';
                     if(resultText && !g.results.includes(resultText)) g.results.push(resultText);
+                    if((isReadTool(toolName)||isWriteTool(toolName)) && !g.fileContent && resultText){{
+                        const fallbackTxt=pickText(resultText).trim();
+                        if(fallbackTxt) g.fileContent=fallbackTxt;
+                    }}
                     continue;
                 }}
 
@@ -1098,7 +1165,9 @@ function mkBubble(m){{
                     details=String(payload.details||'').trim();
                 }}
                 lifecycleItems.push({{name:String(payload.text||payload.name||payload.phase||'lifecycle'), details}});
-                addReasoning((payload.text||payload.name||'event')+': '+details);
+                const parsedPhase=(parsed&&typeof parsed==='object'&&parsed.phase!==undefined)?String(parsed.phase).toLowerCase():'';
+                const isLifecycleError=(name==='lifecycle' && (phase==='error' || parsedPhase==='error'));
+                if(!isLifecycleError) addReasoning((payload.text||payload.name||'event')+': '+details);
             }}
 
             for(const g of toolGroups.values()){{
@@ -1113,7 +1182,7 @@ function mkBubble(m){{
                   +'</div>'
                 : '';
 
-            const toolRows=[...toolGroups.values()].map(g=>{{
+            const toolRows=[...toolGroups.values()].map((g, gi)=>{{
                 const failed=(g.isError===true || g.phases.includes('error'));
                 const success=!failed && (g.isError===false || g.phases.includes('result') || g.phases.includes('end'));
                 const icon=failed?'✕':(success?'✓':'•');
@@ -1132,29 +1201,34 @@ function mkBubble(m){{
 
                 const resultJoined=(g.results.length?g.results.join('\\n\\n---\\n\\n'):'') || '(no result)';
                 const payloadJoined=(g.payloads.length?g.payloads.join('\\n\\n---\\n\\n'):'') || '(no payload)';
-                const payloadBlock='<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+                const detailBase='req:'+reqKey+':tool:'+String(g.callId||g.name||'tool')+':'+String(gi);
+                const payloadBlock='<details data-detail-key="'+esc(detailBase+':payload')+'" class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
                     +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">payload</summary>'
                     +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(payloadJoined)+'</pre>'
                     +'</details>';
                 const resultInline=(resultJoined && resultJoined!=='(no result)')
                     ? '<div class="mt-1 text-[11px] text-gray-200 whitespace-pre-wrap break-words">'+esc(resultJoined)+'</div>'
                     : '';
-                const execCommand=(g.command||g.requestPreview||'(no command)');
-                const fileLabel=(g.files.length?basename(g.files[0]):'(no file)');
+                                const execCommand=String(g.command||g.requestPreview||'(no command)').replace(/^command:\s*/i,'');
+                                const fileLabel=(g.files.length?String(g.files[0]):'(no file)');
                 const contentLabel=(isWrite?'file content':'content');
+                                const markdownLike=/\.(md|markdown|mdx)$/i.test(String(fileLabel||''));
+                                const markdownHtml=((isWrite||isRead) && markdownLike) ? renderMarkdown(g.fileContent) : '';
                 const contentBlock=((isWrite||isRead) && g.fileContent)
-                    ? '<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+                                        ? '<details data-detail-key="'+esc(detailBase+':content')+'" class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
                         +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">'+contentLabel+'</summary>'
-                        +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(g.fileContent)+'</pre>'
+                                                +(markdownHtml
+                                                        ? '<div class="px-1.5 pb-1.5 text-[11px] text-gray-300 md-content">'+markdownHtml+'</div>'
+                                                        : '<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(g.fileContent)+'</pre>')
                       +'</details>'
                     : ((isWrite||isRead)
-                        ? '<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+                                                ? '<details data-detail-key="'+esc(detailBase+':content')+'" class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
                             +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">'+contentLabel+'</summary>'
-                            +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">(no content)</pre>'
+                                                        +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">(no content returned)</pre>'
                           +'</details>'
                         : '');
-                const errorInline=(failed && (g.errorText || (resultJoined && resultJoined!=='(no result)')))
-                    ? '<div class="mt-1 text-[11px] text-red-300 whitespace-pre-wrap break-words">'+esc(g.errorText || resultJoined)+'</div>'
+                                const errorInline=(failed)
+                                        ? '<div class="mt-1 text-[11px] text-red-300 whitespace-pre-wrap break-words">error status'+((g.errorText || (resultJoined && resultJoined!=='(no result)'))?(': '+esc(g.errorText || resultJoined)):'')+'</div>'
                     : '';
 
                 let bodyHtml='<div class="text-[11px] text-gray-300 mt-0.5">'+esc(summary)+'</div>'
@@ -1175,8 +1249,8 @@ function mkBubble(m){{
                     +'</div>';
             }}).join('');
 
-            const lifecycleRows=lifecycleItems.map(item=>{{
-                const detailsBlock='<details class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
+            const lifecycleRows=lifecycleItems.map((item, li)=>{{
+                const detailsBlock='<details data-detail-key="'+esc('req:'+reqKey+':lifecycle:'+String(li))+ '" class="mt-1 rounded border border-gray-700/70 bg-gray-900/40">'
                     +'<summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">payload</summary>'
                     +'<pre class="px-1.5 pb-1.5 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(item.details||'(no details)')+'</pre>'
                     +'</details>';
@@ -1187,7 +1261,7 @@ function mkBubble(m){{
             }}).join('');
 
             const interimBlock=reasoningLines.length
-                ? '<details class="mt-2 rounded border border-gray-700/70 bg-gray-900/40">'
+                                ? '<details data-detail-key="'+esc('req:'+reqKey+':interim')+'" class="mt-2 rounded border border-gray-700/70 bg-gray-900/40">'
                     +'<summary class="px-2 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100">Interim/Reasoning</summary>'
                     +'<pre class="px-2 pb-2 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(reasoningLines.join('\\n'))+'</pre>'
                   +'</details>'
@@ -1196,7 +1270,7 @@ function mkBubble(m){{
             const executionSequenceContent=waitingRow+toolRows+lifecycleRows+interimBlock;
             if(executionSequenceContent){{
                 const timeline=document.createElement('div');
-                timeline.innerHTML='<details class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden">'
+                timeline.innerHTML='<details data-detail-key="'+esc('req:'+reqKey+':thinking')+'" class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden">'
                     +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Thinking</summary>'
                     +'<div class="px-2 pb-2 pt-1">'+executionSequenceContent+'</div>'
                     +'</details>';

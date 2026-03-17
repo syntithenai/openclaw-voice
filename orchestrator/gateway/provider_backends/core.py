@@ -257,6 +257,22 @@ class OpenClawGateway(BaseGateway):
         reasoning = "\n".join(part.strip() for part in reasoning_parts if part and part.strip())
         return visible, reasoning
 
+    @staticmethod
+    def _extract_output_text(result_obj: Any) -> Optional[str]:
+        """Extract text output from tool result object."""
+        if not isinstance(result_obj, dict):
+            if isinstance(result_obj, str) and result_obj.strip():
+                return result_obj.strip()
+            return None
+
+        # Try common field names in order of preference
+        for field in ["text", "output", "result", "stdout", "stderr", "message", "content", "body"]:
+            value = result_obj.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+
+        return None
+
     async def _emit_step_event(self, name: str, phase: str, tool_call_id: str, details_obj: Any) -> None:
         try:
             details_text = details_obj if isinstance(details_obj, str) else json.dumps(details_obj, ensure_ascii=False)
@@ -616,6 +632,13 @@ class OpenClawGateway(BaseGateway):
                                         for k, v in step_data.items()
                                         if k not in {"name", "tool", "toolName", "tool_name", "phase", "status", "state", "event"}
                                     }
+                                    # For read/write operations at completion, explicitly extract and include output text
+                                    if phase == "end" and any(x in str(name).lower() for x in ["read", "write", "create", "insert", "replace"]):
+                                        result_val = step_data.get("result")
+                                        if result_val is not None:
+                                            extracted_text = self._extract_output_text(result_val)
+                                            if extracted_text and "outputText" not in details_obj:
+                                                details_obj["outputText"] = extracted_text
                                     await self._emit_step_event(str(name), str(phase), str(tool_call_id), details_obj)
                                     logger.debug(
                                         "← OpenClaw tool[%s] phase=%s id=%s",
