@@ -135,7 +135,7 @@ def _build_ui_html(
 
 <div id="wsDebugBanner" class="hidden flex-none relative overflow-hidden text-[11px] border-b border-gray-800 select-none bg-gray-900/95 text-gray-100" role="button" tabindex="0" onclick="onTopMusicProgressClick(event)" onkeydown="if(event.key==='Enter'||event.key===' ')onTopMusicProgressClick(event)">
     <div id="wsProgressFill" class="absolute inset-y-0 left-0 pointer-events-none bg-blue-700/45" style="width:0%;transition:width .12s linear;"></div>
-    <span id="wsDebugText" class="relative z-10 block px-3 py-1 text-center">0:00 / 0:00</span>
+    <span id="wsDebugText" class="relative z-10 block px-3 py-1 text-left">0:00 / 0:00</span>
 </div>
 <div id="timerBar" class="hidden flex-none px-3 py-2 bg-amber-950/60 border-b border-amber-800/50 flex gap-2 flex-wrap items-center text-sm"></div>
 <div id="scrollUpWrap" class="hidden flex-none justify-center pt-2 pb-1">
@@ -3379,6 +3379,13 @@ class EmbeddedVoiceWebService:
                 self._browser_level_packet_count += 1
                 now = time.monotonic()
                 if now - self._last_audio_packet_log_ts >= 2.0:
+                    logger.info(
+                        "📦 Audio packet source summary: browser_audio_level=%d browser_pcm=%d (%d bytes queued=%d)",
+                        self._browser_level_packet_count,
+                        self._browser_pcm_packet_count,
+                        self._browser_pcm_packet_bytes,
+                        len(self._browser_pcm_frames),
+                    )
                     self._browser_level_packet_count = 0
                     self._browser_pcm_packet_count = 0
                     self._browser_pcm_packet_bytes = 0
@@ -3869,6 +3876,15 @@ class EmbeddedVoiceWebService:
 
         now = time.monotonic()
         if now - self._last_audio_packet_log_ts >= 2.0:
+            logger.info(
+                "📦 Audio packet source summary: browser_pcm=%d (%d bytes, rms=%.4f peak=%.4f queued=%d) browser_audio_level=%d",
+                self._browser_pcm_packet_count,
+                self._browser_pcm_packet_bytes,
+                self._latest_browser_audio["rms"],
+                self._latest_browser_audio["peak"],
+                len(self._browser_pcm_frames),
+                self._browser_level_packet_count,
+            )
             self._browser_level_packet_count = 0
             self._browser_pcm_packet_count = 0
             self._browser_pcm_packet_bytes = 0
