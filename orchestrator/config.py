@@ -282,7 +282,7 @@ class VoiceConfig(BaseSettings):
     mpd_host: str = Field("localhost")  # MPD server host
     mpd_port: int = Field(6600)  # MPD server port
     mpd_timeout: float = Field(5.0)  # Connection timeout in seconds
-    mpd_pool_size: int = Field(3)  # Number of connections in pool
+    mpd_pool_size: int = Field(6)  # Number of connections in pool (increased from 3 to prevent starving searches with FTS rebuilds)
     mpd_playlist_dir: str = Field("playlists")  # Relative to OPENCLAW_WORKSPACE_DIR
     mpd_state_dir: str = Field(".mpd")  # Relative to OPENCLAW_WORKSPACE_DIR
     music_fast_path_enabled: bool = Field(True)  # Enable fast-path parsing for music commands

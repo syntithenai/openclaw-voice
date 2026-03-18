@@ -21,9 +21,8 @@ def test_queue_queries_stay_on_local_music_path() -> None:
     assert reason == "music_local"
 
 
-def test_music_page_navigation_uses_broader_music_intent() -> None:
+def test_music_page_navigation_requires_explicit_user_navigation() -> None:
     source = Path("orchestrator/main.py").read_text(encoding="utf-8")
 
-    assert "def _should_navigate_to_music_page(" in source
-    assert 're.search(r"\\b(queue|playlist)\\b", normalized)' in source
-    assert '"music" if _should_navigate_to_music_page(combined_transcript, parsed_music, is_music_query) else "home"' in source
+    assert "def _should_navigate_to_music_page(" not in source
+    assert "web_service.navigate_ui_page(" not in source

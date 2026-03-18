@@ -18,37 +18,9 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import websockets
-from orchestrator.gateway.message_extract import strip_gateway_control_markers
 from orchestrator.web.http_server import start_http_servers
 
 logger = logging.getLogger("orchestrator.web.realtime")
-
-
-class _WebsocketHandshakeNoiseFilter(logging.Filter):
-    """Suppress expected client-abort handshake noise from websockets logger."""
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        message = record.getMessage()
-        if "opening handshake failed" not in message:
-            return True
-        exc_text = ""
-        if record.exc_info:
-            exc_text = " ".join(str(part) for part in record.exc_info if part)
-        combined = f"{message} {exc_text}".lower()
-        return "no close frame received or sent" not in combined
-
-
-_WS_NOISE_FILTER_INSTALLED = False
-
-
-def _install_websockets_noise_filter() -> None:
-    global _WS_NOISE_FILTER_INSTALLED
-    if _WS_NOISE_FILTER_INSTALLED:
-        return
-    noise_filter = _WebsocketHandshakeNoiseFilter()
-    logging.getLogger("websockets.server").addFilter(noise_filter)
-    logging.getLogger("websockets.asyncio.server").addFilter(noise_filter)
-    _WS_NOISE_FILTER_INSTALLED = True
 
 
 def _build_ui_html(
@@ -144,12 +116,6 @@ def _build_ui_html(
     <div class="relative flex items-center flex-none gap-3" id="micControlWrap">
         <button id="micBtn" class="mic-btn w-11 h-11 flex items-center justify-center font-bold text-xl rounded-full border-4 border-transparent" title="Microphone">&#127908;</button>
         <button id="micMenuBtn" class="w-7 h-7 flex items-center justify-center rounded-full text-gray-300 bg-gray-800/60 border border-gray-700 hover:bg-gray-700 transition-colors" title="Microphone options">&#9662;</button>
-        <div id="mutedChatNotice" class="hidden absolute right-0 top-14 z-40 max-w-[19rem]">
-            <div class="relative rounded-2xl border-2 border-gray-100 bg-amber-200 text-gray-900 px-3 py-2 shadow-lg text-xs font-semibold leading-snug">
-                <span class="mr-1">💬</span><span id="mutedChatNoticeText"></span>
-                <span class="absolute -top-1.5 right-6 w-3 h-3 bg-amber-200 border-l-2 border-t-2 border-gray-100 rotate-45"></span>
-            </div>
-        </div>
         <div id="micControlDropdown" class="hidden absolute right-0 top-12 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-50 p-2 flex flex-col gap-2">
             <div class="flex items-center justify-between px-2 py-1">
                 <span id="ttsMuteLabel" class="text-xs text-gray-300">Mute TTS output</span>
@@ -167,10 +133,14 @@ def _build_ui_html(
     </div>
 </header>
 
-<div id="wsDebugBanner" class="flex-none px-3 py-1 text-[11px] bg-gray-900/95 border-b border-gray-800 text-gray-300 truncate">
-    WS: initializing...
+<div id="wsDebugBanner" class="hidden flex-none relative overflow-hidden text-[11px] border-b border-gray-800 select-none bg-gray-900/95 text-gray-100" role="button" tabindex="0" onclick="onTopMusicProgressClick(event)" onkeydown="if(event.key==='Enter'||event.key===' ')onTopMusicProgressClick(event)">
+    <div id="wsProgressFill" class="absolute inset-y-0 left-0 pointer-events-none bg-blue-700/45" style="width:0%;transition:width .12s linear;"></div>
+    <span id="wsDebugText" class="relative z-10 block px-3 py-1 text-center">0:00 / 0:00</span>
 </div>
 <div id="timerBar" class="hidden flex-none px-3 py-2 bg-amber-950/60 border-b border-amber-800/50 flex gap-2 flex-wrap items-center text-sm"></div>
+<div id="scrollUpWrap" class="hidden flex-none justify-center pt-2 pb-1">
+    <button id="scrollUpBtn" data-action="page-scroll-up" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>
+</div>
 
 <main id="main" class="flex-1 overflow-y-auto min-h-0"></main>
 <div id="chatComposerDock" class="hidden flex-none border-t border-gray-800 bg-gray-900 px-3 py-2 z-10">
@@ -191,29 +161,25 @@ const SERVER_INSTANCE_ID = '{server_instance_id}';
 const PREF_TTS_MUTED = 'openclaw.ui.ttsMuted';
 const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
 const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
-const PREF_CHAT_FOLLOW = 'openclaw.ui.chatFollowLatest';
 const CHAT_CACHE_VERSION = 1;
 const PENDING_ACTION_TIMEOUT_MS = 8000;
-const MUSIC_LOAD_PLAYLIST_TIMEOUT_MS = 30000;
 const INLINE_ERROR_TTL_MS = 7000;
 const MUSIC_LIBRARY_SEARCH_MIN_LEN = 3;
+const WS_RECONNECT_MS = 1500;
 
 const S = {{
   ws:null, wsConnected:false,
   micEnabled:!MIC_STARTS_DISABLED,
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
     chat:[], music:{{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''}},
-        chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
-                chatThreadSearchQuery:'',
-            chatDeleteModalOpen:false,
-            chatDeleteTargetId:'',
-            chatDeleteTargetTitle:'',
+    chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
+                chatThreadFilter:'',
+        chatDeleteModalOpen:false, chatDeleteTargetId:'', chatDeleteTargetTitle:'',
         chatFollowLatest:true,
     musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
         musicQueueFilter:'', musicQueueSelectionByIds:{{}}, musicQueueLastCheckedId:null,
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{{}}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
         musicAddSearchPending:false, musicAddPendingQuery:'',
-        musicAddSearchLimit:200,
         musicNewPlaylistName:'',
         musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'',
         timers:[], page:'home',
@@ -223,7 +189,6 @@ const S = {{
     ttsMuted:true, browserAudioEnabled:true, continuousMode:false,
     pendingChatSends:new Set(), nextClientMsgId:1,
     nextMusicActionId:1, pendingMusicActions:{{}},
-    musicLoadRetryPending:null, musicLoadRetryAttempted:false,
     nextTimerActionId:1, pendingTimerActions:{{}},
     nextSettingActionId:1, pendingSettingActions:{{}},
     settingActionErrors:{{}}, timerActionErrors:{{}},
@@ -234,12 +199,8 @@ const S = {{
     wsPingTimer:null,
     captureRetryTimer:null,
     lastAudioInputCount:null,
-    mutedChatNoticeTimer:null,
     scrollToBottomPending:false,
     autoScrollUntilTs:0,
-    chatLastScrollTop:0,
-    chatUserScrolledUp:false,
-    suppressScrollDirectionTracking:false,
 }};
 
 function applyToggle(btn, enabled){{
@@ -272,20 +233,14 @@ function canSearchMusicLibrary(query){{
 }}
 
 function submitMusicLibrarySearch(){{
-    submitMusicLibrarySearchWithLimit(undefined);
-}}
-
-function submitMusicLibrarySearchWithLimit(limitOverride){{
     const query = String(S.musicAddQuery||'').trim();
     if(!canSearchMusicLibrary(query)) return;
-    const nextLimit = Math.max(1, Number(limitOverride||S.musicAddSearchLimit||200) || 200);
     S.musicAddHasSearched = true;
     S.musicAddSearchPending = true;
     S.musicAddPendingQuery = query;
-    S.musicAddSearchLimit = nextLimit;
     S.musicLibraryResults = [];
     if(S.page==='music' && S.musicAddMode) renderMusicPage(document.getElementById('main'));
-    sendAction({{type:'music_search_library', query, limit: nextLimit}});
+    sendAction({{type:'music_search_library', query}});
 }}
 
 function getChatCacheKey(){{
@@ -312,28 +267,14 @@ function normalizeChatThread(t){{
     return thread;
 }}
 
-function sortChatThreadsBySavedOrder(threads){{
-    return [...(Array.isArray(threads)?threads:[])].sort((a,b)=>{{
-        const aCreated=Number(a?.created_ts||0);
-        const bCreated=Number(b?.created_ts||0);
-        if(aCreated!==bCreated) return bCreated-aCreated;
-        const aUpdated=Number(a?.updated_ts||0);
-        const bUpdated=Number(b?.updated_ts||0);
-        if(aUpdated!==bUpdated) return bUpdated-aUpdated;
-        return String(b?.id||'').localeCompare(String(a?.id||''));
-    }});
-}}
-
 function mergeChatThreads(serverThreads, cachedThreads){{
     const merged = new Map();
     (Array.isArray(cachedThreads)?cachedThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>merged.set(t.id, t));
     (Array.isArray(serverThreads)?serverThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>{{
         const existing = merged.get(t.id);
-        const nextThread=Object.assign({{}}, t);
-        if(existing && Number(existing.created_ts||0)>0) nextThread.created_ts=Number(existing.created_ts||nextThread.created_ts||0);
-        if(!existing || Number(t.updated_ts||0) >= Number(existing.updated_ts||0)) merged.set(t.id, nextThread);
+        if(!existing || Number(t.updated_ts||0) >= Number(existing.updated_ts||0)) merged.set(t.id, t);
     }});
-    return sortChatThreadsBySavedOrder([...merged.values()]);
+    return [...merged.values()].sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
 }}
 
 function persistChatCache(){{
@@ -357,32 +298,17 @@ function hydrateChatCache(){{
         const data = JSON.parse(raw);
         if(!data || typeof data!=='object') return;
         if(Array.isArray(data.chat)) S.chat = data.chat.map(normalizeChatMessage).filter(Boolean);
-        if(Array.isArray(data.chatThreads)) S.chatThreads = sortChatThreadsBySavedOrder(data.chatThreads.map(normalizeChatThread).filter(Boolean));
+        if(Array.isArray(data.chatThreads)) S.chatThreads = data.chatThreads.map(normalizeChatThread).filter(Boolean);
         if(data.activeChatId) S.activeChatId = String(data.activeChatId);
         if(data.selectedChatId) S.selectedChatId = String(data.selectedChatId);
     }} catch(_) {{}}
 }}
 
-function applyServerChatState(chat, chatThreads, activeChatId, replaceThreads=false){{
+function applyServerChatState(chat, chatThreads, activeChatId){{
     if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
-    if(Array.isArray(chatThreads)){{
-        if(replaceThreads){{
-            const existingById = new Map((Array.isArray(S.chatThreads)?S.chatThreads:[]).map(normalizeChatThread).filter(Boolean).map(t=>[t.id, t]));
-            const next = chatThreads.map(normalizeChatThread).filter(Boolean).map(t=>{{
-                const existing = existingById.get(t.id);
-                if(existing && Number(existing.created_ts||0)>0) t.created_ts=Number(existing.created_ts||t.created_ts||0);
-                return t;
-            }});
-            S.chatThreads = sortChatThreadsBySavedOrder(next);
-        }} else {{
-            S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
-        }}
-    }}
+    if(Array.isArray(chatThreads)) S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
     if(activeChatId) S.activeChatId = String(activeChatId);
     if(!S.selectedChatId) S.selectedChatId = 'active';
-    if(String(S.selectedChatId||'active')==='active' && String(S.activeChatId||'active')!=='active'){{
-        S.selectedChatId = String(S.activeChatId||'active');
-    }}
     const selected = String(S.selectedChatId||'active');
     if(selected!=='active' && !(S.chatThreads||[]).some(t=>String(t.id||'')===selected)) S.selectedChatId = 'active';
     persistChatCache();
@@ -392,7 +318,6 @@ function loadUiPrefs(){{
     S.ttsMuted = readBoolPref(PREF_TTS_MUTED, true);
     S.browserAudioEnabled = readBoolPref(PREF_BROWSER_AUDIO, true);
     S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
-    S.chatFollowLatest = readBoolPref(PREF_CHAT_FOLLOW, true);
 }}
 
 function pushUiPrefsToServer(){{
@@ -423,59 +348,68 @@ function applyMicControlToggles(){{
     if(ttsLabel) ttsLabel.textContent='Mute TTS output'+(ttsErr?' ⚠ '+ttsErr:'');
     if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:'');
     if(contLabel) contLabel.textContent='Continuous mode'+(contErr?' ⚠ '+contErr:'');
-    refreshMutedChatNoticeVisibility();
 }}
 
-function hideMutedChatNotice(){{
-    const wrap=document.getElementById('mutedChatNotice');
-    if(!wrap) return;
-    if(S.mutedChatNoticeTimer){{
-        clearTimeout(S.mutedChatNoticeTimer);
-        S.mutedChatNoticeTimer=null;
+function formatMusicTime(seconds){{
+    const safe=Math.max(0, Math.floor(Number(seconds)||0));
+    const mm=Math.floor(safe/60);
+    const ss=String(safe%60).padStart(2,'0');
+    return mm+':'+ss;
+}}
+
+function getEffectiveMusicElapsed(){{
+    const base=Math.max(0, Number(S.music && S.music.elapsed) || 0);
+    const duration=Math.max(0, Number(S.music && S.music.duration) || 0);
+    const state=String((S.music&&S.music.state)||'').toLowerCase();
+    if(state!=='play' || !S.music || !S.music._clientElapsedAnchorTs) return Math.min(base, duration||base);
+    const delta=Math.max(0, (Date.now()-Number(S.music._clientElapsedAnchorTs||Date.now()))/1000);
+    const predicted=base+delta;
+    if(duration>0) return Math.min(duration, predicted);
+    return predicted;
+}}
+
+function onTopMusicProgressClick(event){{
+    if(!S.music) return;
+    const duration=Math.max(0, Number(S.music.duration)||0);
+    if(duration<=0) return;
+    if(!(S.ws&&S.ws.readyState===WebSocket.OPEN)) return;
+    const bar=document.getElementById('wsDebugBanner');
+    if(!bar) return;
+    const rect=bar.getBoundingClientRect();
+    if(!rect || rect.width<=0) return;
+    const pointerX=Number(event&&event.clientX);
+    const fallbackX=rect.width*Math.max(0, Math.min(1, getEffectiveMusicElapsed()/duration));
+    const rawX=Number.isFinite(pointerX) ? (pointerX-rect.left) : fallbackX;
+    const x=Math.min(rect.width, Math.max(0, rawX));
+    const ratio=x/rect.width;
+    const target=Math.max(0, Math.min(duration, duration*ratio));
+    sendMusicAction('music_seek', {{seconds: target}});
+}}
+
+function applyTopMusicProgress(){{
+    const bar=document.getElementById('wsDebugBanner');
+    const fill=document.getElementById('wsProgressFill');
+    const text=document.getElementById('wsDebugText');
+    if(!bar || !fill || !text) return;
+    const duration=Math.max(0, Number(S.music && S.music.duration)||0);
+    const state=String((S.music&&S.music.state)||'').toLowerCase();
+    const active=(state==='play'||state==='pause') && duration>0;
+    if(!active){{
+        bar.classList.add('hidden');
+        fill.style.width='0%';
+        text.textContent='0:00 / 0:00';
+        return;
     }}
-    wrap.classList.add('hidden');
-}}
-
-function refreshMutedChatNoticeVisibility(){{
-    if(S.page==='music' && !!S.ttsMuted) return;
-    hideMutedChatNotice();
-}}
-
-function showMutedChatNoticeForMessage(msg){{
-    if(S.page!=='music' || !S.ttsMuted) return;
-    if(!msg || typeof msg!=='object') return;
-    const role=String(msg.role||'').toLowerCase();
-    if(role!=='user' && role!=='assistant') return;
-    const text=String(msg.text||'').trim();
-    if(!text) return;
-    const wrap=document.getElementById('mutedChatNotice');
-    const textEl=document.getElementById('mutedChatNoticeText');
-    if(!wrap || !textEl) return;
-
-    const label=(role==='user')?'You':'Bot';
-    const preview=text.length>120?(text.slice(0,117)+'...'):text;
-    textEl.textContent=label+': '+preview;
-    wrap.classList.remove('hidden');
-
-    if(S.mutedChatNoticeTimer) clearTimeout(S.mutedChatNoticeTimer);
-    S.mutedChatNoticeTimer=setTimeout(()=>{{
-        hideMutedChatNotice();
-    }}, 2000);
+    bar.classList.remove('hidden');
+    const elapsed=getEffectiveMusicElapsed();
+    const ratio=Math.max(0, Math.min(1, duration>0?(elapsed/duration):0));
+    fill.style.width=(ratio*100).toFixed(2)+'%';
+    text.textContent=formatMusicTime(elapsed)+' / '+formatMusicTime(duration);
+    bar.title='Click to seek';
 }}
 
 function updateWsDebugBanner(){{
-    const el=document.getElementById('wsDebugBanner');
-    if(!el) return;
-    const url=wsUrl();
-    const s=S.wsDebug||{{}};
-    const parts=['WS '+(s.status||'unknown'), url];
-    if(s.lastCloseCode!==null&&s.lastCloseCode!==undefined){{
-        let closeTxt='close='+s.lastCloseCode;
-        if(s.lastCloseReason) closeTxt+=' ('+s.lastCloseReason+')';
-        parts.push(closeTxt);
-    }}
-    if(s.lastError) parts.push('err='+s.lastError);
-    el.textContent=parts.join(' • ');
+    applyTopMusicProgress();
 }}
 
 function updateMicInteractivity(){{
@@ -535,58 +469,50 @@ function isChatAtBottom(){{
     return (area.scrollTop + area.clientHeight) >= (area.scrollHeight - 8);
 }}
 
-function isChatAtTop(){{
-    const area=document.getElementById('chatArea');
-    if(!area) return true;
-    return area.scrollTop <= 8;
-}}
-
 function updateScrollDownButton(){{
     const wrap=document.getElementById('scrollDownWrap');
-    const upWrap=document.getElementById('scrollUpWrap');
-    if(!wrap && !upWrap) return;
-
-    if(wrap){{
-        const desktop=window.matchMedia('(min-width: 768px)').matches;
-        const alignToChatPane=S.page==='home' && desktop && !!S.chatSidebarOpen;
-        wrap.style.marginLeft=alignToChatPane ? '18rem' : '';
-        wrap.style.width=alignToChatPane ? 'calc(100% - 18rem)' : '';
-    }}
-
+    if(!wrap) return;
     const area=document.getElementById('chatArea');
     if(!area || S.page!=='home'){{
-        if(wrap){{
-            wrap.classList.add('hidden');
-            wrap.classList.remove('flex');
-        }}
-        if(upWrap){{
-            upWrap.classList.add('hidden');
-            upWrap.classList.remove('flex');
-        }}
+        wrap.classList.add('hidden');
+        wrap.classList.remove('flex');
         return;
     }}
     const overflow=area.scrollHeight > (area.clientHeight + 1);
     const atBottom=isChatAtBottom();
-    const atTop=isChatAtTop();
     const shouldShow=overflow && !atBottom;
-    const shouldShowUp=overflow && !atTop && !!S.chatUserScrolledUp;
-    if(wrap){{
-        wrap.classList.toggle('hidden', !shouldShow);
-        wrap.classList.toggle('flex', shouldShow);
-    }}
-    if(upWrap){{
-        upWrap.classList.toggle('hidden', !shouldShowUp);
-        upWrap.classList.toggle('flex', shouldShowUp);
-    }}
-}}
-
-function updateMusicQueueScrollUpButton(){{
-    const wrap=document.getElementById('musicQueueScrollUpWrap');
-    if(!wrap) return;
-    const pageTop=window.scrollY || document.documentElement.scrollTop || 0;
-    const shouldShow=(S.page==='music') && pageTop > 120;
     wrap.classList.toggle('hidden', !shouldShow);
     wrap.classList.toggle('flex', shouldShow);
+}}
+
+function getScrollUpArea(){{
+    if(S.page==='home') return document.getElementById('chatArea');
+    if(S.page==='music') return document.getElementById('main');
+    return null;
+}}
+
+function updateScrollUpButton(){{
+    const wrap=document.getElementById('scrollUpWrap');
+    if(!wrap) return;
+    const area=getScrollUpArea();
+    if(!area){{
+        wrap.classList.add('hidden');
+        wrap.classList.remove('flex');
+        return;
+    }}
+    const overflow=area.scrollHeight > (area.clientHeight + 1);
+    const partiallyScrolled=area.scrollTop > 8;
+    const shouldShow=overflow && partiallyScrolled;
+    wrap.classList.toggle('hidden', !shouldShow);
+    wrap.classList.toggle('flex', shouldShow);
+}}
+
+function scrollCurrentViewUp(){{
+    const area=getScrollUpArea();
+    if(!area) return;
+    area.scrollTop=0;
+    updateScrollUpButton();
+    updateScrollDownButton();
 }}
 
 function requestScrollToBottomBurst(){{
@@ -605,18 +531,23 @@ function updateNavActiveState(){{
     }});
 }}
 window.addEventListener('hashchange',()=>{{ S.page=getPage(); renderPage(); updateNavActiveState(); closeMenu(); }});
-window.addEventListener('resize',()=>{{ updateScrollDownButton(); updateMusicQueueScrollUpButton(); }});
-window.addEventListener('scroll',()=>{{ updateScrollDownButton(); updateMusicQueueScrollUpButton(); }}, {{passive:true}});
 
 function closeMenu(){{ document.getElementById('menuDropdown').classList.add('hidden'); }}
 function closeMicControlMenu(){{ const m=document.getElementById('micControlDropdown'); if(m) m.classList.add('hidden'); }}
 document.getElementById('menuBtn').addEventListener('click',e=>{{ e.stopPropagation(); document.getElementById('menuDropdown').classList.toggle('hidden'); }});
 document.getElementById('micMenuBtn').addEventListener('click',e=>{{ e.stopPropagation(); const m=document.getElementById('micControlDropdown'); if(m) m.classList.toggle('hidden'); }});
-document.addEventListener('click', e=>{{ closeMenu(); if(!e.target.closest('#micControlWrap')) closeMicControlMenu(); }});
+document.addEventListener('click', e=>{{
+    closeMenu();
+    const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
+    if(!target || !target.closest('#micControlWrap')) closeMicControlMenu();
+}});
 document.addEventListener('keydown', e=>{{ if(e.key==='Escape'){{ closeMenu(); closeMicControlMenu(); }} }});
 document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',e=>{{ e.preventDefault(); navigate(el.dataset.nav); }}));
 document.addEventListener('click', e => {{
-    const newChatBtn = e.target.closest('[data-action="chat-new"]');
+    const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
+    if(!target) return;
+
+    const newChatBtn = target.closest('[data-action="chat-new"]');
     if (newChatBtn) {{
         sendAction({{type:'chat_new'}});
         S.selectedChatId = 'active';
@@ -624,71 +555,80 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const toggleSidebarBtn = e.target.closest('[data-action="chat-sidebar-toggle"]');
+    const toggleSidebarBtn = target.closest('[data-action="chat-sidebar-toggle"]');
     if (toggleSidebarBtn) {{
         S.chatSidebarOpen = !S.chatSidebarOpen;
         renderPage();
         return;
     }}
 
-    const clearThreadSearchBtn = e.target.closest('[data-action="chat-search-clear"]');
-    if (clearThreadSearchBtn) {{
-        S.chatThreadSearchQuery='';
-        const input=document.getElementById('chatThreadSearchInput');
-        if(input) input.value='';
-        updateChatThreadSearchUi();
-        renderThreadList(S.selectedChatId || 'active');
+    const deleteThreadOpenBtn = target.closest('[data-action="chat-delete-open"]');
+    if (deleteThreadOpenBtn) {{
+        e.stopPropagation();
+        const tid = String(deleteThreadOpenBtn.dataset.threadId || '').trim();
+        if(!tid || tid==='active') return;
+        const title = String(deleteThreadOpenBtn.dataset.threadTitle || '').trim() || 'Untitled';
+        S.chatDeleteModalOpen = true;
+        S.chatDeleteTargetId = tid;
+        S.chatDeleteTargetTitle = title;
+        renderPage();
         return;
     }}
 
-    const selectThreadBtn = e.target.closest('[data-action="chat-select"]');
+    const deleteThreadCancelBtn = target.closest('[data-action="chat-delete-cancel"]');
+    if (deleteThreadCancelBtn) {{
+        S.chatDeleteModalOpen = false;
+        S.chatDeleteTargetId = '';
+        S.chatDeleteTargetTitle = '';
+        renderPage();
+        return;
+    }}
+
+    const deleteThreadConfirmBtn = target.closest('[data-action="chat-delete-confirm"]');
+    if (deleteThreadConfirmBtn) {{
+        const tid = String(S.chatDeleteTargetId || '').trim();
+        if(tid && tid!=='active') sendAction({{type:'chat_delete', thread_id: tid}});
+        S.chatDeleteModalOpen = false;
+        S.chatDeleteTargetId = '';
+        S.chatDeleteTargetTitle = '';
+        renderPage();
+        return;
+    }}
+
+    const selectThreadBtn = target.closest('[data-action="chat-select"]');
     if (selectThreadBtn) {{
         const tid = selectThreadBtn.dataset.threadId || 'active';
         S.selectedChatId = tid;
-        sendAction({{type:'chat_select', thread_id: tid}});
         persistChatCache();
         renderPage();
         return;
     }}
 
-    const openDeleteThreadBtn = e.target.closest('[data-action="chat-open-delete"]');
-    if (openDeleteThreadBtn) {{
-        e.stopPropagation();
-        const tid = String(openDeleteThreadBtn.dataset.threadId || '').trim();
-        if(!tid) return;
-        const t=(S.chatThreads||[]).find(x=>String(x.id||'')===tid);
-        S.chatDeleteTargetId=tid;
-        S.chatDeleteTargetTitle=String((t&&t.title)||'Untitled').trim()||'Untitled';
-        S.chatDeleteModalOpen=true;
-        renderHomeDeleteModal();
-        return;
-    }}
-
-    const scrollDownBtn = e.target.closest('[data-action="chat-scroll-down"]');
+    const scrollDownBtn = target.closest('[data-action="chat-scroll-down"]');
     if (scrollDownBtn) {{
         scrollChat();
         return;
     }}
 
-    const scrollUpBtn = e.target.closest('[data-action="chat-scroll-up"]');
+    const scrollUpBtn = target.closest('[data-action="page-scroll-up"]');
     if (scrollUpBtn) {{
-        scrollChatToTop();
+        scrollCurrentViewUp();
         return;
     }}
 
-    const timerBtn = e.target.closest('[data-action="timer-cancel"]');
+    const timerBtn = target.closest('[data-action="timer-cancel"]');
     if (timerBtn) {{
         sendTimerAction('timer_cancel','timer_id', timerBtn.dataset.timerId);
         return;
     }}
 
-    const alarmBtn = e.target.closest('[data-action="alarm-cancel"]');
+    const alarmBtn = target.closest('[data-action="alarm-cancel"]');
     if (alarmBtn) {{
         sendTimerAction('alarm_cancel','alarm_id', alarmBtn.dataset.alarmId);
         return;
     }}
 
-    const browserAudioToggle = e.target.closest('[data-action="toggle-browser-audio"]');
+    const browserAudioToggle = target.closest('[data-action="toggle-browser-audio"]');
     if (browserAudioToggle) {{
         e.stopPropagation();
         if(S.pendingSettingActions['browser_audio_set']) return;
@@ -696,7 +636,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const ttsMuteToggle = e.target.closest('[data-action="toggle-tts-mute"]');
+    const ttsMuteToggle = target.closest('[data-action="toggle-tts-mute"]');
     if (ttsMuteToggle) {{
         e.stopPropagation();
         if(S.pendingSettingActions['tts_mute_set']) return;
@@ -704,7 +644,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const continuousToggle = e.target.closest('[data-action="toggle-continuous-mode"]');
+    const continuousToggle = target.closest('[data-action="toggle-continuous-mode"]');
     if (continuousToggle) {{
         e.stopPropagation();
         if(S.pendingSettingActions['continuous_mode_set']) return;
@@ -712,7 +652,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const queueCb = e.target.closest('[data-action="music-queue-select"]');
+    const queueCb = target.closest('[data-action="music-queue-select"]');
     if (queueCb) {{
         e.stopPropagation();
         const songId = String(queueCb.dataset.songId||'').trim();
@@ -737,7 +677,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const addCb = e.target.closest('[data-action="music-add-select"]');
+    const addCb = target.closest('[data-action="music-add-select"]');
     if (addCb) {{
         const file = String(addCb.dataset.file || '');
         const checked = !!addCb.checked;
@@ -761,7 +701,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const selectAllBtn = e.target.closest('[data-action="music-select-all"]');
+    const selectAllBtn = target.closest('[data-action="music-select-all"]');
     if (selectAllBtn) {{
         const boxes=[...document.querySelectorAll('[data-action="music-queue-select"]')];
         boxes.forEach(cb=>{{
@@ -772,7 +712,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const selectNoneBtn = e.target.closest('[data-action="music-select-none"]');
+    const selectNoneBtn = target.closest('[data-action="music-select-none"]');
     if (selectNoneBtn) {{
         S.musicQueueSelectionByIds={{}};
         S.musicQueueLastCheckedId=null;
@@ -780,44 +720,25 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const musicScrollTopBtn = e.target.closest('[data-action="music-scroll-top"]');
-    if (musicScrollTopBtn) {{
-        window.scrollTo({{top:0, behavior:'smooth'}});
-        return;
-    }}
-
-    const clearQueueBtn = e.target.closest('[data-action="music-clear-queue"]');
-    if (clearQueueBtn) {{
-        sendMusicAction('music_clear_queue');
-        return;
-    }}
-
-    const addModeBtn = e.target.closest('[data-action="music-add-open"]');
+    const addModeBtn = target.closest('[data-action="music-add-open"]');
     if (addModeBtn) {{
         S.musicAddMode = true;
         S.musicAddSelection = {{}};
         S.musicAddHasSearched = false;
         S.musicAddSearchPending = false;
         S.musicAddPendingQuery = '';
-        S.musicAddSearchLimit = 200;
         sendAction({{type:'music_list_playlists'}});
         renderMusicPage(document.getElementById('main'));
         return;
     }}
 
-    const addSearchBtn = e.target.closest('[data-action="music-add-search-submit"]');
+    const addSearchBtn = target.closest('[data-action="music-add-search-submit"]');
     if (addSearchBtn && !addSearchBtn.disabled) {{
         submitMusicLibrarySearch();
         return;
     }}
 
-    const addSearchMoreBtn = e.target.closest('[data-action="music-add-search-more"]');
-    if (addSearchMoreBtn && !addSearchMoreBtn.disabled) {{
-        submitMusicLibrarySearchWithLimit((Number(S.musicAddSearchLimit)||200) + 200);
-        return;
-    }}
-
-    const addModeCancel = e.target.closest('[data-action="music-add-cancel"]');
+    const addModeCancel = target.closest('[data-action="music-add-cancel"]');
     if (addModeCancel) {{
         S.musicAddMode = false;
         S.musicAddSearchPending = false;
@@ -826,7 +747,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const addSelectedBtn = e.target.closest('[data-action="music-add-selected"]');
+    const addSelectedBtn = target.closest('[data-action="music-add-selected"]');
     if (addSelectedBtn) {{
         const files = Object.keys(S.musicAddSelection).filter(k=>S.musicAddSelection[k]);
         if(files.length) sendMusicAction('music_add_files', {{files}});
@@ -836,7 +757,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const addSelectAllBtn = e.target.closest('[data-action="music-add-select-all"]');
+    const addSelectAllBtn = target.closest('[data-action="music-add-select-all"]');
     if (addSelectAllBtn) {{
         (S.musicLibraryResults||[]).forEach(item=>{{
             const file=String((item&&item.file)||'').trim();
@@ -846,7 +767,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const addSelectNoneBtn = e.target.closest('[data-action="music-add-select-none"]');
+    const addSelectNoneBtn = target.closest('[data-action="music-add-select-none"]');
     if (addSelectNoneBtn) {{
         S.musicAddSelection={{}};
         S.musicAddLastCheckedFile='';
@@ -854,22 +775,16 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const removeSelectedBtn = e.target.closest('[data-action="music-remove-selected"]');
+    const removeSelectedBtn = target.closest('[data-action="music-remove-selected"]');
     if (removeSelectedBtn) {{
         const song_ids = Object.keys(S.musicQueueSelectionByIds).filter(k=>S.musicQueueSelectionByIds[k]);
-        if(song_ids.length) {{
-            const positions = (S.musicQueue||[])
-                .filter(item=>S.musicQueueSelectionByIds[String(item.id||'').trim()])
-                .map(item=>Number(item.pos))
-                .filter(Number.isFinite);
-            sendMusicAction('music_remove_selected', {{positions, song_ids}});
-        }}
+        if(song_ids.length) sendMusicAction('music_remove_selected', {{positions: [], song_ids}});
         S.musicQueueSelectionByIds = {{}};
         renderMusicPage(document.getElementById('main'));
         return;
     }}
 
-    const openSavePlaylistBtn = e.target.closest('[data-action="music-open-save-playlist"]');
+    const openSavePlaylistBtn = target.closest('[data-action="music-open-save-playlist"]');
     if (openSavePlaylistBtn) {{
         const loadedName = String((S.music && S.music.loaded_playlist) || '').trim();
         if (loadedName) {{
@@ -883,7 +798,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const openCreateSelectedBtn = e.target.closest('[data-action="music-open-create-selected"]');
+    const openCreateSelectedBtn = target.closest('[data-action="music-open-create-selected"]');
     if (openCreateSelectedBtn) {{
         const positions = (S.musicQueue||[])
             .filter(item=>!!S.musicQueueSelectionByIds[String(item.id||'').trim()])
@@ -897,7 +812,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const modalCancelBtn = e.target.closest('[data-action="music-modal-cancel"]');
+    const modalCancelBtn = target.closest('[data-action="music-modal-cancel"]');
     if (modalCancelBtn) {{
         S.musicPlaylistModalOpen = false;
         S.musicPlaylistModalMode = '';
@@ -906,7 +821,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const modalConfirmBtn = e.target.closest('[data-action="music-modal-confirm"]');
+    const modalConfirmBtn = target.closest('[data-action="music-modal-confirm"]');
     if (modalConfirmBtn) {{
         const mode = String(S.musicPlaylistModalMode||'').trim();
         const name = String(S.musicPlaylistModalName||'').trim();
@@ -931,7 +846,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const loadPlaylistBtn = e.target.closest('[data-action="music-load-playlist"]');
+    const loadPlaylistBtn = target.closest('[data-action="music-load-playlist"]');
     if (loadPlaylistBtn) {{
         const name = String(loadPlaylistBtn.dataset.playlistName || '').trim();
         if(name){{
@@ -941,7 +856,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const openDeletePlaylistBtn = e.target.closest('[data-action="music-open-delete-playlist"]');
+    const openDeletePlaylistBtn = target.closest('[data-action="music-open-delete-playlist"]');
     if (openDeletePlaylistBtn) {{
         const name = String(openDeletePlaylistBtn.dataset.playlistName || '').trim();
         if(!name) return;
@@ -952,13 +867,13 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const refreshPlaylistsBtn = e.target.closest('[data-action="music-refresh-playlists"]');
+    const refreshPlaylistsBtn = target.closest('[data-action="music-refresh-playlists"]');
     if (refreshPlaylistsBtn) {{
         sendAction({{type:'music_list_playlists'}});
         return;
     }}
 
-    const musicRow = e.target.closest('[data-action="music-play-track"]');
+    const musicRow = target.closest('[data-action="music-play-track"]');
     if (musicRow) {{
         if (e.target.closest('input[type="checkbox"]')) return;
         const pos = Number(musicRow.dataset.position);
@@ -966,7 +881,7 @@ document.addEventListener('click', e => {{
         return;
     }}
 
-    const musicToggle = e.target.closest('[data-action="music-toggle"]');
+    const musicToggle = target.closest('[data-action="music-toggle"]');
     if (musicToggle && !musicToggle.disabled) {{
         const isCurrentlyPlaying = normalizeMusicState(S.music.state) === 'play';
         sendMusicAction(isCurrentlyPlaying ? 'music_stop' : 'music_toggle');
@@ -987,6 +902,11 @@ document.addEventListener('submit', e => {{
     updateChatComposerState();
     sendAction({{type:'chat_text', text, client_msg_id:clientMsgId}});
     input.value = '';
+    if (S.selectedChatId !== 'active') {{
+        S.selectedChatId = 'active';
+        persistChatCache();
+        renderPage();
+    }}
 }});
 
 document.addEventListener('keydown', e => {{
@@ -1001,21 +921,13 @@ document.addEventListener('input', e => {{
     const t = e.target;
     if(!t) return;
     if(t.id==='musicQueueSearch'){{
-        const start = (typeof t.selectionStart === 'number') ? t.selectionStart : null;
-        const end = (typeof t.selectionEnd === 'number') ? t.selectionEnd : null;
         S.musicQueueFilter = String(t.value||'');
         renderMusicPage(document.getElementById('main'));
-        setTimeout(() => {{
-            const el = document.getElementById('musicQueueSearch');
-            if(!el) return;
-            if(el !== document.activeElement) el.focus();
-            if(start !== null && end !== null && typeof el.setSelectionRange === 'function') {{
-                const maxLen = String(el.value||'').length;
-                const nextStart = Math.max(0, Math.min(start, maxLen));
-                const nextEnd = Math.max(0, Math.min(end, maxLen));
-                try {{ el.setSelectionRange(nextStart, nextEnd); }} catch(_) {{}}
-            }}
-        }}, 0);
+        return;
+    }}
+    if(t.id==='chatThreadSearch'){{
+        S.chatThreadFilter = String(t.value||'');
+        renderThreadList(S.selectedChatId || 'active');
         return;
     }}
     if(t.id==='musicAddSearch'){{
@@ -1111,6 +1023,7 @@ function applyMusicHeader(){{
     btn.classList.toggle('cursor-not-allowed', pendingCount>0);
     btn.textContent=pendingCount>0?'\u2026':(m.state==='play'?'\u23f9':'\u25b6');
     btn.title=pendingCount>0?'Processing\u2026':(m.state==='play'?'Stop':'Play');
+    applyTopMusicProgress();
 }}
 
 function renderTimerBar(){{
@@ -1149,47 +1062,47 @@ function renderTimerBar(){{
 function renderPage(){{
   const main=document.getElementById('main');
     const dock=document.getElementById('chatComposerDock');
+        if(main) main.onscroll=null;
     if(S.page==='music'){{
         if(dock) dock.classList.add('hidden');
-        S.musicAddMode = false;
         renderMusicPage(main);
         sendAction({{type:'music_list_playlists'}});
     }} else {{
         if(dock) dock.classList.remove('hidden');
-        if(main && main.dataset.page==='home'){{
-            const hasThreadSearch=!!document.getElementById('chatThreadSearchInput');
-            if(!hasThreadSearch){{
-                renderHomePage(main);
-            }} else {{
-                const selected = S.selectedChatId || 'active';
-                renderThreadList(selected);
-                renderChatMessages(selected);
-            }}
-        }} else {{
-            renderHomePage(main);
-        }}
+        renderHomePage(main);
         updateChatComposerState();
     }}
     applyMusicHeader();
-    refreshMutedChatNoticeVisibility();
+    updateScrollUpButton();
 }}
 
 function renderHomePage(main){{
     const sidebarClass = S.chatSidebarOpen ? 'w-72 border-r border-gray-800' : 'w-0 border-r-0';
     const sidebarInnerClass = S.chatSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none';
-    const sidebarToggleText = S.chatSidebarOpen ? 'Hide chats' : 'Show chats';
+    const sidebarToggleText = S.chatSidebarOpen ? '&lt;&lt;' : '&gt;&gt;';
+    const sidebarToggleTitle = S.chatSidebarOpen ? 'Hide chats' : 'Show chats';
     const selected = S.selectedChatId || 'active';
 
     main.dataset.page='home';
+    const chatDeleteModal = S.chatDeleteModalOpen
+        ? '<div class="fixed inset-0 z-20 bg-black/60 flex items-center justify-center px-4">'
+            +'<div class="w-full max-w-md rounded-xl border border-gray-700 bg-gray-900 p-4 space-y-3">'
+                +'<div class="text-sm font-semibold">Delete chat history</div>'
+                +'<p class="text-sm text-gray-300">Do you really want to delete chat history - <span class="font-semibold">'+esc(S.chatDeleteTargetTitle||'Untitled')+'</span></p>'
+                +'<div class="flex justify-end gap-2">'
+                    +'<button data-action="chat-delete-cancel" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Cancel</button>'
+                    +'<button data-action="chat-delete-confirm" class="px-3 py-1.5 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors">Delete</button>'
+                +'</div>'
+            +'</div>'
+        +'</div>'
+        : '';
+
     main.innerHTML='<div class="w-full h-full flex min-h-0">'
         +'<aside id="chatSidebar" class="'+sidebarClass+' transition-all duration-200 overflow-hidden">'
             +'<div class="'+sidebarInnerClass+' h-full flex flex-col">'
                 +'<div class="px-0 py-3 text-xs uppercase tracking-wide text-gray-400 border-b border-gray-800">Previous chats</div>'
                 +'<div class="px-2 py-2 border-b border-gray-800">'
-                    +'<div class="relative">'
-                        +'<input id="chatThreadSearchInput" type="search" placeholder="Search chats" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 pr-9 text-xs text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
-                        +'<button id="chatThreadSearchClearBtn" data-action="chat-search-clear" type="button" class="hidden absolute right-1.5 top-1/2 -translate-y-1/2 w-6 h-6 rounded-md text-xs text-gray-300 bg-gray-700 hover:bg-gray-600 transition-colors" title="Clear search" aria-label="Clear search">x</button>'
-                    +'</div>'
+                    +'<input id="chatThreadSearch" type="text" value="'+esc(S.chatThreadFilter||'')+'" placeholder="Search chats" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
                 +'</div>'
                 +'<div id="chatThreadList" class="flex-1 overflow-y-auto p-0 space-y-0"></div>'
             +'</div>'
@@ -1197,94 +1110,28 @@ function renderHomePage(main){{
         +'<div class="flex-1 min-w-0 flex flex-col h-full">'
             +'<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
                 +'<div class="flex items-center gap-2">'
-                    +'<button data-action="chat-sidebar-toggle" class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleText+'</button>'
+                    +'<button data-action="chat-sidebar-toggle" title="'+sidebarToggleTitle+'" aria-label="'+sidebarToggleTitle+'" class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleText+'</button>'
                 +'</div>'
                 +'<button data-action="chat-new" class="px-3 py-1.5 rounded-lg text-xs bg-blue-700 hover:bg-blue-600 transition-colors">New</button>'
             +'</div>'
-            +'<div id="scrollUpWrap" class="hidden justify-center border-b border-gray-800/70 px-3 py-2">'
-                +'<button id="scrollUpBtn" data-action="chat-scroll-up" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>'
-            +'</div>'
             +'<div id="chatArea" class="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0"></div>'
         +'</div>'
-        +'<div id="chatDeleteModalMount"></div>'
-    +'</div>';
+    +'</div>'
+    +chatDeleteModal;
 
     renderThreadList(selected);
     renderChatMessages(selected);
     const area=document.getElementById('chatArea');
     if(area){{
-        S.chatLastScrollTop=area.scrollTop;
         area.addEventListener('scroll', ()=>{{
-            const prevTop=Number(S.chatLastScrollTop||0);
-            const nextTop=area.scrollTop;
-            const movedUp=nextTop < prevTop;
-            if(!S.suppressScrollDirectionTracking && movedUp) S.chatUserScrolledUp=true;
-            if(isChatAtTop()) S.chatUserScrolledUp=false;
-            S.chatLastScrollTop=nextTop;
             if(!isChatAtBottom()) S.autoScrollUntilTs=0;
             updateScrollDownButton();
+            updateScrollUpButton();
         }}, {{passive:true}});
     }}
-    const threadSearchInput=document.getElementById('chatThreadSearchInput');
-    if(threadSearchInput){{
-        threadSearchInput.value=String(S.chatThreadSearchQuery||'');
-        threadSearchInput.addEventListener('input', ()=>{{
-            S.chatThreadSearchQuery=threadSearchInput.value||'';
-            updateChatThreadSearchUi();
-            renderThreadList(S.selectedChatId || 'active');
-        }});
-        threadSearchInput.addEventListener('search', ()=>{{
-            S.chatThreadSearchQuery=threadSearchInput.value||'';
-            updateChatThreadSearchUi();
-            renderThreadList(S.selectedChatId || 'active');
-        }});
-    }}
-    updateChatThreadSearchUi();
+    if(main) main.onscroll=null;
     updateScrollDownButton();
-    renderHomeDeleteModal();
-}}
-
-function updateChatThreadSearchUi(){{
-    const input=document.getElementById('chatThreadSearchInput');
-    const clearBtn=document.getElementById('chatThreadSearchClearBtn');
-    if(!input || !clearBtn) return;
-    const hasQuery=String(input.value||'').trim().length>0;
-    clearBtn.classList.toggle('hidden', !hasQuery);
-    clearBtn.classList.toggle('flex', hasQuery);
-}}
-
-function closeChatDeleteModal(){{
-    S.chatDeleteModalOpen=false;
-    S.chatDeleteTargetId='';
-    S.chatDeleteTargetTitle='';
-    renderHomeDeleteModal();
-}}
-
-function confirmChatDeleteModal(){{
-    const tid=String(S.chatDeleteTargetId||'').trim();
-    const title=String(S.chatDeleteTargetTitle||'').trim() || 'Untitled';
-    if(tid) sendAction({{type:'chat_delete', thread_id: tid, expected_title: title, confirmed: true}});
-    closeChatDeleteModal();
-}}
-
-function renderHomeDeleteModal(){{
-    const mount=document.getElementById('chatDeleteModalMount');
-    if(!mount) return;
-    if(S.page!=='home' || !S.chatDeleteModalOpen){{
-        mount.innerHTML='';
-        return;
-    }}
-    mount.innerHTML=''
-        +'<div id="chatDeleteModalBackdrop" class="fixed inset-0 z-40 flex items-center justify-center bg-black/50 px-4" onclick="closeChatDeleteModal()">'
-            +'<div id="chatDeleteModalDialog" class="w-full max-w-sm rounded-xl border border-gray-700 bg-gray-900 shadow-xl p-4" role="dialog" aria-modal="true" aria-label="Delete chat session" onclick="event.stopPropagation()">'
-                +'<h3 class="text-sm font-semibold text-white">Delete chat session</h3>'
-                +'<p class="mt-2 text-sm text-gray-300">Really delete chat conversation history - <span class="font-semibold">'+esc(S.chatDeleteTargetTitle||'Untitled')+'</span></p>'
-                +'<div class="mt-4 flex justify-end gap-2">'
-                    +'<button id="chatDeleteCancelBtn" type="button" data-action="chat-delete-cancel" onclick="closeChatDeleteModal()" class="px-3 py-1.5 rounded-lg text-sm bg-gray-800 hover:bg-gray-700 transition-colors">Cancel</button>'
-                    +'<button id="chatDeleteConfirmBtn" type="button" data-action="chat-delete-confirm" onclick="confirmChatDeleteModal()" class="px-3 py-1.5 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors">Delete</button>'
-                +'</div>'
-            +'</div>'
-        +'</div>';
+    updateScrollUpButton();
 }}
 function getSelectedMessages(selectedId){{
     if(!selectedId || selectedId==='active') return S.chat;
@@ -1294,24 +1141,21 @@ function getSelectedMessages(selectedId){{
 function renderThreadList(selectedId){{
     const list=document.getElementById('chatThreadList');
     if(!list) return;
-    const query=String(S.chatThreadSearchQuery||'').trim().toLowerCase();
-    const sortedThreads=sortChatThreadsBySavedOrder(S.chatThreads||[]);
-    const visibleThreads=query
-        ? sortedThreads.filter(t=>String(t.title||'').toLowerCase().includes(query))
-        : sortedThreads;
+    const query = String(S.chatThreadFilter||'').trim().toLowerCase();
+    const threads = (S.chatThreads||[]).filter(t=>{{
+        if(String(t.id||'')==='active') return false;
+        if(!query) return true;
+        return String((t.title||'')).toLowerCase().includes(query);
+    }});
     const items = [];
-    visibleThreads.forEach(t=>{{
+    threads.forEach(t=>{{
         const title = esc((t.title||'Untitled').trim()||'Untitled');
         const activeCls = (t.id===selectedId) ? 'bg-blue-800 text-white' : 'bg-gray-800 text-gray-200 hover:bg-gray-700';
-        items.push(''
-            +'<div class="w-full flex items-stretch border-b border-gray-800 '+activeCls+'">'
-                +'<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="flex-1 min-w-0 text-left px-3 py-2 rounded-none transition-colors '+activeCls+'">'
-                    +'<div class="text-sm truncate">'+title+'</div>'
-                +'</button>'
-                +'<button data-action="chat-open-delete" data-thread-id="'+esc(t.id)+'" class="w-9 flex-none px-0 py-2 text-sm text-gray-300 hover:text-red-300 hover:bg-red-900/40 transition-colors" title="Delete chat" aria-label="Delete chat">✕</button>'
-            +'</div>'
-        );
+        items.push('<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="w-full text-left px-3 py-2 rounded-none transition-colors border-b border-gray-800 '+activeCls+'"><div class="flex items-center gap-2"><div class="text-sm truncate flex-1">'+title+'</div><span data-action="chat-delete-open" data-thread-id="'+esc(t.id)+'" data-thread-title="'+title+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete chat history" aria-label="Delete chat history">✕</span></div></button>');
     }});
+    if(!items.length){{
+        items.push('<div class="px-3 py-2 text-sm text-gray-500 border-b border-gray-800">No chats found</div>');
+    }}
     list.innerHTML = items.join('');
 }}
 function renderChatMessages(selectedId){{
@@ -1339,6 +1183,7 @@ function renderChatMessages(selectedId){{
         scrollChat();
         S.scrollToBottomPending=false;
         updateScrollDownButton();
+        updateScrollUpButton();
         return;
     }}
     const burstActive=Date.now()<Number(S.autoScrollUntilTs||0);
@@ -1347,30 +1192,10 @@ function renderChatMessages(selectedId){{
     }} else {{
         area.scrollTop=prevScrollTop;
     }}
-    S.chatLastScrollTop=area.scrollTop;
     updateScrollDownButton();
+    updateScrollUpButton();
 }}
-function scrollChat(){{
-    const a=document.getElementById('chatArea');
-    if(a){{
-        S.suppressScrollDirectionTracking=true;
-        a.scrollTop=a.scrollHeight;
-        S.chatLastScrollTop=a.scrollTop;
-        setTimeout(()=>{{ S.suppressScrollDirectionTracking=false; }}, 0);
-        updateScrollDownButton();
-    }}
-}}
-function scrollChatToTop(){{
-    const a=document.getElementById('chatArea');
-    if(a){{
-        S.suppressScrollDirectionTracking=true;
-        a.scrollTop=0;
-        S.chatLastScrollTop=0;
-        S.chatUserScrolledUp=false;
-        setTimeout(()=>{{ S.suppressScrollDirectionTracking=false; }}, 0);
-        updateScrollDownButton();
-    }}
-}}
+function scrollChat(){{ const a=document.getElementById('chatArea'); if(a){{ a.scrollTop=a.scrollHeight; updateScrollDownButton(); }} }}
 function collateChatMessages(msgs){{
     const out=[];
     let activeBucket=null;
@@ -2100,41 +1925,6 @@ function mkBubble(m){{
 
 function renderMusicPage(main){{
   main.dataset.page='music';
-    const prevActiveEl=document.activeElement;
-    const hadQueueSearchFocus=!!(prevActiveEl && prevActiveEl.id==='musicQueueSearch');
-    const prevQueueSearchStart=(hadQueueSearchFocus && typeof prevActiveEl.selectionStart==='number') ? prevActiveEl.selectionStart : null;
-    const prevQueueSearchEnd=(hadQueueSearchFocus && typeof prevActiveEl.selectionEnd==='number') ? prevActiveEl.selectionEnd : null;
-
-    const hadAddSearchFocus=!!(prevActiveEl && prevActiveEl.id==='musicAddSearch');
-    const prevAddSearchStart=(hadAddSearchFocus && typeof prevActiveEl.selectionStart==='number') ? prevActiveEl.selectionStart : null;
-    const prevAddSearchEnd=(hadAddSearchFocus && typeof prevActiveEl.selectionEnd==='number') ? prevActiveEl.selectionEnd : null;
-
-    function restoreQueueSearchFocus(){{
-        if(!hadQueueSearchFocus) return;
-        const el=document.getElementById('musicQueueSearch');
-        if(!el) return;
-        if(el!==document.activeElement) el.focus();
-        if(prevQueueSearchStart!==null && prevQueueSearchEnd!==null && typeof el.setSelectionRange==='function'){{
-            const maxLen=String(el.value||'').length;
-            const nextStart=Math.max(0, Math.min(prevQueueSearchStart, maxLen));
-            const nextEnd=Math.max(0, Math.min(prevQueueSearchEnd, maxLen));
-            try{{ el.setSelectionRange(nextStart, nextEnd); }}catch(_e){{}}
-        }}
-    }}
-
-    function restoreAddSearchFocus(){{
-        if(!hadAddSearchFocus) return;
-        const el=document.getElementById('musicAddSearch');
-        if(!el) return;
-        if(el!==document.activeElement) el.focus();
-        if(prevAddSearchStart!==null && prevAddSearchEnd!==null && typeof el.setSelectionRange==='function'){{
-            const maxLen=String(el.value||'').length;
-            const nextStart=Math.max(0, Math.min(prevAddSearchStart, maxLen));
-            const nextEnd=Math.max(0, Math.min(prevAddSearchEnd, maxLen));
-            try{{ el.setSelectionRange(nextStart, nextEnd); }}catch(_e){{}}
-        }}
-    }}
-
     const m=S.music, q=S.musicQueue||[];
     m.state=normalizeMusicState(m.state);
     const pendingMusicCount=Object.keys(S.pendingMusicActions||{{}}).length;
@@ -2158,7 +1948,7 @@ function renderMusicPage(main){{
         const canSearch=canSearchMusicLibrary(S.musicAddQuery);
         const searchPending=!!S.musicAddSearchPending;
         const addPending=Object.values(S.pendingMusicActions||{{}}).some(item=>String((item&&item.type)||'')==='music_add_files');
-        const addRows=(S.musicLibraryResults||[]).map(item=>{{
+    const addRows=(S.musicLibraryResults||[]).map(item=>{{
       const file=String(item.file||'');
       const checked=!!S.musicAddSelection[file];
       return '<tr class="hover:bg-gray-800">'
@@ -2169,8 +1959,6 @@ function renderMusicPage(main){{
       +'</tr>';
     }}).join('');
     const addSelectedCount=Object.keys(S.musicAddSelection||{{}}).filter(k=>S.musicAddSelection[k]).length;
-    const searchLimit=Math.max(1, Number(S.musicAddSearchLimit||200) || 200);
-    const canLoadMore=!!(S.musicAddHasSearched && !searchPending && (S.musicLibraryResults||[]).length>=searchLimit);
     main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
       +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
         +'<h2 class="font-semibold text-lg">Add Songs</h2>'
@@ -2181,12 +1969,11 @@ function renderMusicPage(main){{
       +'</div>'
       +'<div class="px-2">'
                 +'<div class="flex items-center gap-2">'
-                    +'<input type="search" id="musicAddSearch" data-action="music-add-search" value="'+esc(S.musicAddQuery||'')+'" placeholder="Search library by title, artist, album" class="flex-1 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+                    +'<input id="musicAddSearch" data-action="music-add-search" value="'+esc(S.musicAddQuery||'')+'" placeholder="Search library by title, artist, album" class="flex-1 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
                                         +'<button id="musicAddSearchSubmit" data-action="music-add-search-submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors" '+((canSearch && !searchPending) ? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>'+(searchPending?'Searching…':'Search')+'</button>'
                 +'</div>'
                                 +(canSearch ? '' : '<p id="musicAddMinHint" class="text-xs text-gray-500 mt-1">Enter at least '+MUSIC_LIBRARY_SEARCH_MIN_LEN+' letters to search</p>')
       +'</div>'
-    +(canLoadMore ? '<div class="px-2 -mt-1"><button data-action="music-add-search-more" class="px-3 py-1 rounded-lg text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Load More</button></div>' : '')
       +(addRows
                 ? '<div class="px-2 flex items-center justify-end gap-1 text-xs text-gray-400">'
                         +'<button data-action="music-add-select-all" class="px-2 py-1 rounded bg-gray-800 hover:bg-gray-700 transition-colors">Select All</button>'
@@ -2195,6 +1982,8 @@ function renderMusicPage(main){{
                     +'<div class="overflow-x-auto rounded-xl border border-gray-800"><table class="w-full text-left"><thead><tr class="text-xs text-gray-400 border-b border-gray-800"><th class="px-2 py-2">#</th><th class="px-2 py-2">Title</th><th class="px-2 py-2">Artist</th><th class="px-2 py-2">Album</th></tr></thead><tbody>'+addRows+'</tbody></table></div>'
                                 : '<p class="text-gray-500 text-center py-10 text-sm">'+(searchPending ? '<span class="inline-flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></span>Searching…</span>' : (canSearch && S.musicAddHasSearched ? 'No matches found' : 'Search to find songs to add'))+'</p>')
       +'</div>';
+        main.onscroll=()=>{{ updateScrollUpButton(); }};
+        updateScrollUpButton();
     return;
   }}
 
@@ -2240,21 +2029,17 @@ function renderMusicPage(main){{
         +'<div class="flex items-center justify-between gap-2 flex-wrap px-2">'
           +'<h2 class="font-semibold text-lg">Queue <span class="text-gray-400 font-normal text-sm ml-1">'+m.queue_length+' tracks</span></h2>'
           +'<div class="flex items-center gap-2">'
-            +'<button data-action="music-clear-queue" class="px-3 py-1 rounded-lg text-sm bg-red-900 hover:bg-red-800 transition-colors">Clear Queue</button>'
             +'<button data-action="music-add-open" class="px-3 py-1 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Add Songs</button>'
                         +'<button data-action="music-open-save-playlist" class="px-3 py-1 rounded-lg text-sm bg-emerald-700 hover:bg-emerald-600 transition-colors">Save Playlist</button>'
                         +'<button data-action="music-toggle" class="px-4 py-2 rounded-lg text-base font-semibold bg-gray-700 hover:bg-gray-600 transition-colors" '+(pendingMusicCount? 'disabled style="opacity:.5;cursor:not-allowed"' : '')+'>'+(pendingMusicCount?'\u2026 Pending':(m.state==='play'?'\u23f9 Stop':'\u25b6 Play'))+'</button>'
           +'</div>'
         +'</div>'
         +'<div class="px-2">'
-          +'<input type="search" id="musicQueueSearch" data-action="music-queue-search" value="'+esc(S.musicQueueFilter||'')+'" placeholder="Filter queue: title, artist, album" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+          +'<input id="musicQueueSearch" data-action="music-queue-search" value="'+esc(S.musicQueueFilter||'')+'" placeholder="Filter queue: title, artist, album" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
         +'</div>'
         +(S.musicActionError? '<div class="px-2 text-xs text-red-300">⚠ '+esc(S.musicActionError)+'</div>' : '')
         +(rows
-                        ? '<div id="musicQueueScrollUpWrap" class="hidden justify-center px-2">'
-                                +'<button data-action="music-scroll-top" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>'
-                            +'</div>'
-                            +'<div class="px-2 min-h-10 flex items-center justify-between gap-2">'
+            ? '<div class="px-2 min-h-10 flex items-center justify-between gap-2">'
                 +'<div class="flex items-center gap-2">'
                     +'<button data-action="music-remove-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(selectedCount? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>Remove Selected ('+selectedCount+')</button>'
                     +'<button data-action="music-open-create-selected" class="px-3 py-1.5 rounded-lg text-sm bg-emerald-700 hover:bg-emerald-600 transition-colors" '+(selectedCount? '' : 'disabled style="opacity:.5;cursor:not-allowed"')+'>Create Playlist from Selected</button>'
@@ -2281,9 +2066,8 @@ function renderMusicPage(main){{
           +'</div>'
         : '')
   +'</div>';
-    restoreQueueSearchFocus();
-    restoreAddSearchFocus();
-        updateMusicQueueScrollUpButton();
+    main.onscroll=()=>{{ updateScrollUpButton(); }};
+    updateScrollUpButton();
 }}
 
 function fmtDur(s){{ if(!s) return '\u2014'; const t=Math.round(Number(s)); return Math.floor(t/60)+':'+String(t%60).padStart(2,'0'); }}
@@ -2292,15 +2076,8 @@ function esc(s){{ return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').re
 function wsUrl(){{ return (location.protocol==='https:'?'wss':'ws')+'://'+location.hostname+':'+WS_PORT+'/ws'; }}
 function sendAction(payload){{ if(S.ws&&S.ws.readyState===WebSocket.OPEN) S.ws.send(JSON.stringify(payload)); }}
 function sendMusicAction(actionType, extraPayload={{}}){{
-    if(!(S.ws&&S.ws.readyState===WebSocket.OPEN)){{
-        recordInlineError('music','', 'Not connected; retry in a moment');
-        if(S.page==='music') renderMusicPage(document.getElementById('main'));
-        applyMusicHeader();
-        return null;
-    }}
     const actionId='m'+(S.nextMusicActionId++);
-    const timeoutMs=(actionType==='music_load_playlist') ? MUSIC_LOAD_PLAYLIST_TIMEOUT_MS : PENDING_ACTION_TIMEOUT_MS;
-    S.pendingMusicActions[actionId]={{type:actionType, ts:Date.now(), timeoutMs, payload:Object.assign({{}}, extraPayload||{{}})}};
+    S.pendingMusicActions[actionId]={{type:actionType, ts:Date.now()}};
     sendAction(Object.assign({{type:actionType, action_id:actionId}}, extraPayload||{{}}));
     if(S.page==='music') renderMusicPage(document.getElementById('main'));
     applyMusicHeader();
@@ -2348,8 +2125,7 @@ function expirePendingActions(){{
     Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
         const item=S.pendingMusicActions[actionId];
         if(!item) return;
-        const timeoutMs=Math.max(1000, Number(item.timeoutMs||PENDING_ACTION_TIMEOUT_MS));
-        if((now-Number(item.ts||0))>timeoutMs){{
+        if((now-Number(item.ts||0))>PENDING_ACTION_TIMEOUT_MS){{
             delete S.pendingMusicActions[actionId];
             recordInlineError('music','', 'Music action timed out');
             touchMusic=true;
@@ -2399,43 +2175,6 @@ function expirePendingActions(){{
     if(touchMusic){{ applyMusicHeader(); if(S.page==='music') renderMusicPage(document.getElementById('main')); }}
     if(touchTimer) renderTimerBar();
     if(touchSettings) applyMicControlToggles();
-}}
-
-function clearPendingActionsOnDisconnect(){{
-    const hadMusic = Object.keys(S.pendingMusicActions||{{}}).length > 0;
-    const hadTimer = Object.keys(S.pendingTimerActions||{{}}).length > 0;
-    const hadSetting = Object.keys(S.pendingSettingActions||{{}}).length > 0;
-    if(!hadMusic && !hadTimer && !hadSetting) return;
-
-    let retryPlaylistName='';
-    let retryPlaylistTs=0;
-    Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
-        const item=S.pendingMusicActions[actionId];
-        if(!item || String(item.type||'')!=='music_load_playlist') return;
-        const name=String(((item.payload||{{}}).name)||'').trim();
-        if(!name) return;
-        const ts=Number(item.ts||0);
-        if(!retryPlaylistName || ts > retryPlaylistTs){{
-            retryPlaylistName=name;
-            retryPlaylistTs=ts;
-        }}
-    }});
-    if(retryPlaylistName){{
-        S.musicLoadRetryPending = retryPlaylistName;
-        S.musicLoadRetryAttempted = false;
-    }}
-
-    S.pendingMusicActions = {{}};
-    S.pendingTimerActions = {{}};
-    S.pendingSettingActions = {{}};
-
-    if(hadMusic){{
-        recordInlineError('music','', retryPlaylistName ? 'Connection reset; retrying playlist load…' : 'Connection reset; please retry music action');
-        applyMusicHeader();
-        if(S.page==='music') renderMusicPage(document.getElementById('main'));
-    }}
-    if(hadTimer) renderTimerBar();
-    if(hadSetting) applyMicControlToggles();
 }}
 
 function formatCaptureError(err){{
@@ -2561,17 +2300,6 @@ function connectWs(){{
             if(S.browserAudioEnabled) ensureBrowserCapture().catch((err)=>reportCaptureFailure(err,'connect'));
             S.ws.send(JSON.stringify({{type:'ui_ready'}}));
                 pushUiPrefsToServer();
-            if(S.musicLoadRetryPending && !S.musicLoadRetryAttempted){{
-                const retryName=String(S.musicLoadRetryPending||'').trim();
-                if(retryName){{
-                    S.musicLoadRetryAttempted=true;
-                    setTimeout(()=>{{
-                        if(!S.ws || S.ws.readyState!==WebSocket.OPEN) return;
-                        const actionId=sendMusicAction('music_load_playlist', {{name: retryName}});
-                        if(actionId) S.musicLoadRetryPending=null;
-                    }}, 120);
-                }}
-            }}
     }};
     S.ws.onclose=(evt)=>{{
         S.wsConnected=false;
@@ -2581,11 +2309,10 @@ function connectWs(){{
         updateWsDebugBanner();
         updateMicInteractivity();
         stopWsPingTimer();
-        clearPendingActionsOnDisconnect();
         S.ws=null;
         if (evt && evt.code === 4001) return;
         if(S.wsManualDisconnect) return;
-        S.wsReconnectTimer=setTimeout(()=>{{ S.wsReconnectTimer=null; connectWs(); }},1500);
+        S.wsReconnectTimer=setTimeout(()=>{{ S.wsReconnectTimer=null; connectWs(); }},WS_RECONNECT_MS);
     }};
     S.ws.onerror=(evt)=>{{
         S.wsDebug.status='error';
@@ -2643,21 +2370,12 @@ function handleMsg(msg){{
             if(msg.message){{
                 const nextMsg = normalizeChatMessage(msg.message);
                 if(nextMsg) S.chat.push(nextMsg);
-                if(nextMsg) showMutedChatNoticeForMessage(nextMsg);
-                if(nextMsg && S.activeChatId && S.activeChatId!=='active'){{
-                    const activeThread=(S.chatThreads||[]).find(t=>String(t.id||'')===String(S.activeChatId||''));
-                    if(activeThread){{
-                        if(!Array.isArray(activeThread.messages)) activeThread.messages=[];
-                        activeThread.messages.push(Object.assign({{}}, nextMsg));
-                        activeThread.updated_ts=Number(nextMsg.ts||Date.now()/1000) || Date.now()/1000;
-                    }}
-                }}
                 if(nextMsg && nextMsg.role==='user') requestScrollToBottomBurst();
+                S.selectedChatId='active';
                 persistChatCache();
                 if(S.page==='home'){{
-                    const selected = S.selectedChatId || S.activeChatId || 'active';
-                    renderThreadList(selected);
-                    renderChatMessages(selected);
+                    renderThreadList('active');
+                    renderChatMessages('active');
                 }}
             }}
             break;
@@ -2667,8 +2385,9 @@ function handleMsg(msg){{
             if(S.page==='home') renderPage();
             break;
         case 'chat_reset':
-            applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id, true);
-            S.selectedChatId=String(msg.active_chat_id || S.selectedChatId || 'active');
+            S.chat=[];
+            applyServerChatState([], msg.chat_threads, msg.active_chat_id);
+            S.selectedChatId='active';
             persistChatCache();
             if(S.page==='home') renderPage();
             break;
@@ -2711,22 +2430,6 @@ function handleMsg(msg){{
                 S.lastMusicRev=rev;
             }}
             applyMusic(msg.music||msg);
-            if(S.music && S.music.loaded_playlist){{
-                const loadedNow=String(S.music.loaded_playlist||'').trim().toLowerCase();
-                Object.keys(S.pendingMusicActions||{{}}).forEach((actionId)=>{{
-                    const item=S.pendingMusicActions[actionId];
-                    if(!item || String(item.type||'')!=='music_load_playlist') return;
-                    const expected=String(((item.payload||{{}}).name)||'').trim().toLowerCase();
-                    if(expected && loadedNow && expected===loadedNow) delete S.pendingMusicActions[actionId];
-                }});
-                if(S.musicLoadRetryPending){{
-                    const expectedRetry=String(S.musicLoadRetryPending||'').trim().toLowerCase();
-                    if(expectedRetry && loadedNow && expectedRetry===loadedNow){{
-                        S.musicLoadRetryPending=null;
-                        S.musicLoadRetryAttempted=false;
-                    }}
-                }}
-            }}
             if(msg.queue!==undefined) S.musicQueue=msg.queue;
             else if(msg.music&&msg.music.queue!==undefined) S.musicQueue=msg.music.queue;
             syncMusicFromQueue();
@@ -2743,10 +2446,6 @@ function handleMsg(msg){{
             break;
         case 'music_action_ack':
             if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
-            if(String(msg.action||'')==='music_load_playlist'){{
-                S.musicLoadRetryPending=null;
-                S.musicLoadRetryAttempted=false;
-            }}
             S.musicActionError='';
             S.musicActionErrorTs=0;
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
@@ -2768,10 +2467,6 @@ function handleMsg(msg){{
             }}
             S.musicAddSearchPending = false;
             S.musicAddPendingQuery = '';
-            if(msg.limit!==undefined){{
-                const responseLimit = Math.max(1, Number(msg.limit) || 200);
-                S.musicAddSearchLimit = responseLimit;
-            }}
             if(Array.isArray(msg.results)){{
                 S.musicLibraryResults = msg.results;
                 S.musicAddSelection = {{}};
@@ -2901,8 +2596,10 @@ function applyMusic(m){{
     const payload=(m&&typeof m==='object'&&m.music&&typeof m.music==='object')?m.music:m;
     if(!payload||typeof payload!=='object') return;
     Object.assign(S.music,payload);
+    S.music._clientElapsedAnchorTs=Date.now();
     S.music.state=normalizeMusicState(S.music.state);
     syncMusicFromQueue();
+    applyTopMusicProgress();
     applyMusicHeader();
 }}
 function applyTimers(t){{
@@ -3078,7 +2775,7 @@ loadUiPrefs();
 hydrateChatCache();
 S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); connectWs();
 setupServerRefreshWatcher();
-setInterval(()=>{{ expirePendingActions(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{{ if(t._clientAnchorTs===undefined){{ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; }} t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }}); renderTimerBar(); }},500);
+setInterval(()=>{{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{{ if(t._clientAnchorTs===undefined){{ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; }} t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }}); renderTimerBar(); }},500);
 startBrowserCapture().catch((err)=>{{
     reportCaptureFailure(err,'startup');
 }});
@@ -3152,10 +2849,7 @@ class EmbeddedVoiceWebService:
         self._chat_seq: int = 0
         self._chat_threads: list[dict[str, Any]] = []
         self._active_chat_id: str = "active"
-        self._active_chat_source_thread_id: str | None = None
         self._chat_thread_limit = 100
-        self._chat_persist_debounce_s: float = 0.4
-        self._chat_persist_timer: asyncio.TimerHandle | None = None
         _default_persist = Path.home() / ".config" / "openclaw" / "chat_state.json"
         self._chat_persist_path = Path(chat_persist_path) if chat_persist_path else _default_persist
         self._load_chat_state()
@@ -3179,14 +2873,14 @@ class EmbeddedVoiceWebService:
         self._on_music_toggle: Callable[[str], Awaitable[None]] | None = None
         self._on_music_stop: Callable[[str], Awaitable[None]] | None = None
         self._on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None
+        self._on_music_seek: Callable[[float, str], Awaitable[None]] | None = None
         self._on_music_remove_selected: Callable[[list[int], str, list[str] | None], Awaitable[None]] | None = None
-        self._on_music_clear_queue: Callable[[str], Awaitable[None]] | None = None
         self._on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None
         self._on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None
         self._on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None
-        self._on_music_search_library: Callable[[str, int, str], Awaitable[list[dict[str, Any]]]] | None = None
+        self._on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None
         self._on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None
         self._on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None
@@ -3215,7 +2909,6 @@ class EmbeddedVoiceWebService:
 
     async def start(self) -> None:
         ssl_context = self._ensure_ssl_context()
-        _install_websockets_noise_filter()
         self._start_http_server()
         self._ws_server = await websockets.serve(
             self._ws_handler,
@@ -3274,9 +2967,6 @@ class EmbeddedVoiceWebService:
         if self._http_redirect_thread and self._http_redirect_thread.is_alive():
             self._http_redirect_thread.join(timeout=1.0)
         self._http_redirect_thread = None
-        if self._chat_persist_timer is not None:
-            self._chat_persist_timer.cancel()
-            self._chat_persist_timer = None
         self._clients.clear()
 
     # ------------------------------------------------------------------
@@ -3304,11 +2994,10 @@ class EmbeddedVoiceWebService:
             data = json.loads(raw)
             threads = data.get("threads")
             if isinstance(threads, list):
-                self._chat_threads = self._sorted_chat_threads(threads)[: self._chat_thread_limit]
+                self._chat_threads = threads[: self._chat_thread_limit]
             active = data.get("active_messages")
             if isinstance(active, list):
-                # Deduplicate messages when loading from persisted state
-                self._chat_messages = self._deduplicate_messages(active[-self.chat_history_limit:])
+                self._chat_messages = active[-self.chat_history_limit:]
             seq = data.get("chat_seq")
             if isinstance(seq, int):
                 self._chat_seq = seq
@@ -3321,76 +3010,13 @@ class EmbeddedVoiceWebService:
         except Exception:
             logger.debug("Could not load chat state from disk (will start fresh)", exc_info=True)
 
-    def _has_non_empty_user_message(self, messages: list[dict[str, Any]]) -> bool:
-        for message in messages:
-            if str(message.get("role", "")).lower() != "user":
-                continue
-            if str(message.get("text", "")).strip():
-                return True
-        return False
-
-    def _chat_state_persistable(self) -> bool:
-        if self._has_non_empty_user_message(self._chat_messages):
-            return True
-        for thread in self._chat_threads:
-            msgs = thread.get("messages")
-            if isinstance(msgs, list) and self._has_non_empty_user_message(msgs):
-                return True
-        return False
-
-    def _sorted_chat_threads(self, threads: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        return sorted(
-            list(threads),
-            key=lambda t: float(t.get("updated_ts", t.get("created_ts", 0.0)) or 0.0),
-            reverse=True,
-        )
-
-    def _deduplicate_messages(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Remove duplicate messages by ID, keeping first occurrence."""
-        seen_ids: set[int | str] = set()
-        deduplicated: list[dict[str, Any]] = []
-        for msg in messages:
-            msg_id = msg.get("id")
-            if msg_id is not None and msg_id in seen_ids:
-                continue  # Skip duplicate
-            if msg_id is not None:
-                seen_ids.add(msg_id)
-            deduplicated.append(msg)
-        return deduplicated
-
-    def _schedule_chat_state_persist(self) -> None:
-        if not self._chat_state_persistable():
-            return
-        if self._chat_persist_timer is not None:
-            self._chat_persist_timer.cancel()
-            self._chat_persist_timer = None
-        try:
-            loop = asyncio.get_running_loop()
-            self._chat_persist_timer = loop.call_later(
-                self._chat_persist_debounce_s,
-                self._persist_chat_state,
-            )
-        except RuntimeError:
-            # Fallback for non-async contexts.
-            self._persist_chat_state()
-
     def _persist_chat_state(self) -> None:
         """Atomically write chat threads and active messages to disk (best-effort)."""
-        if self._chat_persist_timer is not None:
-            self._chat_persist_timer.cancel()
-            self._chat_persist_timer = None
         try:
             self._chat_persist_path.parent.mkdir(parents=True, exist_ok=True)
-            # Deduplicate messages in threads before persisting
-            clean_threads = []
-            for thread in self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]:
-                clean_thread = dict(thread)
-                if "messages" in clean_thread:
-                    clean_thread["messages"] = self._deduplicate_messages(clean_thread.get("messages", []))
-                clean_threads.append(clean_thread)
             payload = {
-                "threads": clean_threads,
-                "active_messages": self._deduplicate_messages(self._chat_messages),
+                "threads": self._chat_threads,
+                "active_messages": self._chat_messages,
                 "chat_seq": self._chat_seq,
                 "saved_ts": time.time(),
             }
@@ -3413,8 +3039,8 @@ class EmbeddedVoiceWebService:
             logger.debug("Could not persist chat state to disk", exc_info=True)
 
     def update_chat_history(self, messages: list[dict[str, Any]]) -> None:
-        self._chat_messages = self._deduplicate_messages(list(messages[-self.chat_history_limit:]))
-        self._schedule_chat_state_persist()
+        self._chat_messages = list(messages[-self.chat_history_limit:])
+        self._persist_chat_state()
 
     def _derive_chat_title(self, messages: list[dict[str, Any]]) -> str:
         for m in messages:
@@ -3425,11 +3051,7 @@ class EmbeddedVoiceWebService:
         return f"Chat {len(self._chat_threads) + 1}"
 
     def _archive_active_chat_if_needed(self) -> None:
-        if self._active_chat_source_thread_id:
-            return
         if not self._chat_messages:
-            return
-        if not self._has_non_empty_user_message(self._chat_messages):
             return
         now = time.time()
         archived = {
@@ -3440,192 +3062,56 @@ class EmbeddedVoiceWebService:
             "updated_ts": now,
         }
         self._chat_threads.insert(0, archived)
-        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
-        self._schedule_chat_state_persist()
-
-    def _promote_active_chat_to_thread_if_needed(self, now_ts: float | None = None) -> bool:
-        if self._active_chat_source_thread_id:
-            return False
-        if not self._has_non_empty_user_message(self._chat_messages):
-            return False
-        ts = float(now_ts or time.time())
-        promoted = {
-            "id": uuid.uuid4().hex[:12],
-            "title": self._derive_chat_title(self._chat_messages),
-            "messages": list(self._chat_messages),
-            "created_ts": ts,
-            "updated_ts": ts,
-        }
-        self._chat_threads.insert(0, promoted)
-        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
-        self._active_chat_id = str(promoted["id"])
-        self._active_chat_source_thread_id = str(promoted["id"])
-        self._schedule_chat_state_persist()
-        return True
+        if len(self._chat_threads) > self._chat_thread_limit:
+            self._chat_threads = self._chat_threads[: self._chat_thread_limit]
+        self._persist_chat_state()
 
     def start_new_chat(self) -> None:
         self._archive_active_chat_if_needed()
         self._chat_messages = []
         self._active_chat_id = "active"
-        self._active_chat_source_thread_id = None
-        self._schedule_chat_state_persist()
+        self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
                 {
                     "type": "chat_reset",
                     "active_chat_id": self._active_chat_id,
                     "chat": [],
-                    "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+                    "chat_threads": list(self._chat_threads),
                 }
             )
         )
 
-    def activate_chat_thread(self, thread_id: str) -> None:
-        target_id = str(thread_id or "active").strip() or "active"
-        if target_id == "active":
-            self._active_chat_id = "active"
-            self._active_chat_source_thread_id = None
-            self._schedule_chat_state_persist()
-            asyncio.create_task(
-                self.broadcast(
-                    {
-                        "type": "chat_reset",
-                        "active_chat_id": self._active_chat_id,
-                        "chat": list(self._chat_messages),
-                        "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
-                    }
-                )
-            )
-            return
-
-        selected_index = -1
-        selected_thread: dict[str, Any] | None = None
-        for index, thread in enumerate(self._chat_threads):
-            if str(thread.get("id", "")) == target_id:
-                selected_index = index
-                selected_thread = thread
-                break
-
-        if selected_thread is None:
-            logger.debug("chat_select ignored: unknown thread_id=%s", target_id)
-            return
-
-        self._archive_active_chat_if_needed()
-        loaded = selected_thread.get("messages")
-        # Deduplicate messages by ID when loading from thread
-        self._chat_messages = self._deduplicate_messages(
-            list(loaded[-self.chat_history_limit:]) if isinstance(loaded, list) else []
-        )
-        self._active_chat_id = target_id
-        self._active_chat_source_thread_id = target_id
-
-        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
-        self._schedule_chat_state_persist()
+    def delete_chat_thread(self, thread_id: str) -> bool:
+        tid = str(thread_id or "").strip()
+        if not tid or tid == "active":
+            return False
+        before = len(self._chat_threads)
+        self._chat_threads = [t for t in self._chat_threads if str(t.get("id", "")) != tid]
+        if len(self._chat_threads) == before:
+            return False
+        self._persist_chat_state()
         asyncio.create_task(
             self.broadcast(
                 {
-                    "type": "chat_reset",
+                    "type": "chat_threads_update",
                     "active_chat_id": self._active_chat_id,
-                    "chat": list(self._chat_messages),
-                    "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+                    "chat_threads": list(self._chat_threads),
                 }
             )
         )
-
-    def delete_chat_thread(self, thread_id: str, expected_title: str = "", confirmed: bool = False) -> None:
-        if not confirmed:
-            logger.warning("chat_delete ignored: missing confirmation for thread_id=%s", thread_id)
-            return
-        target_id = str(thread_id or "").strip()
-        if not target_id:
-            return
-        expected_title = str(expected_title or "").strip()
-        matches = [
-            (index, thread)
-            for index, thread in enumerate(self._chat_threads)
-            if str(thread.get("id", "")) == target_id
-            and (not expected_title or str(thread.get("title", "")).strip() == expected_title)
-        ]
-        if len(matches) != 1:
-            logger.warning(
-                "chat_delete ignored: thread_id=%s expected_title=%s matches=%d",
-                target_id,
-                expected_title,
-                len(matches),
-            )
-            return
-        delete_index, _thread = matches[0]
-        del self._chat_threads[delete_index]
-        if delete_index < 0:
-            logger.debug("chat_delete ignored: unknown thread_id=%s", target_id)
-            return
-        if self._active_chat_source_thread_id == target_id:
-            self._active_chat_source_thread_id = None
-        if self._active_chat_id == target_id:
-            self._active_chat_id = "active"
-        self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
-        self._schedule_chat_state_persist()
-        asyncio.create_task(
-            self.broadcast(
-                {
-                    "type": "chat_reset",
-                    "active_chat_id": self._active_chat_id,
-                    "chat": list(self._chat_messages),
-                    "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
-                }
-            )
-        )
+        return True
 
     def append_chat_message(self, message: dict[str, Any]) -> None:
         self._chat_seq += 1
-        now_ts = time.time()
         msg = dict(message)
-        role = str(msg.get("role") or "").strip().lower()
-        if role == "assistant":
-            cleaned_text = strip_gateway_control_markers(str(msg.get("text") or "")).strip()
-            if not cleaned_text:
-                return
-            msg["text"] = cleaned_text
         msg.setdefault("id", self._chat_seq)
-        msg.setdefault("ts", now_ts)
-        
-        # Prevent duplicate messages: check if message with same ID already exists
-        msg_id = msg.get("id")
-        if msg_id is not None:
-            for existing in self._chat_messages:
-                if existing.get("id") == msg_id:
-                    # Message already exists, skip appending to prevent duplication
-                    return
-        
+        msg.setdefault("ts", time.time())
         self._chat_messages.append(msg)
         if len(self._chat_messages) > self.chat_history_limit:
             self._chat_messages = self._chat_messages[-self.chat_history_limit:]
-        promoted = self._promote_active_chat_to_thread_if_needed(now_ts)
-        mirrored = promoted
-        if self._active_chat_source_thread_id:
-            for thread in self._chat_threads:
-                if str(thread.get("id", "")) != self._active_chat_source_thread_id:
-                    continue
-                thread["messages"] = list(self._chat_messages)
-                thread["updated_ts"] = now_ts
-                if not str(thread.get("title", "")).strip():
-                    thread["title"] = self._derive_chat_title(thread.get("messages") or [])
-                mirrored = True
-                break
-        if mirrored:
-            self._chat_threads = self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]
-        self._schedule_chat_state_persist()
+        self._persist_chat_state()
         asyncio.create_task(self.broadcast({"type": "chat_append", "message": msg}))
-        if mirrored:
-            asyncio.create_task(
-                self.broadcast(
-                    {
-                        "type": "chat_threads_update",
-                        "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
-                        "active_chat_id": self._active_chat_id,
-                    }
-                )
-            )
 
     def update_music_transport(self, **state: Any) -> None:
         self._music_state.update(state)
@@ -3740,14 +3226,15 @@ class EmbeddedVoiceWebService:
         on_music_toggle: Callable[[str], Awaitable[None]] | None = None,
         on_music_stop: Callable[[str], Awaitable[None]] | None = None,
         on_music_play_track: Callable[[int, str], Awaitable[None]] | None = None,
-        on_music_remove_selected: Callable[[list[int], str, list[str] | None], Awaitable[None]] | None = None,
+        on_music_seek: Callable[[float, str], Awaitable[None]] | None = None,
         on_music_clear_queue: Callable[[str], Awaitable[None]] | None = None,
+        on_music_remove_selected: Callable[[list[int], str, list[str] | None], Awaitable[None]] | None = None,
         on_music_add_files: Callable[[list[str], str], Awaitable[None]] | None = None,
         on_music_create_playlist: Callable[[str, list[int], str], Awaitable[None]] | None = None,
         on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None,
-        on_music_search_library: Callable[[str, int, str], Awaitable[list[dict[str, Any]]]] | None = None,
+        on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None,
         on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None,
         on_timer_cancel: Callable[[str, str], Awaitable[None]] | None = None,
@@ -3766,10 +3253,12 @@ class EmbeddedVoiceWebService:
             self._on_music_stop = on_music_stop
         if on_music_play_track is not None:
             self._on_music_play_track = on_music_play_track
-        if on_music_remove_selected is not None:
-            self._on_music_remove_selected = on_music_remove_selected
+        if on_music_seek is not None:
+            self._on_music_seek = on_music_seek
         if on_music_clear_queue is not None:
             self._on_music_clear_queue = on_music_clear_queue
+        if on_music_remove_selected is not None:
+            self._on_music_remove_selected = on_music_remove_selected
         if on_music_add_files is not None:
             self._on_music_add_files = on_music_add_files
         if on_music_create_playlist is not None:
@@ -3890,13 +3379,6 @@ class EmbeddedVoiceWebService:
                 self._browser_level_packet_count += 1
                 now = time.monotonic()
                 if now - self._last_audio_packet_log_ts >= 2.0:
-                    logger.info(
-                        "📦 Audio packet source summary: browser_audio_level=%d browser_pcm=%d (%d bytes queued=%d)",
-                        self._browser_level_packet_count,
-                        self._browser_pcm_packet_count,
-                        self._browser_pcm_packet_bytes,
-                        len(self._browser_pcm_frames),
-                    )
                     self._browser_level_packet_count = 0
                     self._browser_pcm_packet_count = 0
                     self._browser_pcm_packet_bytes = 0
@@ -3923,24 +3405,6 @@ class EmbeddedVoiceWebService:
             return
 
         if msg_type in ("ui_ready", "navigate"):
-            return
-
-        if msg_type == "chat_select":
-            try:
-                self.activate_chat_thread(str(payload.get("thread_id", "active")))
-            except Exception as exc:
-                logger.warning("chat_select handler error: %s", exc)
-            return
-
-        if msg_type == "chat_delete":
-            try:
-                self.delete_chat_thread(
-                    str(payload.get("thread_id", "")),
-                    str(payload.get("expected_title", "")),
-                    bool(payload.get("confirmed", False)),
-                )
-            except Exception as exc:
-                logger.warning("chat_delete handler error: %s", exc)
             return
 
         if msg_type == "mic_toggle" and self._on_mic_toggle:
@@ -4048,6 +3512,30 @@ class EmbeddedVoiceWebService:
                         }))
             return
 
+        if msg_type == "music_seek" and self._on_music_seek:
+            action_id = payload.get("action_id")
+            seconds = payload.get("seconds")
+            if seconds is not None:
+                try:
+                    await self._on_music_seek(float(seconds), client_id)
+                    if self._on_get_music_state:
+                        try:
+                            transport, queue = await self._on_get_music_state()
+                            await self.push_music_state_now(queue=queue, **transport)
+                        except Exception:
+                            pass
+                    await _send_music_action_ack("music_seek", action_id)
+                except Exception as exc:
+                    logger.warning("music_seek handler error: %s", exc)
+                    if websocket is not None and action_id:
+                        await websocket.send(json.dumps({
+                            "type": "music_action_error",
+                            "action": "music_seek",
+                            "action_id": str(action_id),
+                            "error": str(exc),
+                        }))
+            return
+
         if msg_type == "music_remove_selected" and self._on_music_remove_selected:
             action_id = payload.get("action_id")
             positions = payload.get("positions")
@@ -4063,22 +3551,6 @@ class EmbeddedVoiceWebService:
                     await websocket.send(json.dumps({
                         "type": "music_action_error",
                         "action": "music_remove_selected",
-                        "action_id": str(action_id),
-                        "error": str(exc),
-                    }))
-            return
-
-        if msg_type == "music_clear_queue" and self._on_music_clear_queue:
-            action_id = payload.get("action_id")
-            try:
-                await _send_music_action_ack("music_clear_queue", action_id)
-                await self._on_music_clear_queue(client_id)
-            except Exception as exc:
-                logger.warning("music_clear_queue handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
-                        "type": "music_action_error",
-                        "action": "music_clear_queue",
                         "action_id": str(action_id),
                         "error": str(exc),
                     }))
@@ -4182,14 +3654,13 @@ class EmbeddedVoiceWebService:
 
         if msg_type == "music_search_library" and self._on_music_search_library:
             query = str(payload.get("query", "")).strip()
-            requested_limit = max(1, min(2000, int(payload.get("limit", 200) or 200)))
+            limit = int(payload.get("limit", 200))
             try:
-                rows = await self._on_music_search_library(query, requested_limit, client_id)
+                rows = await self._on_music_search_library(query, limit, client_id)
                 if websocket is not None:
                     await websocket.send(json.dumps({
                         "type": "music_library_results",
                         "query": query,
-                        "limit": requested_limit,
                         "results": rows or [],
                     }))
             except Exception as exc:
@@ -4365,6 +3836,12 @@ class EmbeddedVoiceWebService:
                             pass
             return
 
+        if msg_type == "chat_delete":
+            thread_id = str(payload.get("thread_id", "")).strip()
+            if thread_id:
+                self.delete_chat_thread(thread_id)
+            return
+
         logger.debug("Web UI: unhandled action '%s' from %s", msg_type, client_id)
 
     def _handle_pcm_chunk(self, pcm_bytes: bytes) -> None:
@@ -4392,15 +3869,6 @@ class EmbeddedVoiceWebService:
 
         now = time.monotonic()
         if now - self._last_audio_packet_log_ts >= 2.0:
-            logger.info(
-                "📦 Audio packet source summary: browser_pcm=%d (%d bytes, rms=%.4f peak=%.4f queued=%d) browser_audio_level=%d",
-                self._browser_pcm_packet_count,
-                self._browser_pcm_packet_bytes,
-                self._latest_browser_audio["rms"],
-                self._latest_browser_audio["peak"],
-                len(self._browser_pcm_frames),
-                self._browser_level_packet_count,
-            )
             self._browser_level_packet_count = 0
             self._browser_pcm_packet_count = 0
             self._browser_pcm_packet_bytes = 0
@@ -4464,7 +3932,7 @@ class EmbeddedVoiceWebService:
             "timers": list(self._timers_state),
             "timers_rev": self._timers_rev,
             "chat": list(self._chat_messages[-50:]),
-            "chat_threads": list(self._sorted_chat_threads(self._chat_threads)[: self._chat_thread_limit]),
+            "chat_threads": list(self._chat_threads),
             "active_chat_id": self._active_chat_id,
         }
 

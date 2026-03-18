@@ -320,21 +320,6 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
     return GhostDecision(True, ("default_accept",), score, "default_accept")
 
 
-def _should_navigate_to_music_page(
-    transcript: str,
-    parsed_music: tuple[str, dict[str, Any] | str] | None,
-    is_music_query: bool,
-) -> bool:
-    if is_music_query:
-        return True
-    if parsed_music is not None:
-        return True
-    normalized = canonicalize_transcript_for_match(transcript)
-    if not normalized:
-        return False
-    return bool(re.search(r"\b(queue|playlist)\b", normalized))
-
-
 # Custom logging formatter with selective color highlighting for transcriptions
 class ColoredFormatter(logging.Formatter):
     """Formatter that highlights transcribed speech and TTS responses in green."""
@@ -368,8 +353,12 @@ class ColoredFormatter(logging.Formatter):
         return msg
 
 
+AUDIO_LOG_LEVEL = 25
+logging.addLevelName(AUDIO_LOG_LEVEL, "AUDIO")
+
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
     force=True,  # Force reconfiguration
@@ -1920,6 +1909,17 @@ async def run_orchestrator() -> None:
                     except Exception as exc:
                         logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
 
+            async def _ui_music_seek(seconds: float, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.seek_to(seconds)
+                        if web_service:
+                            ms = await music_manager.get_ui_music_state()
+                            q = await music_manager.get_ui_playlist()
+                            web_service.update_music_state(queue=q, **ms)
+                    except Exception as exc:
+                        logger.warning("Web UI music_seek seconds=%s: %s", seconds, exc)
+
             async def _ui_music_clear_queue(client_id: str) -> None:
                 if music_manager:
                     try:
@@ -2051,6 +2051,7 @@ async def run_orchestrator() -> None:
                 on_music_toggle=_ui_music_toggle,
                 on_music_stop=_ui_music_stop,
                 on_music_play_track=_ui_music_play_track,
+                on_music_seek=_ui_music_seek,
                 on_music_clear_queue=_ui_music_clear_queue,
                 on_music_remove_selected=_ui_music_remove_selected,
                 on_music_add_files=_ui_music_add_files,
@@ -2514,6 +2515,7 @@ async def run_orchestrator() -> None:
             logger.info("📍 New user message [req#%d]", current_request_id)
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
             suppress_gateway_messages_for_new_session = False
+            is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
             if web_service:
                 web_service.append_chat_message({
                     "role": "user",
@@ -2521,9 +2523,6 @@ async def run_orchestrator() -> None:
                     "source": "voice",
                     "request_id": current_request_id,
                 })
-                is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
-                page_to_navigate = "music" if _should_navigate_to_music_page(combined_transcript, parsed_music, is_music_query) else "home"
-                web_service.navigate_ui_page(page_to_navigate)
 
             last_user_text = combined_transcript
             last_user_accepted_ts = time.monotonic()
@@ -3772,15 +3771,6 @@ async def run_orchestrator() -> None:
                 local_mic_frames_count += 1
 
             if now - last_audio_source_log_ts >= 2.0:
-                logger.info(
-                    "📦 Audio frame source summary: browser_pcm=%d local_mic=%d (connected=%s ready=%s enabled=%s authority=%s)",
-                    browser_pcm_frames_count,
-                    local_mic_frames_count,
-                    browser_connected,
-                    browser_audio_ready,
-                    browser_audio_enabled,
-                    audio_authority,
-                )
                 browser_pcm_frames_count = 0
                 local_mic_frames_count = 0
                 last_audio_source_log_ts = now
@@ -3943,16 +3933,16 @@ async def run_orchestrator() -> None:
                         source_label = "Browser" if use_browser_audio else "Mic"
                         if use_browser_audio and web_service:
                             browser_level = web_service.latest_browser_audio()
-                            logger.info(
-                                "🎚️ %s level: frame_rms=%.4f (%.1f dBFS), browser_rms=%.4f, browser_peak=%.4f",
-                                source_label,
+                            logger.log(
+                                AUDIO_LOG_LEVEL,
+                                "Mic level: frame_rms=%.4f (%.1f dBFS), browser_rms=%.4f, browser_peak=%.4f",
                                 rms,
                                 dbfs,
                                 float(browser_level.get("rms", 0.0) or 0.0),
                                 float(browser_level.get("peak", 0.0) or 0.0),
                             )
                         else:
-                            logger.info("🎚️ %s level: %.4f (%.1f dBFS)", source_label, rms, dbfs)
+                            logger.log(AUDIO_LOG_LEVEL, "Mic level: %.4f (%.1f dBFS)", rms, dbfs)
                         mic_level_count += 1
                         
                         # Swoosh sound disabled

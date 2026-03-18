@@ -155,6 +155,16 @@ class MusicManager:
         except Exception as e:
             logger.error(f"Failed to play: {e}")
             return f"Error: {e}"
+
+    async def seek_to(self, seconds: float) -> str:
+        """Seek to absolute position (seconds) in current track."""
+        try:
+            target = max(0, int(float(seconds)))
+            await self.pool.execute(f"seekcur {target}")
+            return f"Seeked to {target}s"
+        except Exception as e:
+            logger.error(f"Failed to seek: {e}")
+            return f"Error: {e}"
     
     async def pause(self) -> str:
         """Pause playback."""
@@ -472,22 +482,47 @@ class MusicManager:
             return f"Error: {e}"
 
     async def add_files_to_queue(self, files: List[str]) -> str:
-        """Add multiple file URIs to the queue."""
+        """Add multiple file URIs to the top of the queue and focus the new head."""
         try:
             cleaned = [str(f).strip() for f in files if str(f).strip()]
             if not cleaned:
                 return "No tracks selected"
+
+            status_before = await self.pool.execute("status")
+            state_before = str(status_before.get("state", "stop") or "stop")
             added = 0
             failed = 0
-            for file_uri in cleaned:
+
+            # Insert at queue position 0 in reverse order so the first requested
+            # track ends up at the top of the playlist.
+            for file_uri in reversed(cleaned):
                 try:
-                    await self.pool.execute(f'add "{self._quote(file_uri)}"')
+                    await self.pool.execute(f'addid "{self._quote(file_uri)}" 0')
                     added += 1
                 except Exception as exc:
                     failed += 1
                     logger.warning("Failed to add file to queue '%s': %s", file_uri, exc)
+
             if added == 0:
                 return "Error: Failed to add selected tracks to queue"
+
+            # MPD has no direct "select queue item without playback side effects"
+            # command, so move focus to the new head and then restore the prior
+            # non-playing state as closely as MPD allows.
+            await self.pool.execute("play 0")
+            if state_before == "pause":
+                await self.pool.execute("pause 1")
+            elif state_before == "stop":
+                await self.pool.execute("stop")
+                status_after_stop = await self.pool.execute("status")
+                try:
+                    current_pos_after_stop = int(status_after_stop.get("song", -1) or -1)
+                except Exception:
+                    current_pos_after_stop = -1
+                if current_pos_after_stop != 0:
+                    await self.pool.execute("play 0")
+                    await self.pool.execute("pause 1")
+
             if failed > 0:
                 return f"Added {added} track(s) to queue ({failed} failed)"
             return f"Added {added} track(s) to queue"
@@ -722,7 +757,9 @@ class MusicManager:
                 self._record_search_metric("prefix_cache", q, elapsed)
                 return prefix_rows
 
-            await self._maybe_refresh_fts_index()
+            # Only refresh FTS index if no FTS rebuild is in progress (avoid starving UI with pool connections)
+            if not self._fts_building:
+                await self._maybe_refresh_fts_index()
 
             if self._fts_ready and self._fts_conn is not None:
                 try:

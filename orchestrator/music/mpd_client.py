@@ -90,7 +90,7 @@ class MPDConnection:
             ValueError: If MPD returns an error response
         """
         async with self._lock:
-            if not self.is_connected:
+            if not self.is_connected or self._reader is None or self._writer is None:
                 raise ConnectionError("Not connected to MPD")
             
             try:
@@ -104,6 +104,10 @@ class MPDConnection:
                 # Read response
                 response = {}
                 while True:
+                    # Re-check connection state in case close() was called while reading
+                    if self._reader is None:
+                        raise ConnectionError("Connection lost to MPD during command")
+                    
                     line = await asyncio.wait_for(
                         self._reader.readline(),
                         timeout=self.timeout
@@ -157,7 +161,7 @@ class MPDConnection:
             List of dictionaries, one per item
         """
         async with self._lock:
-            if not self.is_connected:
+            if not self.is_connected or self._reader is None or self._writer is None:
                 raise ConnectionError("Not connected to MPD")
             
             try:
@@ -173,6 +177,10 @@ class MPDConnection:
                 current_item = {}
                 
                 while True:
+                    # Re-check connection state in case close() was called while reading
+                    if self._reader is None:
+                        raise ConnectionError("Connection lost to MPD during list read")
+                    
                     line = await asyncio.wait_for(
                         self._reader.readline(),
                         timeout=self.timeout
@@ -263,6 +271,8 @@ class MPDClientPool:
     async def close(self):
         """Close all connections in the pool."""
         async with self._lock:
+            # Cancel any pending FTS rebuild tasks before closing connections
+            # This prevents errors when FTS rebuild tries to use closed connections
             for conn in self._pool:
                 await conn.close()
             self._pool.clear()
