@@ -121,6 +121,7 @@ class EmbeddedVoiceWebService:
             "queue_length": 0, "elapsed": 0.0, "duration": 0.0, "position": -1,
         }
         self._music_queue: list[dict[str, Any]] = []
+        self._music_playlists_cache: list[str] = []
         self._music_rev: int = 0
         self._timers_state: list[dict[str, Any]] = []
         self._timers_rev: int = 0
@@ -610,6 +611,21 @@ class EmbeddedVoiceWebService:
                 except Exception:
                     pass
             await websocket.send(json.dumps(self._build_state_snapshot()))
+            if self._on_music_list_playlists is not None:
+                try:
+                    names = await self._on_music_list_playlists(client_id)
+                    playlist_names = [str(n) for n in (names or []) if str(n).strip()]
+                    if playlist_names:
+                        self._music_playlists_cache = playlist_names
+                    elif self._music_playlists_cache:
+                        playlist_names = list(self._music_playlists_cache)
+                    logger.info("Sent playlists on connect to %s: count=%d", client_id, len(playlist_names))
+                    await websocket.send(json.dumps({
+                        "type": "music_playlists",
+                        "playlists": playlist_names,
+                    }))
+                except Exception:
+                    pass
             async for message in websocket:
                 if isinstance(message, str):
                     asyncio.create_task(self._handle_text_action(message, client_id, websocket))
@@ -686,31 +702,40 @@ class EmbeddedVoiceWebService:
                 logger.warning("mic_toggle handler error: %s", exc)
             return
 
+        async def _send_ws_json(payload_dict: dict[str, Any]) -> bool:
+            if websocket is None:
+                return False
+            try:
+                await websocket.send(json.dumps(payload_dict))
+                return True
+            except Exception as exc:
+                logger.debug("Web UI socket send failed (%s): %s", client_id, exc)
+                self._clients.discard(websocket)
+                if self._active_client is websocket:
+                    self._active_client = next(iter(self._clients), None)
+                return False
+
         async def _send_music_action_ack(action: str, action_id: Any) -> None:
-            if websocket is None or not action_id:
+            if not action_id:
                 return
-            await websocket.send(
-                json.dumps(
-                    {
-                        "type": "music_action_ack",
-                        "action": action,
-                        "action_id": str(action_id),
-                    }
-                )
+            await _send_ws_json(
+                {
+                    "type": "music_action_ack",
+                    "action": action,
+                    "action_id": str(action_id),
+                }
             )
 
         async def _send_music_playlists_update() -> None:
-            if websocket is None or self._on_music_list_playlists is None:
+            if self._on_music_list_playlists is None:
                 return
             try:
                 names = await self._on_music_list_playlists(client_id)
-                await websocket.send(
-                    json.dumps(
-                        {
-                            "type": "music_playlists",
-                            "playlists": names or [],
-                        }
-                    )
+                await _send_ws_json(
+                    {
+                        "type": "music_playlists",
+                        "playlists": names or [],
+                    }
                 )
             except Exception:
                 pass
@@ -740,13 +765,13 @@ class EmbeddedVoiceWebService:
                 asyncio.create_task(_push_music_state_best_effort())
             except Exception as exc:
                 logger.warning("music_toggle handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_toggle",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_stop" and self._on_music_stop:
@@ -757,13 +782,13 @@ class EmbeddedVoiceWebService:
                 asyncio.create_task(_push_music_state_best_effort())
             except Exception as exc:
                 logger.warning("music_stop handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_stop",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_play_track" and self._on_music_play_track:
@@ -776,13 +801,13 @@ class EmbeddedVoiceWebService:
                     asyncio.create_task(_push_music_state_best_effort())
                 except Exception as exc:
                     logger.warning("music_play_track handler error: %s", exc)
-                    if websocket is not None and action_id:
-                        await websocket.send(json.dumps({
+                    if action_id:
+                        await _send_ws_json({
                             "type": "music_action_error",
                             "action": "music_play_track",
                             "action_id": str(action_id),
                             "error": str(exc),
-                        }))
+                        })
             return
 
         if msg_type == "music_seek" and self._on_music_seek:
@@ -795,13 +820,30 @@ class EmbeddedVoiceWebService:
                     asyncio.create_task(_push_music_state_best_effort())
                 except Exception as exc:
                     logger.warning("music_seek handler error: %s", exc)
-                    if websocket is not None and action_id:
-                        await websocket.send(json.dumps({
+                    if action_id:
+                        await _send_ws_json({
                             "type": "music_action_error",
                             "action": "music_seek",
                             "action_id": str(action_id),
                             "error": str(exc),
-                        }))
+                        })
+            return
+
+        if msg_type == "music_clear_queue" and self._on_music_clear_queue:
+            action_id = payload.get("action_id")
+            try:
+                await _send_music_action_ack("music_clear_queue", action_id)
+                await self._on_music_clear_queue(client_id)
+                asyncio.create_task(_push_music_state_best_effort())
+            except Exception as exc:
+                logger.warning("music_clear_queue handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "music_action_error",
+                        "action": "music_clear_queue",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    })
             return
 
         if msg_type == "music_remove_selected" and self._on_music_remove_selected:
@@ -815,13 +857,13 @@ class EmbeddedVoiceWebService:
                 await self._on_music_remove_selected(pos_list, client_id, song_id_list or None)
             except Exception as exc:
                 logger.warning("music_remove_selected handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_remove_selected",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_add_files" and self._on_music_add_files:
@@ -833,13 +875,13 @@ class EmbeddedVoiceWebService:
                 await _send_music_action_ack("music_add_files", action_id)
             except Exception as exc:
                 logger.warning("music_add_files handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_add_files",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_create_playlist" and self._on_music_create_playlist:
@@ -854,13 +896,13 @@ class EmbeddedVoiceWebService:
                     await _send_music_playlists_update()
             except Exception as exc:
                 logger.warning("music_create_playlist handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_create_playlist",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_load_playlist" and self._on_music_load_playlist:
@@ -870,16 +912,17 @@ class EmbeddedVoiceWebService:
                 if name:
                     await _send_music_action_ack("music_load_playlist", action_id)
                     await self._on_music_load_playlist(name, client_id)
+                    asyncio.create_task(_push_music_state_best_effort())
                     await _send_music_playlists_update()
             except Exception as exc:
                 logger.warning("music_load_playlist handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_load_playlist",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_save_playlist" and self._on_music_save_playlist:
@@ -892,13 +935,13 @@ class EmbeddedVoiceWebService:
                     await _send_music_playlists_update()
             except Exception as exc:
                 logger.warning("music_save_playlist handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_save_playlist",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_delete_playlist" and self._on_music_delete_playlist:
@@ -911,13 +954,13 @@ class EmbeddedVoiceWebService:
                     await _send_music_playlists_update()
             except Exception as exc:
                 logger.warning("music_delete_playlist handler error: %s", exc)
-                if websocket is not None and action_id:
-                    await websocket.send(json.dumps({
+                if action_id:
+                    await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_delete_playlist",
                         "action_id": str(action_id),
                         "error": str(exc),
-                    }))
+                    })
             return
 
         if msg_type == "music_search_library" and self._on_music_search_library:
@@ -938,10 +981,16 @@ class EmbeddedVoiceWebService:
         if msg_type == "music_list_playlists" and self._on_music_list_playlists:
             try:
                 names = await self._on_music_list_playlists(client_id)
+                playlist_names = [str(n) for n in (names or []) if str(n).strip()]
+                if playlist_names:
+                    self._music_playlists_cache = playlist_names
+                elif self._music_playlists_cache:
+                    playlist_names = list(self._music_playlists_cache)
+                logger.info("Handled music_list_playlists for %s: count=%d", client_id, len(playlist_names))
                 if websocket is not None:
                     await websocket.send(json.dumps({
                         "type": "music_playlists",
-                        "playlists": names or [],
+                        "playlists": playlist_names,
                     }))
             except Exception as exc:
                 logger.warning("music_list_playlists handler error: %s", exc)

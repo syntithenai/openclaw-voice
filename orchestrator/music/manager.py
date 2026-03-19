@@ -877,12 +877,18 @@ class MusicManager:
     
     async def list_playlists(self) -> List[str]:
         """List available playlists."""
-        try:
-            result = await self.pool.execute_list("listplaylists")
-            return [item.get("playlist", "") for item in result if "playlist" in item]
-        except Exception as e:
-            logger.error(f"Failed to list playlists: {e}")
-            return []
+        for attempt in (1, 2):
+            try:
+                result = await self.pool.execute_list("listplaylists", timeout=8.0)
+                return [item.get("playlist", "") for item in result if "playlist" in item]
+            except Exception as e:
+                if attempt == 1:
+                    logger.warning(f"list_playlists attempt 1 failed, retrying: {e}")
+                    await asyncio.sleep(0.05)
+                    continue
+                logger.error(f"Failed to list playlists: {e}")
+                return []
+        return []
     
     async def load_playlist(self, name: str) -> str:
         """Load a saved playlist."""
@@ -893,11 +899,26 @@ class MusicManager:
                 return "Playlist name is required"
 
             clear_start = time.monotonic() * 1000
-            await self.pool.execute("clear")
+            await self.pool.execute("clear", timeout=8.0)
             clear_ms = time.monotonic() * 1000 - clear_start
             
             load_start = time.monotonic() * 1000
-            await self.pool.execute(f'load "{self._quote(playlist_name)}"')
+            load_ok = False
+            last_exc: Exception | None = None
+            for attempt in (1, 2):
+                try:
+                    await self.pool.execute(f'load "{self._quote(playlist_name)}"', timeout=25.0)
+                    load_ok = True
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt == 1:
+                        logger.warning("load_playlist first attempt failed for '%s', retrying: %s", playlist_name, exc)
+                        await asyncio.sleep(0.05)
+            if not load_ok:
+                if last_exc is not None:
+                    raise last_exc
+                raise RuntimeError("Playlist load failed")
             load_ms = time.monotonic() * 1000 - load_start
             
             self._loaded_playlist_name = playlist_name

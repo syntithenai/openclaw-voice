@@ -727,7 +727,14 @@ async def run_orchestrator() -> None:
     
     # MPD (Music Player Daemon)
     print("→ Starting MPD...", flush=True)
-    mpd_manager = MPDManager(mpd_port=6600, mpd_host="127.0.0.1")
+    playlist_dir = workspace_root / config.mpd_playlist_dir
+    playlist_dir.mkdir(parents=True, exist_ok=True)
+    mpd_manager = MPDManager(
+        mpd_port=6600,
+        mpd_host="127.0.0.1",
+        playlist_directory=str(playlist_dir),
+        state_directory=str(workspace_root / config.mpd_state_dir),
+    )
     mpd_start = time.monotonic()
     if mpd_manager.start():
         if mpd_manager.wait_for_ready(timeout_sec=5):
@@ -1952,8 +1959,10 @@ async def run_orchestrator() -> None:
             async def _ui_music_clear_queue(client_id: str) -> None:
                 if music_manager:
                     try:
-                        await music_manager.clear_queue()
-                        await _ui_refresh_music_state("music_clear_queue")
+                        result = await music_manager.clear_queue()
+                        if str(result).strip().lower().startswith("error:"):
+                            raise RuntimeError(result)
+                        asyncio.create_task(_ui_refresh_music_state("music_clear_queue"))
                     except Exception as exc:
                         logger.warning("Web UI music_clear_queue: %s", exc)
 
@@ -1986,6 +1995,16 @@ async def run_orchestrator() -> None:
                         await _ui_refresh_music_state("music_create_playlist")
                     except Exception as exc:
                         logger.warning("Web UI music_create_playlist '%s': %s", name, exc)
+
+            async def _ui_music_load_playlist(name: str, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        result = await music_manager.load_playlist(name)
+                        if str(result).strip().lower().startswith("error:"):
+                            raise RuntimeError(result)
+                        asyncio.create_task(_ui_refresh_music_state("music_load_playlist"))
+                    except Exception as exc:
+                        logger.warning("Web UI music_load_playlist '%s': %s", name, exc)
 
             async def _ui_music_save_playlist(name: str, client_id: str) -> None:
                 if music_manager:
@@ -2067,6 +2086,7 @@ async def run_orchestrator() -> None:
                 on_music_remove_selected=_ui_music_remove_selected,
                 on_music_add_files=_ui_music_add_files,
                 on_music_create_playlist=_ui_music_create_playlist,
+                on_music_load_playlist=_ui_music_load_playlist,
                 on_music_save_playlist=_ui_music_save_playlist,
                 on_music_delete_playlist=_ui_music_delete_playlist,
                 on_music_search_library=_ui_music_search_library,
@@ -2080,6 +2100,21 @@ async def run_orchestrator() -> None:
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,
             )
+
+            # If a browser connected before handlers were wired, push initial music data now.
+            try:
+                if music_manager:
+                    playlist_names = await music_manager.list_playlists()
+                    await web_service.broadcast(
+                        {
+                            "type": "music_playlists",
+                            "playlists": playlist_names or [],
+                        }
+                    )
+                    transport, queue = await _ui_get_music_state_snapshot()
+                    await web_service.push_music_state_now(queue=queue, **transport)
+            except Exception as exc:
+                logger.warning("Web UI post-handler initial sync failed: %s", exc)
 
             # Start music + timer state publisher
             async def _web_ui_publisher() -> None:

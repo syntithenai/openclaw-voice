@@ -26,10 +26,14 @@ function handleMsg(msg){
         S.musicQueue=msg.music_queue;
         syncMusicFromQueue();
     }
+    if(Array.isArray(msg.music_playlists)) S.musicPlaylists = msg.music_playlists;
     if(msg.music_rev!==undefined) S.lastMusicRev=Math.max(S.lastMusicRev, Number(msg.music_rev)||0);
     if(Array.isArray(msg.timers)) applyTimers(msg.timers);
     if(msg.timers_rev!==undefined) S.lastTimersRev=Math.max(S.lastTimersRev, Number(msg.timers_rev)||0);
             applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id);
+            if(S.page==='music' && (!Array.isArray(S.musicPlaylists) || S.musicPlaylists.length===0)){
+                sendAction({type:'music_list_playlists'});
+            }
             renderPage();
       break;
     case 'orchestrator_status':
@@ -82,7 +86,8 @@ function handleMsg(msg){
                 S.lastMusicRev=rev;
             }
             applyMusic(msg.music||msg);
-            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            // Transport updates can arrive frequently (elapsed/position changes).
+            // Avoid full page re-render on each tick, especially with large queues.
             applyMusicHeader();
             break;
         case 'music_queue':
@@ -453,3 +458,4 @@ setupServerRefreshWatcher();
 setInterval(()=>{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{ if(t._clientAnchorTs===undefined){ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; } t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }); renderTimerBar(); },500);
 startBrowserCapture().catch((err)=>{
     reportCaptureFailure(err,'startup');
+});

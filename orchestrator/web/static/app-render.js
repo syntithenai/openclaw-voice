@@ -376,6 +376,7 @@ function connectWs(){
             if(S.browserAudioEnabled) ensureBrowserCapture().catch((err)=>reportCaptureFailure(err,'connect'));
             S.ws.send(JSON.stringify({type:'ui_ready'}));
                 pushUiPrefsToServer();
+        if(S.page==='music') sendAction({type:'music_list_playlists'});
     };
     S.ws.onclose=(evt)=>{
         S.wsConnected=false;
