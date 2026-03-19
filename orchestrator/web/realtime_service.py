@@ -743,11 +743,16 @@ class EmbeddedVoiceWebService:
         async def _push_music_state_best_effort() -> None:
             if self._on_get_music_state is None:
                 return
-            try:
-                transport, queue = await self._on_get_music_state()
-                await self.push_music_state_now(queue=queue, **transport)
-            except Exception:
-                pass
+            for attempt in (1, 2, 3):
+                try:
+                    transport, queue = await self._on_get_music_state()
+                    await self.push_music_state_now(queue=queue, **transport)
+                    return
+                except Exception as exc:
+                    if attempt == 3:
+                        logger.warning("music state push failed after retries: %s", exc)
+                        return
+                    await asyncio.sleep(0.1 * attempt)
 
         if msg_type == "music_get_state" and self._on_get_music_state:
             try:
@@ -910,8 +915,12 @@ class EmbeddedVoiceWebService:
             name = str(payload.get("name", "")).strip()
             try:
                 if name:
-                    await _send_music_action_ack("music_load_playlist", action_id)
                     await self._on_music_load_playlist(name, client_id)
+                    await _send_music_action_ack("music_load_playlist", action_id)
+
+                    # Push updated state/queue asynchronously to avoid blocking ACK timeout.
+                    # Large playlists can take longer to materialize on MPD; retries handled
+                    # inside _push_music_state_best_effort.
                     asyncio.create_task(_push_music_state_best_effort())
                     await _send_music_playlists_update()
             except Exception as exc:
@@ -965,17 +974,50 @@ class EmbeddedVoiceWebService:
 
         if msg_type == "music_search_library" and self._on_music_search_library:
             query = str(payload.get("query", "")).strip()
-            limit = int(payload.get("limit", 200))
             try:
-                rows = await self._on_music_search_library(query, limit, client_id)
+                limit = int(payload.get("limit", 200))
+            except Exception:
+                limit = 200
+            limit = max(1, min(2000, limit))
+            try:
+                started = time.monotonic()
+                # Keep UI responsive: return results or timeout quickly.
+                rows = await asyncio.wait_for(
+                    self._on_music_search_library(query, limit, client_id),
+                    timeout=4.0,
+                )
+                elapsed_ms = (time.monotonic() - started) * 1000
+                logger.info(
+                    "music_search_library handled query='%s' limit=%d rows=%d in %.1fms",
+                    query,
+                    limit,
+                    len(rows or []),
+                    elapsed_ms,
+                )
                 if websocket is not None:
                     await websocket.send(json.dumps({
                         "type": "music_library_results",
                         "query": query,
                         "results": rows or [],
                     }))
+            except asyncio.TimeoutError:
+                logger.warning("music_search_library timed out query='%s' limit=%d", query, limit)
+                if websocket is not None:
+                    await websocket.send(json.dumps({
+                        "type": "music_library_results",
+                        "query": query,
+                        "results": [],
+                        "error": "search timeout",
+                    }))
             except Exception as exc:
                 logger.warning("music_search_library handler error: %s", exc)
+                if websocket is not None:
+                    await websocket.send(json.dumps({
+                        "type": "music_library_results",
+                        "query": query,
+                        "results": [],
+                        "error": str(exc),
+                    }))
             return
 
         if msg_type == "music_list_playlists" and self._on_music_list_playlists:

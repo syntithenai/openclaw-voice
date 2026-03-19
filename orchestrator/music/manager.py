@@ -54,6 +54,9 @@ class MusicManager:
         self._fts_batch_size = 1000
         self._fts_last_indexed_count = 0
         self._fts_rebuild_task: asyncio.Task | None = None
+        self._fts_indexed_so_far = 0
+        self._fts_total_estimate = 0
+        self._fts_build_started_ts = 0.0
 
     async def _normalize_pipewire_mpd_stream_volume(self) -> None:
         """Best-effort: set PipeWire per-app stream volume for MPD to target percent.
@@ -411,10 +414,19 @@ class MusicManager:
         try:
             # For huge queues, MPD closes connection on full playlistinfo
             # So we always limit the response. Clients can paginate if needed.
+            t0 = time.monotonic()
             if limit is None:
-                return await self.pool.execute_list("playlistinfo")
+                # Large queries need extra time; 60s for potentially slow connections
+                result = await self.pool.execute_list("playlistinfo", timeout=60.0)
             else:
-                return await self.pool.execute_list(f"playlistinfo 0:{limit-1}")
+                cmd = f"playlistinfo 0:{limit-1}"
+                # Scale timeout based on limit; 200 items = 45s, 500 items = 60s
+                query_timeout = max(45.0, min(60.0, 30.0 + (limit / 10)))
+                result = await self.pool.execute_list(cmd, timeout=query_timeout)
+            elapsed_ms = (time.monotonic() - t0) * 1000
+            if len(result) > 50:
+                logger.info(f"⏱️ playlistinfo 0:{limit-1} returned {len(result)} items in {elapsed_ms:.1f}ms")
+            return result
         except Exception as e:
             logger.error(f"Failed to get queue: {e}")
             return []
@@ -601,6 +613,18 @@ class MusicManager:
         db_update = str(stats.get("db_update", "0"))
         return f"{songs}:{db_update}"
 
+    def _fts_progress_text(self) -> str:
+        indexed = int(self._fts_indexed_so_far or 0)
+        total = int(self._fts_total_estimate or 0)
+        elapsed = max(0.0, time.monotonic() - float(self._fts_build_started_ts or 0.0))
+        if total > 0:
+            pct = min(100.0, (indexed / total) * 100.0)
+            return (
+                f"Library index is building ({indexed}/{total}, {pct:.1f}%). "
+                f"Please retry in a few seconds."
+            )
+        return f"Library index is building ({indexed} indexed in {elapsed:.1f}s). Please retry in a few seconds."
+
     def _fts_query_expr(self, query: str) -> str:
         terms = [t.strip().replace('"', '""') for t in query.split() if t.strip()]
         if not terms:
@@ -615,12 +639,20 @@ class MusicManager:
             conn = self._ensure_fts_conn()
             conn.execute("DELETE FROM music_search_idx")
             conn.commit()
+            self._fts_ready = False
 
             inserted = 0
             offset = 0
             batch = max(100, int(self._fts_batch_size))
             pending: List[tuple] = []
-            commit_every = batch * 10
+            commit_every = batch
+            self._fts_build_started_ts = time.monotonic()
+            self._fts_indexed_so_far = 0
+            try:
+                stats = await self.get_stats()
+                self._fts_total_estimate = int(stats.get("songs", 0) or 0)
+            except Exception:
+                self._fts_total_estimate = 0
             while True:
                 cmd = f'search file "" window {offset}:{offset + batch}'
                 rows = await self.pool.execute_list(cmd)
@@ -645,6 +677,18 @@ class MusicManager:
                     inserted += len(pending)
                     pending = []
                     conn.commit()
+                    self._fts_ready = inserted > 0
+                    self._fts_indexed_so_far = inserted
+                    if self._fts_total_estimate > 0:
+                        pct = min(100.0, (inserted / self._fts_total_estimate) * 100.0)
+                        logger.info(
+                            "🔎 FTS indexing progress: %d/%d (%.1f%%)",
+                            inserted,
+                            self._fts_total_estimate,
+                            pct,
+                        )
+                    else:
+                        logger.info("🔎 FTS indexing progress: %d rows", inserted)
 
                 if len(rows) < batch:
                     break
@@ -656,6 +700,7 @@ class MusicManager:
                     pending,
                 )
                 inserted += len(pending)
+                self._fts_indexed_so_far = inserted
 
             conn.commit()
             self._fts_last_indexed_count = inserted
@@ -757,9 +802,24 @@ class MusicManager:
                 self._record_search_metric("prefix_cache", q, elapsed)
                 return prefix_rows
 
+            # Ensure SQLite/FTS connection is opened so we can use existing local index
+            # immediately on first request after startup.
+            try:
+                self._ensure_fts_conn()
+            except Exception:
+                pass
+
             # Only refresh FTS index if no FTS rebuild is in progress (avoid starving UI with pool connections)
             if not self._fts_building:
                 await self._maybe_refresh_fts_index()
+
+            # First-search bootstrap: wait briefly for an in-flight index build so
+            # users don't immediately see empty results right after startup.
+            if not self._fts_ready and self._fts_rebuild_task is not None and not self._fts_rebuild_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(self._fts_rebuild_task), timeout=2.5)
+                except Exception:
+                    pass
 
             if self._fts_ready and self._fts_conn is not None:
                 try:
@@ -790,85 +850,49 @@ class MusicManager:
                         )
                         self._record_search_metric("fts", q, total_elapsed)
                         return out
+
+                    # FTS may return zero rows for some tokenization edge-cases;
+                    # use local SQLite LIKE fallback before touching MPD network search.
+                    like = f"%{q_norm}%"
+                    cursor = self._fts_conn.execute(
+                        "SELECT file,title,artist,album FROM music_search_idx WHERE searchable LIKE ? LIMIT ?",
+                        (like, safe_limit),
+                    )
+                    out_like = [
+                        {
+                            "file": str(file_uri or ""),
+                            "title": str(title or ""),
+                            "artist": str(artist or ""),
+                            "album": str(album or ""),
+                        }
+                        for (file_uri, title, artist, album) in cursor.fetchall()
+                        if str(file_uri or "").strip()
+                    ]
+                    if out_like:
+                        fts_elapsed = time.monotonic() * 1000 - fts_start
+                        total_elapsed = time.monotonic() * 1000 - start_ms
+                        self._ui_search_cache[cache_key] = (time.monotonic(), [dict(row) for row in out_like])
+                        self._ui_prefix_cache[q_norm] = (time.monotonic(), [dict(row) for row in out_like])
+                        logger.info(
+                            f"🔍 Music search (sqlite-like): '{q}' → {len(out_like)} results in {total_elapsed:.1f}ms "
+                            f"(sqlite:{fts_elapsed:.1f}ms)"
+                        )
+                        self._record_search_metric("sqlite_like", q, total_elapsed)
+                        return out_like
                 except Exception as exc:
-                    logger.debug("FTS query failed, falling back to MPD: %s", exc)
+                    logger.warning("FTS query failed for '%s': %s", q, exc)
 
-            mpd_start = time.monotonic() * 1000
-            rows: List[Dict[str, str]] = []
-            quoted = self._quote(q)
-            window_clause = f"window 0:{safe_limit}"
-            search_any_cmd = f'search any "{quoted}"'
-            search_title_cmd = f'search title "{quoted}"'
-            search_artist_cmd = f'search artist "{quoted}"'
-            search_album_cmd = f'search album "{quoted}"'
-
-            try:
-                primary = await self.pool.execute_list(f'{search_any_cmd} {window_clause}')
-                if primary:
-                    rows.extend(primary)
-            except Exception:
-                pass
-
-            async def _safe_execute_list(command: str) -> List[Dict[str, str]]:
-                try:
-                    return await self.pool.execute_list(command)
-                except Exception:
-                    return []
-
-            if len(rows) < safe_limit:
-                extras = await asyncio.gather(
-                    _safe_execute_list(f'{search_title_cmd} {window_clause}'),
-                    _safe_execute_list(f'{search_artist_cmd} {window_clause}'),
-                    _safe_execute_list(f'{search_album_cmd} {window_clause}'),
-                )
-                for part in extras:
-                    if part:
-                        rows.extend(part)
-
-            if not rows:
-                try:
-                    rows = await self.pool.execute_list(f'search file "{quoted}" {window_clause}')
-                except Exception:
-                    rows = []
-            
-            mpd_elapsed = time.monotonic() * 1000 - mpd_start
-
-            dedup_start = time.monotonic() * 1000
-            out: List[Dict[str, str]] = []
-            seen: set[str] = set()
-            for item in rows:
-                file_uri = str(item.get("file", "")).strip()
-                if not file_uri or file_uri in seen:
-                    continue
-                seen.add(file_uri)
-                out.append(
-                    {
-                        "file": file_uri,
-                        "title": str(item.get("title") or item.get("Title") or file_uri.split("/")[-1]),
-                        "artist": str(item.get("artist") or item.get("Artist") or ""),
-                        "album": str(item.get("album") or item.get("Album") or ""),
-                    }
-                )
-                if len(out) >= safe_limit:
-                    break
-            
-            dedup_elapsed = time.monotonic() * 1000 - dedup_start
-            self._ui_search_cache[cache_key] = (time.monotonic(), [dict(row) for row in out])
-            self._ui_prefix_cache[q_norm] = (time.monotonic(), [dict(row) for row in out])
-            if len(self._ui_search_cache) > self._ui_search_cache_max_entries:
-                oldest_key = min(self._ui_search_cache, key=lambda key: self._ui_search_cache[key][0])
-                self._ui_search_cache.pop(oldest_key, None)
-            if len(self._ui_prefix_cache) > self._ui_search_cache_max_entries:
-                oldest_prefix_key = min(self._ui_prefix_cache, key=lambda key: self._ui_prefix_cache[key][0])
-                self._ui_prefix_cache.pop(oldest_prefix_key, None)
+            # Bounded MPD fallback: used only when local index returns no results.
+            if self._fts_building or not self._fts_ready:
+                raise RuntimeError(self._fts_progress_text())
 
             total_elapsed = time.monotonic() * 1000 - start_ms
             logger.info(
-                f"🔍 Music search (fresh): '{q}' → {len(out)} results in {total_elapsed:.1f}ms "
-                f"(MPD:{mpd_elapsed:.1f}ms, dedup:{dedup_elapsed:.1f}ms, raw:{len(rows)} hits)"
+                f"🔍 Music search (miss): '{q}' → 0 results in {total_elapsed:.1f}ms "
+                f"(fts_ready={self._fts_ready}, fts_building={self._fts_building})"
             )
-            self._record_search_metric("mpd", q, total_elapsed)
-            return out
+            self._record_search_metric("local_miss", q, total_elapsed)
+            return []
         except Exception as e:
             logger.error(f"Failed UI library search: {e}")
             return []
@@ -1324,9 +1348,11 @@ class MusicManager:
 
     async def get_ui_playlist(self, limit: int = 200) -> list:
         """Return a compact queue list for the web UI music page."""
+        t0 = time.monotonic()
         try:
             # Fetch only as many items as we'll display to avoid connection timeouts on huge queues
             queue = await self.get_queue(limit=limit)
+            t_queue = time.monotonic()
             result = []
             for i, item in enumerate(queue[:limit]):
                 raw_dur = item.get("duration") or item.get("time") or item.get("Time") or 0
@@ -1343,6 +1369,12 @@ class MusicManager:
                     "file": item.get("file", ""),
                     "duration": dur,
                 })
+            t_loop = time.monotonic()
+            elapsed_ms = (t_loop - t0) * 1000
+            queue_ms = (t_queue - t0) * 1000
+            loop_ms = (t_loop - t_queue) * 1000
+            if len(result) > 50:
+                logger.info(f"⏱️ get_ui_playlist({limit}): {elapsed_ms:.1f}ms total (queue:{queue_ms:.1f}ms, loop:{loop_ms:.1f}ms)")
             return result
         except Exception as e:
             logger.error(f"Failed to get UI playlist: {e}")

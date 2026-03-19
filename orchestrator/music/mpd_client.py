@@ -9,6 +9,7 @@ Provides low-level MPD protocol communication with:
 
 import asyncio
 import logging
+import time
 from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
 
@@ -26,6 +27,7 @@ class MPDConnection:
         self._writer: Optional[asyncio.StreamWriter] = None
         self._connected = False
         self._lock = asyncio.Lock()
+        self._last_activity_ts = 0.0
     
     async def connect(self) -> bool:
         """Establish connection to MPD server."""
@@ -47,6 +49,7 @@ class MPDConnection:
                 return False
             
             self._connected = True
+            self._last_activity_ts = time.monotonic()
             logger.info(f"Connected to MPD at {self.host}:{self.port}")
             return True
             
@@ -150,6 +153,9 @@ class MPDConnection:
                 logger.error(f"Error sending MPD command: {e}")
                 self._connected = False
                 raise
+            finally:
+                if self._connected:
+                    self._last_activity_ts = time.monotonic()
     
     async def send_command_list(self, send_cmd: str = "", timeout: float | None = None) -> List[Dict[str, str]]:
         """
@@ -228,6 +234,22 @@ class MPDConnection:
                 logger.error(f"Error in MPD list response: {e}")
                 self._connected = False
                 raise ConnectionError(f"MPD list response error: {e}")
+            finally:
+                if self._connected:
+                    self._last_activity_ts = time.monotonic()
+
+    async def ensure_alive(self, idle_probe_after_s: float = 4.0) -> bool:
+        """Best-effort liveness probe for potentially stale idle sockets."""
+        if not self.is_connected:
+            return False
+        if (time.monotonic() - self._last_activity_ts) < idle_probe_after_s:
+            return True
+        try:
+            await self.send_command("ping", timeout=min(1.5, max(0.5, self.timeout)))
+            return True
+        except Exception:
+            self._connected = False
+            return False
 
 
 class MPDClientPool:
@@ -238,7 +260,7 @@ class MPDClientPool:
     Handles automatic reconnection and connection health monitoring.
     """
     
-    def __init__(self, host: str, port: int, pool_size: int = 3, timeout: float = 5.0):
+    def __init__(self, host: str, port: int, pool_size: int = 3, timeout: float = 8.0):
         self.host = host
         self.port = port
         self.pool_size = pool_size
@@ -311,6 +333,11 @@ class MPDClientPool:
                 if not await conn.connect():
                     logger.warning("Failed to reconnect to MPD; keeping connection in pool for future retry")
                     raise ConnectionError("Failed to reconnect to MPD")
+            elif not await conn.ensure_alive(idle_probe_after_s=4.0):
+                logger.debug("MPD connection failed liveness probe; reconnecting...")
+                await conn.close()
+                if not await conn.connect():
+                    raise ConnectionError("Failed to reconnect to MPD")
 
             yield conn
         finally:
@@ -329,15 +356,18 @@ class MPDClientPool:
         Returns:
             Dictionary of response key-value pairs
         """
-        async with self.get_connection() as conn:
-            try:
-                return await conn.send_command(command, timeout=timeout)
-            except ConnectionError:
-                # Stale/half-open connection — reconnect and retry once
-                await conn.close()
-                if not await conn.connect():
-                    raise ConnectionError("Failed to reconnect to MPD")
-                return await conn.send_command(command, timeout=timeout)
+        last_exc: Exception | None = None
+        for attempt in (1, 2, 3):
+            async with self.get_connection() as conn:
+                try:
+                    return await conn.send_command(command, timeout=timeout)
+                except ConnectionError as exc:
+                    last_exc = exc
+                    await conn.close()
+                    if attempt < 3:
+                        await asyncio.sleep(0.05 * attempt)
+                        continue
+        raise ConnectionError(f"MPD command failed after retries: {last_exc}")
     
     async def execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
         """
@@ -350,13 +380,16 @@ class MPDClientPool:
         Returns:
             List of dictionaries, one per item
         """
-        async with self.get_connection() as conn:
-            try:
-                return await conn.send_command_list(send_cmd=command, timeout=timeout)
-            except ConnectionError as e:
-                # Stale/half-open connection — reconnect and retry once
-                logger.debug(f"List command failed ({e}), reconnecting and retrying...")
-                await conn.close()
-                if not await conn.connect():
-                    raise ConnectionError("Failed to reconnect to MPD")
-                return await conn.send_command_list(send_cmd=command, timeout=timeout)
+        last_exc: Exception | None = None
+        for attempt in (1, 2, 3):
+            async with self.get_connection() as conn:
+                try:
+                    return await conn.send_command_list(send_cmd=command, timeout=timeout)
+                except ConnectionError as exc:
+                    last_exc = exc
+                    logger.debug(f"List command failed ({exc}), reconnecting and retrying (attempt {attempt}/3)...")
+                    await conn.close()
+                    if attempt < 3:
+                        await asyncio.sleep(0.05 * attempt)
+                        continue
+        raise ConnectionError(f"MPD list command failed after retries: {last_exc}")

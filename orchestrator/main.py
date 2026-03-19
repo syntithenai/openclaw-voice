@@ -2005,6 +2005,7 @@ async def run_orchestrator() -> None:
                         asyncio.create_task(_ui_refresh_music_state("music_load_playlist"))
                     except Exception as exc:
                         logger.warning("Web UI music_load_playlist '%s': %s", name, exc)
+                        raise
 
             async def _ui_music_save_playlist(name: str, client_id: str) -> None:
                 if music_manager:

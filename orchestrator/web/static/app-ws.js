@@ -1,4 +1,11 @@
 function handleMsg(msg){
+  // Debug logging for music actions
+  if(msg.type && msg.type.startsWith('music_')) console.log(`📥 Received message type="${msg.type}"`, {queue_len: Array.isArray(msg.music_queue) ? msg.music_queue.length : 'N/A', rev: msg.music_rev, action_ack: msg.action_ack});
+  
+  // Timing instrumentation for large playlists
+  const isLargePlaylist = Array.isArray(msg.music_queue) && msg.music_queue.length > 50;
+  if (isLargePlaylist) console.time('🎵 music_queue render');
+  
   switch(msg.type){
     case 'hello': break;
     case 'state_snapshot':
@@ -25,6 +32,7 @@ function handleMsg(msg){
     if(Array.isArray(msg.music_queue)){
         S.musicQueue=msg.music_queue;
         syncMusicFromQueue();
+        if(msg.music_queue.length > 50) console.time('🎵 state_snapshot page render');
     }
     if(Array.isArray(msg.music_playlists)) S.musicPlaylists = msg.music_playlists;
     if(msg.music_rev!==undefined) S.lastMusicRev=Math.max(S.lastMusicRev, Number(msg.music_rev)||0);
@@ -34,7 +42,15 @@ function handleMsg(msg){
             if(S.page==='music' && (!Array.isArray(S.musicPlaylists) || S.musicPlaylists.length===0)){
                 sendAction({type:'music_list_playlists'});
             }
-            renderPage();
+            if(S.page==='music' && S.musicQueue && S.musicQueue.length > 50) {
+                const t0 = performance.now();
+                renderPage();
+                const elapsed = performance.now() - t0;
+                console.timeEnd('🎵 state_snapshot page render');
+                console.log(`  → renderPage: ${elapsed.toFixed(1)}ms for ${S.musicQueue.length} queue items`);
+            } else {
+                renderPage();
+            }
       break;
     case 'orchestrator_status':
         if(msg.status_rev!==undefined){
@@ -96,11 +112,20 @@ function handleMsg(msg){
                 if(rev<=S.lastMusicRev) break;
                 S.lastMusicRev=rev;
             }
+            if(S._musicStateRetryTimer){
+                clearTimeout(S._musicStateRetryTimer);
+                S._musicStateRetryTimer = null;
+            }
             if(msg.queue!==undefined){
                 S.musicQueue=msg.queue;
                 syncMusicFromQueue();
             }
-            if(S.page==='music') renderMusicPage(document.getElementById('main'));
+            if(S.page==='music') {
+                const t0 = performance.now();
+                renderMusicPage(document.getElementById('main'));
+                const elapsed = performance.now() - t0;
+                if(msg.queue && msg.queue.length > 50) console.timeEnd('🎵 music_queue render'), console.log(`  → renderMusicPage: ${elapsed.toFixed(1)}ms for ${msg.queue.length} items`);
+            }
             applyMusicHeader();
             break;
         case 'music_state':
@@ -128,6 +153,9 @@ function handleMsg(msg){
             if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
             S.musicActionError='';
             S.musicActionErrorTs=0;
+            if(String(msg.action||'')==='music_load_playlist'){
+                requestMusicStateRetry('music_load_playlist ack', 8, 600);
+            }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
             break;
@@ -147,13 +175,12 @@ function handleMsg(msg){
             }
             S.musicAddSearchPending = false;
             S.musicAddPendingQuery = '';
+            if(msg.error){
+                recordInlineError('music', 'library_search', String(msg.error||'Music search failed'));
+            }
             if(Array.isArray(msg.results)){
                 S.musicLibraryResults = msg.results;
                 S.musicAddSelection = {};
-                (msg.results||[]).forEach(item=>{
-                    const file=String((item&&item.file)||'').trim();
-                    if(file) S.musicAddSelection[file] = true;
-                });
                 S.musicAddLastCheckedFile='';
             }
             if(S.page==='music' && S.musicAddMode) renderMusicPage(document.getElementById('main'));
@@ -228,6 +255,25 @@ function handleMsg(msg){
                 playFeedbackSound(msg.audio_b64, msg.gain||1.0);
                 break;
   }
+}
+
+function requestMusicStateRetry(reason, attempts=6, delayMs=500){
+    let remaining = Math.max(1, Number(attempts)||1);
+    const delay = Math.max(100, Number(delayMs)||500);
+    if(S._musicStateRetryTimer){
+        clearTimeout(S._musicStateRetryTimer);
+        S._musicStateRetryTimer = null;
+    }
+    const tick = ()=>{
+        if(remaining<=0) return;
+        remaining -= 1;
+        sendAction({type:'music_get_state'});
+        if(remaining>0){
+            S._musicStateRetryTimer = setTimeout(tick, delay);
+        }
+    };
+    console.log(`🔄 Requesting music_get_state retries (${reason}, attempts=${attempts}, delay=${delay}ms)`);
+    tick();
 }
 
 async function playFeedbackSound(b64, gain) {

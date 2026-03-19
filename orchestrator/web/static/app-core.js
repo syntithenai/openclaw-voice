@@ -6,6 +6,8 @@ const SERVER_INSTANCE_ID = String(RUNTIME.serverInstanceId || '');
 const PREF_TTS_MUTED = 'openclaw.ui.ttsMuted';
 const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
 const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
+const PREF_MUSIC_QUEUE_FILTER = 'openclaw.ui.musicQueueFilter';
+const PREF_MUSIC_PLAYLIST_FILTER = 'openclaw.ui.musicPlaylistFilter';
 const CHAT_CACHE_VERSION = 1;
 const PENDING_ACTION_TIMEOUT_MS = 8000;
 const INLINE_ERROR_TTL_MS = 7000;
@@ -22,7 +24,7 @@ const S = {
         chatDeleteModalOpen:false, chatDeleteTargetId:'', chatDeleteTargetTitle:'',
         chatFollowLatest:true,
     musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
-        musicQueueFilter:'', musicQueueSelectionByIds:{}, musicQueueLastCheckedId:null,
+        musicQueueFilter:'', musicPlaylistFilter:'', musicQueueSelectionByIds:{}, musicQueueLastCheckedId:null,
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
         musicAddSearchPending:false, musicAddPendingQuery:'',
         musicNewPlaylistName:'',
@@ -71,6 +73,17 @@ function readBoolPref(key, fallback){
 
 function writeBoolPref(key, value){
     try { localStorage.setItem(key, value ? 'true' : 'false'); } catch(_) {}
+}
+
+function readStringPref(key, fallback){
+    try {
+        const raw = localStorage.getItem(key);
+        return (raw === null || raw === undefined) ? (fallback||'') : String(raw);
+    } catch(_) { return fallback||''; }
+}
+
+function writeStringPref(key, value){
+    try { localStorage.setItem(key, String(value||'')); } catch(_) {}
 }
 
 function canSearchMusicLibrary(query){
@@ -163,6 +176,8 @@ function loadUiPrefs(){
     S.ttsMuted = readBoolPref(PREF_TTS_MUTED, true);
     S.browserAudioEnabled = readBoolPref(PREF_BROWSER_AUDIO, true);
     S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
+    S.musicQueueFilter = readStringPref(PREF_MUSIC_QUEUE_FILTER, '');
+    S.musicPlaylistFilter = readStringPref(PREF_MUSIC_PLAYLIST_FILTER, '');
 }
 
 function pushUiPrefsToServer(){

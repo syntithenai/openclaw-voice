@@ -163,6 +163,13 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const addQuickAddBtn = target.closest('[data-action="music-add-quick-add"]');
+    if (addQuickAddBtn) {
+        const file = String(addQuickAddBtn.dataset.file || '').trim();
+        if(file) sendMusicAction('music_add_files', {files:[file]});
+        return;
+    }
+
     const selectAllBtn = target.closest('[data-action="music-select-all"]');
     if (selectAllBtn) {
         const boxes=[...document.querySelectorAll('[data-action="music-queue-select"]')];
@@ -312,8 +319,10 @@ document.addEventListener('click', e => {
     if (loadPlaylistBtn) {
         const name = String(loadPlaylistBtn.dataset.playlistName || '').trim();
         if(name){
+            console.log(`🎵 Loading playlist: "${name}"`);
             S.music.loaded_playlist = name;
             sendMusicAction('music_load_playlist', {name});
+            console.log(`✓ Sent music_load_playlist action for "${name}"`);
         }
         return;
     }
@@ -385,11 +394,17 @@ document.addEventListener('keydown', e => {
     submitMusicLibrarySearch();
 });
 
-document.addEventListener('input', e => {
-    const t = e.target;
+function handleTextInputChange(t){
     if(!t) return;
     if(t.id==='musicQueueSearch'){
         S.musicQueueFilter = String(t.value||'');
+        writeStringPref(PREF_MUSIC_QUEUE_FILTER, S.musicQueueFilter);
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }
+    if(t.id==='musicPlaylistSearch'){
+        S.musicPlaylistFilter = String(t.value||'');
+        writeStringPref(PREF_MUSIC_PLAYLIST_FILTER, S.musicPlaylistFilter);
         renderMusicPage(document.getElementById('main'));
         return;
     }
@@ -423,6 +438,14 @@ document.addEventListener('input', e => {
         S.musicPlaylistModalName = String(t.value||'');
         return;
     }
+}
+
+document.addEventListener('input', e => {
+    handleTextInputChange(e.target);
+});
+
+document.addEventListener('search', e => {
+    handleTextInputChange(e.target);
 });
 
 function applyMicState(){
@@ -570,7 +593,7 @@ function renderHomePage(main){
             +'<div class="'+sidebarInnerClass+' h-full flex flex-col">'
                 +'<div class="px-0 py-3 text-xs uppercase tracking-wide text-gray-400 border-b border-gray-800">Previous chats</div>'
                 +'<div class="px-2 py-2 border-b border-gray-800">'
-                    +'<input id="chatThreadSearch" type="text" value="'+esc(S.chatThreadFilter||'')+'" placeholder="Search chats" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+                    +'<input id="chatThreadSearch" type="search" value="'+esc(S.chatThreadFilter||'')+'" placeholder="Search chats" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
                 +'</div>'
                 +'<div id="chatThreadList" class="flex-1 overflow-y-auto p-0 space-y-0"></div>'
             +'</div>'
