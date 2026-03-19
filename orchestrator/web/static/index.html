@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>OpenClaw Voice</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <script>
+    if (window.tailwind) {
+      tailwind.config = {
+        darkMode: 'class',
+        theme: { extend: { colors: {
+          gray: { 950: '#0f1117', 900: '#171b26', 800: '#242a3b', 700: '#2f3548' }
+        } } }
+      };
+    }
+  </script>
+  <link rel="stylesheet" href="/app-base.css" />
+  <link rel="stylesheet" href="/app-layout.css" />
+  <link rel="stylesheet" href="/app-chat.css" />
+  <link rel="stylesheet" href="/app-music.css" />
+</head>
+<body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden">
+
+<header class="flex items-center justify-between px-3 h-14 bg-gray-900 border-b border-gray-800 flex-none gap-2 z-10">
+  <div class="flex items-center gap-2 flex-none" id="menuWrap">
+    <nav class="hidden sm:flex items-center gap-1" aria-label="Primary">
+      <a href="#/home" class="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-700 text-sm" data-nav="home" title="Home" aria-label="Home">
+        <span aria-hidden="true">🏠</span>
+        <span class="hidden lg:inline">Home</span>
+      </a>
+      <a href="#/music" class="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-700 text-sm" data-nav="music" title="Music" aria-label="Music">
+        <span aria-hidden="true">🎵</span>
+        <span class="hidden lg:inline">Music</span>
+      </a>
+    </nav>
+    <button id="menuBtn" class="p-2 rounded-lg hover:bg-gray-700 transition-colors sm:hidden" title="Menu">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/>
+      </svg>
+    </button>
+    <div id="menuDropdown" class="hidden absolute left-0 top-11 w-44 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-50 py-1 sm:hidden">
+      <a href="#/home" class="flex items-center gap-2 px-4 py-2.5 hover:bg-gray-700 text-sm" data-nav="home">🏠 Home</a>
+      <a href="#/music" class="flex items-center gap-2 px-4 py-2.5 hover:bg-gray-700 text-sm" data-nav="music">🎵 Music</a>
+    </div>
+  </div>
+
+  <div id="musicHeader" class="hidden flex-1 flex items-center gap-2 min-w-0 px-2">
+    <button id="musicToggleBtn" class="flex-none w-11 h-11 flex items-center justify-center rounded-full bg-gray-700 hover:bg-gray-600 transition-colors text-base" title="Play/Pause">&#9654;</button>
+    <div class="min-w-0">
+      <div id="musicTitle" class="text-sm font-medium truncate text-white">&#8212;</div>
+      <div id="musicArtist" class="text-xs text-gray-400 truncate">&#8212;</div>
+    </div>
+  </div>
+
+  <div class="relative flex items-center flex-none gap-3" id="micControlWrap">
+    <button id="micBtn" class="mic-btn w-11 h-11 flex items-center justify-center font-bold text-xl rounded-full border-4 border-transparent" title="Microphone">&#127908;</button>
+    <button id="micMenuBtn" class="w-7 h-7 flex items-center justify-center rounded-full text-gray-300 bg-gray-800/60 border border-gray-700 hover:bg-gray-700 transition-colors" title="Microphone options">&#9662;</button>
+    <div id="micControlDropdown" class="hidden absolute right-0 top-12 w-72 bg-gray-800 border border-gray-700 rounded-xl shadow-xl z-50 p-2 flex flex-col gap-2">
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="ttsMuteLabel" class="text-xs text-gray-300">Mute TTS output</span>
+        <button id="ttsMuteToggle" data-action="toggle-tts-mute" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
+      </div>
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="browserAudioLabel" class="text-xs text-gray-300">Browser audio streaming</span>
+        <button id="browserAudioToggle" data-action="toggle-browser-audio" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
+      </div>
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="continuousModeLabel" class="text-xs text-gray-300">Continuous mode</span>
+        <button id="continuousModeToggle" data-action="toggle-continuous-mode" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
+      </div>
+    </div>
+  </div>
+</header>
+
+<div id="wsDebugBanner" class="hidden flex-none relative overflow-hidden text-[11px] border-b border-gray-800 select-none bg-gray-900/95 text-gray-100" role="button" tabindex="0" onclick="onTopMusicProgressClick(event)" onkeydown="if(event.key==='Enter'||event.key===' ')onTopMusicProgressClick(event)">
+  <div id="wsProgressFill" class="absolute inset-y-0 left-0 pointer-events-none bg-blue-700/45" style="width:0%;transition:width .12s linear;"></div>
+  <span id="wsDebugText" class="relative z-10 block px-3 py-1 text-left">0:00 / 0:00</span>
+</div>
+<div id="timerBar" class="hidden flex-none px-3 py-2 bg-amber-950/60 border-b border-amber-800/50 flex gap-2 flex-wrap items-center text-sm"></div>
+<div id="scrollUpWrap" class="hidden flex-none justify-center pt-2 pb-1">
+  <button id="scrollUpBtn" data-action="page-scroll-up" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll up</button>
+</div>
+
+<main id="main" class="flex-1 overflow-y-auto min-h-0"></main>
+<div id="chatComposerDock" class="hidden flex-none border-t border-gray-800 bg-gray-900 px-3 py-2 z-10">
+  <div id="scrollDownWrap" class="hidden justify-center pb-2">
+    <button id="scrollDownBtn" data-action="chat-scroll-down" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll down</button>
+  </div>
+  <form id="chatComposer" class="flex items-center gap-2">
+    <input id="chatInput" type="text" placeholder="Type a message" class="flex-1 min-w-0 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />
+    <button id="chatSendBtn" type="submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Send</button>
+  </form>
+</div>
+
+<script>
+  window.__OPENCLAW_RUNTIME__ = {
+    wsPort: __WS_PORT__,
+    micStartsDisabled: __MIC_STARTS_DISABLED__,
+    audioAuthority: '__AUDIO_AUTHORITY__',
+    serverInstanceId: '__SERVER_INSTANCE_ID__',
+  };
+</script>
+<script src="/app-core.js"></script>
+<script src="/app-events.js"></script>
+<script src="/app-render.js"></script>
+<script src="/app-ws.js"></script>
+
+</body>
+</html>

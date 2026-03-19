@@ -1,0 +1,4 @@
+.mermaidchart-shell { background:#1e2436; border:1px solid #3f4a64; border-radius:10px; padding:0.8em; overflow:auto; }
+.mermaidchart-label { font-size:0.68rem; letter-spacing:0.08em; text-transform:uppercase; color:#9aa3c0; margin-bottom:0.65em; }
+.mermaidchart-shell svg { display:block; max-width:100%; height:auto; margin:0 auto; }
+.mermaidchart-error { color:#fca5a5; }

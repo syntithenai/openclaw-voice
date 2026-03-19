@@ -268,6 +268,13 @@ class VoiceConfig(BaseSettings):
     web_ui_ssl_certfile: str = Field("")  # Path to TLS certificate file (PEM); empty = plain HTTP
     web_ui_ssl_keyfile: str = Field("")   # Path to TLS private key file (PEM)
     web_ui_http_redirect_port: int = Field(0)  # Port for HTTP→HTTPS redirector (0 = disabled)
+    web_ui_static_root: str = Field("orchestrator/web/static")  # Root directory for embedded web UI static assets
+    web_ui_workspace_files_enabled: bool = Field(False)  # Serve files under /files/workspace
+    web_ui_workspace_files_root: str = Field("")  # Root directory for /files/workspace; empty = OPENCLAW_WORKSPACE_DIR
+    web_ui_workspace_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/workspace
+    web_ui_media_files_enabled: bool = Field(False)  # Serve files under /files/media
+    web_ui_media_files_root: str = Field("")  # Root directory for /files/media
+    web_ui_media_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/media
 
     # Tool System
     tools_enabled: bool = Field(True)  # Enable timer/alarm tool system

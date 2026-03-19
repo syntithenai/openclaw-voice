@@ -1877,6 +1877,13 @@ async def run_orchestrator() -> None:
                     )
 
             async def _ui_refresh_music_state(source: str) -> None:
+                """Refresh music state on UI.
+                
+                IMPORTANT: This function does NOT block on fetching the full queue.
+                It publishes transport state (play/pause/elapsed) immediately (non-blocking),
+                then fetches the queue asynchronously in the background.
+                This ensures music control actions respond instantly (< 100ms).
+                """
                 if not music_manager or not web_service:
                     return
                 try:
@@ -1885,14 +1892,18 @@ async def run_orchestrator() -> None:
                     logger.warning("Web UI %s transport refresh failed: %s", source, exc)
                     return
 
-                try:
-                    q = await music_manager.get_ui_playlist()
-                except Exception as exc:
-                    logger.warning("Web UI %s queue refresh failed; keeping prior queue: %s", source, exc)
-                    web_service.update_music_transport(**ms)
-                    return
-
-                web_service.update_music_state(queue=q, **ms)
+                # Publish transport state immediately (non-blocking) so UI responds instantly to actions
+                web_service.update_music_transport(**ms)
+                
+                # Fetch and publish queue asynchronously without blocking the action response
+                async def _fetch_and_publish_queue() -> None:
+                    try:
+                        q = await music_manager.get_ui_playlist()
+                        web_service.update_music_queue(q)
+                    except Exception as exc:
+                        logger.debug("Web UI %s queue refresh failed: %s", source, exc)
+                
+                asyncio.create_task(_fetch_and_publish_queue())
 
             async def _ui_get_music_state_snapshot() -> tuple[dict[str, Any], list[dict[str, Any]]]:
                 if not music_manager:
@@ -1910,7 +1921,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.toggle_playback()
-                        await _ui_refresh_music_state("music_toggle")
+                        asyncio.create_task(_ui_refresh_music_state("music_toggle"))
                     except Exception as exc:
                         logger.warning("Web UI music_toggle: %s", exc)
 
@@ -1918,7 +1929,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.stop()
-                        await _ui_refresh_music_state("music_stop")
+                        asyncio.create_task(_ui_refresh_music_state("music_stop"))
                     except Exception as exc:
                         logger.warning("Web UI music_stop: %s", exc)
 
@@ -1926,7 +1937,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.play(position)
-                        await _ui_refresh_music_state("music_play_track")
+                        asyncio.create_task(_ui_refresh_music_state("music_play_track"))
                     except Exception as exc:
                         logger.warning("Web UI music_play_track pos=%d: %s", position, exc)
 
@@ -1934,7 +1945,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.seek_to(seconds)
-                        await _ui_refresh_music_state("music_seek")
+                        asyncio.create_task(_ui_refresh_music_state("music_seek"))
                     except Exception as exc:
                         logger.warning("Web UI music_seek seconds=%s: %s", seconds, exc)
 

@@ -1,0 +1,383 @@
+const RUNTIME = window.__OPENCLAW_RUNTIME__ || {};
+const WS_PORT = Number(RUNTIME.wsPort || 0);
+const MIC_STARTS_DISABLED = !!RUNTIME.micStartsDisabled;
+const AUDIO_AUTHORITY = String(RUNTIME.audioAuthority || 'native');
+const SERVER_INSTANCE_ID = String(RUNTIME.serverInstanceId || '');
+const PREF_TTS_MUTED = 'openclaw.ui.ttsMuted';
+const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
+const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
+const CHAT_CACHE_VERSION = 1;
+const PENDING_ACTION_TIMEOUT_MS = 8000;
+const INLINE_ERROR_TTL_MS = 7000;
+const MUSIC_LIBRARY_SEARCH_MIN_LEN = 3;
+const WS_RECONNECT_MS = 1500;
+
+const S = {
+  ws:null, wsConnected:false,
+  micEnabled:!MIC_STARTS_DISABLED,
+  voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
+    chat:[], music:{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''},
+    chatThreads:[], activeChatId:'active', selectedChatId:'active', chatSidebarOpen:true,
+                chatThreadFilter:'',
+        chatDeleteModalOpen:false, chatDeleteTargetId:'', chatDeleteTargetTitle:'',
+        chatFollowLatest:true,
+    musicQueue:[], musicPlaylists:[], musicLibraryResults:[],
+        musicQueueFilter:'', musicQueueSelectionByIds:{}, musicQueueLastCheckedId:null,
+        musicAddMode:false, musicAddQuery:'', musicAddSelection:{}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
+        musicAddSearchPending:false, musicAddPendingQuery:'',
+        musicNewPlaylistName:'',
+        musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'',
+        timers:[], page:'home',
+    audioCtx:null, mediaStream:null, processor:null, lastLevel:0,
+    feedbackAudioCtx:null,
+    captureWorkletModuleReady:false,
+    ttsMuted:true, browserAudioEnabled:true, continuousMode:false,
+    pendingChatSends:new Set(), nextClientMsgId:1,
+    nextMusicActionId:1, pendingMusicActions:{},
+    nextTimerActionId:1, pendingTimerActions:{},
+    nextSettingActionId:1, pendingSettingActions:{},
+    settingActionErrors:{}, timerActionErrors:{},
+    musicActionError:'', musicActionErrorTs:0,
+    lastStatusRev:0, lastMusicRev:0, lastTimersRev:0, lastUiControlRev:0,
+    wsDebug:{ status:'init', lastCloseCode:null, lastCloseReason:'', lastError:'' },
+    wsManualDisconnect:false, wsReconnectTimer:null,
+    wsPingTimer:null,
+    captureRetryTimer:null,
+    lastAudioInputCount:null,
+    scrollToBottomPending:false,
+    autoScrollUntilTs:0,
+};
+
+function applyToggle(btn, enabled){
+        if(!btn) return;
+        btn.classList.toggle('bg-emerald-700', !!enabled);
+        btn.classList.toggle('border-emerald-500', !!enabled);
+        btn.classList.toggle('bg-gray-700', !enabled);
+        btn.classList.toggle('border-gray-600', !enabled);
+        const knob=btn.querySelector('span');
+        if(knob) knob.style.transform = enabled ? 'translateX(18px)' : 'translateX(0px)';
+        btn.setAttribute('aria-checked', enabled ? 'true' : 'false');
+}
+
+function readBoolPref(key, fallback){
+    try {
+        const raw = localStorage.getItem(key);
+        if (raw === null || raw === undefined || raw === '') return !!fallback;
+        return String(raw).toLowerCase() === 'true';
+    } catch(_) {
+        return !!fallback;
+    }
+}
+
+function writeBoolPref(key, value){
+    try { localStorage.setItem(key, value ? 'true' : 'false'); } catch(_) {}
+}
+
+function canSearchMusicLibrary(query){
+    return String(query||'').trim().length >= MUSIC_LIBRARY_SEARCH_MIN_LEN;
+}
+
+function submitMusicLibrarySearch(){
+    const query = String(S.musicAddQuery||'').trim();
+    if(!canSearchMusicLibrary(query)) return;
+    S.musicAddHasSearched = true;
+    S.musicAddSearchPending = true;
+    S.musicAddPendingQuery = query;
+    S.musicLibraryResults = [];
+    if(S.page==='music' && S.musicAddMode) renderMusicPage(document.getElementById('main'));
+    sendAction({type:'music_search_library', query});
+}
+
+function getChatCacheKey(){
+    return 'openclaw.ui.chatCache.v'+CHAT_CACHE_VERSION+'::'+location.origin+'::'+WS_PORT;
+}
+
+function normalizeChatMessage(m){
+    if(!m || typeof m!=='object') return null;
+    const msg=Object.assign({}, m);
+    if(msg.id===undefined||msg.id===null) msg.id = 'msg-'+Math.random().toString(36).slice(2,10);
+    if(msg.ts===undefined||msg.ts===null) msg.ts = Date.now()/1000;
+    return msg;
+}
+
+function normalizeChatThread(t){
+    if(!t || typeof t!=='object') return null;
+    const thread=Object.assign({}, t);
+    thread.id = String(thread.id || ('thread-'+Math.random().toString(36).slice(2,10)));
+    thread.title = String(thread.title || 'Untitled');
+    thread.messages = Array.isArray(thread.messages) ? thread.messages.map(normalizeChatMessage).filter(Boolean) : [];
+    const now = Date.now()/1000;
+    thread.created_ts = Number(thread.created_ts || thread.updated_ts || now) || now;
+    thread.updated_ts = Number(thread.updated_ts || thread.created_ts || now) || now;
+    return thread;
+}
+
+function mergeChatThreads(serverThreads, cachedThreads){
+    const merged = new Map();
+    (Array.isArray(cachedThreads)?cachedThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>merged.set(t.id, t));
+    (Array.isArray(serverThreads)?serverThreads:[]).map(normalizeChatThread).filter(Boolean).forEach(t=>{
+        const existing = merged.get(t.id);
+        if(!existing || Number(t.updated_ts||0) >= Number(existing.updated_ts||0)) merged.set(t.id, t);
+    });
+    return [...merged.values()].sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));
+}
+
+function persistChatCache(){
+    try {
+        const payload = {
+            version: CHAT_CACHE_VERSION,
+            saved_ts: Date.now()/1000,
+            activeChatId: String(S.activeChatId||'active'),
+            selectedChatId: String(S.selectedChatId||'active'),
+            chat: (Array.isArray(S.chat)?S.chat:[]).map(normalizeChatMessage).filter(Boolean),
+            chatThreads: (Array.isArray(S.chatThreads)?S.chatThreads:[]).map(normalizeChatThread).filter(Boolean),
+        };
+        localStorage.setItem(getChatCacheKey(), JSON.stringify(payload));
+    } catch(_) {}
+}
+
+function hydrateChatCache(){
+    try {
+        const raw = localStorage.getItem(getChatCacheKey());
+        if(!raw) return;
+        const data = JSON.parse(raw);
+        if(!data || typeof data!=='object') return;
+        if(Array.isArray(data.chat)) S.chat = data.chat.map(normalizeChatMessage).filter(Boolean);
+        if(Array.isArray(data.chatThreads)) S.chatThreads = data.chatThreads.map(normalizeChatThread).filter(Boolean);
+        if(data.activeChatId) S.activeChatId = String(data.activeChatId);
+        if(data.selectedChatId) S.selectedChatId = String(data.selectedChatId);
+    } catch(_) {}
+}
+
+function applyServerChatState(chat, chatThreads, activeChatId){
+    if(Array.isArray(chat)) S.chat = chat.map(normalizeChatMessage).filter(Boolean);
+    if(Array.isArray(chatThreads)) S.chatThreads = mergeChatThreads(chatThreads, S.chatThreads);
+    if(activeChatId) S.activeChatId = String(activeChatId);
+    if(!S.selectedChatId) S.selectedChatId = 'active';
+    const selected = String(S.selectedChatId||'active');
+    if(selected!=='active' && !(S.chatThreads||[]).some(t=>String(t.id||'')===selected)) S.selectedChatId = 'active';
+    persistChatCache();
+}
+
+function loadUiPrefs(){
+    S.ttsMuted = readBoolPref(PREF_TTS_MUTED, true);
+    S.browserAudioEnabled = readBoolPref(PREF_BROWSER_AUDIO, true);
+    S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
+}
+
+function pushUiPrefsToServer(){
+    if(!S.ws || S.ws.readyState!==WebSocket.OPEN) return;
+    if(!S.pendingSettingActions['tts_mute_set']) sendSettingAction('tts_mute_set', !!S.ttsMuted);
+    if(!S.pendingSettingActions['browser_audio_set']) sendSettingAction('browser_audio_set', !!S.browserAudioEnabled);
+    if(!S.pendingSettingActions['continuous_mode_set']) sendSettingAction('continuous_mode_set', !!S.continuousMode);
+}
+
+function applyMicControlToggles(){
+        applyToggle(document.getElementById('ttsMuteToggle'), !!S.ttsMuted);
+        applyToggle(document.getElementById('browserAudioToggle'), !!S.browserAudioEnabled);
+        applyToggle(document.getElementById('continuousModeToggle'), !!S.continuousMode);
+    const ttsBtn=document.getElementById('ttsMuteToggle');
+    const browserBtn=document.getElementById('browserAudioToggle');
+    const contBtn=document.getElementById('continuousModeToggle');
+    const pend=S.pendingSettingActions||{};
+    const ttsPending=!!pend['tts_mute_set'];
+    const browserPending=!!pend['browser_audio_set'];
+    const contPending=!!pend['continuous_mode_set'];
+    [[ttsBtn,ttsPending],[browserBtn,browserPending],[contBtn,contPending]].forEach(([btn,pending])=>{ if(!btn) return; btn.disabled=!!pending; btn.classList.toggle('opacity-60',!!pending); btn.classList.toggle('cursor-not-allowed',!!pending); });
+    const ttsErr=(S.settingActionErrors&&S.settingActionErrors['tts_mute_set'])?S.settingActionErrors['tts_mute_set'].msg:'';
+    const browserErr=(S.settingActionErrors&&S.settingActionErrors['browser_audio_set'])?S.settingActionErrors['browser_audio_set'].msg:'';
+    const contErr=(S.settingActionErrors&&S.settingActionErrors['continuous_mode_set'])?S.settingActionErrors['continuous_mode_set'].msg:'';
+    const ttsLabel=document.getElementById('ttsMuteLabel');
+    const browserLabel=document.getElementById('browserAudioLabel');
+    const contLabel=document.getElementById('continuousModeLabel');
+    if(ttsLabel) ttsLabel.textContent='Mute TTS output'+(ttsErr?' ⚠ '+ttsErr:'');
+    if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:'');
+    if(contLabel) contLabel.textContent='Continuous mode'+(contErr?' ⚠ '+contErr:'');
+}
+
+function formatMusicTime(seconds){
+    const safe=Math.max(0, Math.floor(Number(seconds)||0));
+    const mm=Math.floor(safe/60);
+    const ss=String(safe%60).padStart(2,'0');
+    return mm+':'+ss;
+}
+
+function getEffectiveMusicElapsed(){
+    const base=Math.max(0, Number(S.music && S.music.elapsed) || 0);
+    const duration=Math.max(0, Number(S.music && S.music.duration) || 0);
+    const state=String((S.music&&S.music.state)||'').toLowerCase();
+    if(state!=='play' || !S.music || !S.music._clientElapsedAnchorTs) return Math.min(base, duration||base);
+    const delta=Math.max(0, (Date.now()-Number(S.music._clientElapsedAnchorTs||Date.now()))/1000);
+    const predicted=base+delta;
+    if(duration>0) return Math.min(duration, predicted);
+    return predicted;
+}
+
+function onTopMusicProgressClick(event){
+    if(!S.music) return;
+    const duration=Math.max(0, Number(S.music.duration)||0);
+    if(duration<=0) return;
+    if(!(S.ws&&S.ws.readyState===WebSocket.OPEN)) return;
+    const bar=document.getElementById('wsDebugBanner');
+    if(!bar) return;
+    const rect=bar.getBoundingClientRect();
+    if(!rect || rect.width<=0) return;
+    const pointerX=Number(event&&event.clientX);
+    const fallbackX=rect.width*Math.max(0, Math.min(1, getEffectiveMusicElapsed()/duration));
+    const rawX=Number.isFinite(pointerX) ? (pointerX-rect.left) : fallbackX;
+    const x=Math.min(rect.width, Math.max(0, rawX));
+    const ratio=x/rect.width;
+    const target=Math.max(0, Math.min(duration, duration*ratio));
+    sendMusicAction('music_seek', {seconds: target});
+}
+
+function applyTopMusicProgress(){
+    const bar=document.getElementById('wsDebugBanner');
+    const fill=document.getElementById('wsProgressFill');
+    const text=document.getElementById('wsDebugText');
+    if(!bar || !fill || !text) return;
+    const duration=Math.max(0, Number(S.music && S.music.duration)||0);
+    const state=String((S.music&&S.music.state)||'').toLowerCase();
+    const active=(state==='play'||state==='pause') && duration>0;
+    if(!active){
+        bar.classList.add('hidden');
+        fill.style.width='0%';
+        text.textContent='0:00 / 0:00';
+        return;
+    }
+    bar.classList.remove('hidden');
+    const elapsed=getEffectiveMusicElapsed();
+    const ratio=Math.max(0, Math.min(1, duration>0?(elapsed/duration):0));
+    fill.style.width=(ratio*100).toFixed(2)+'%';
+    text.textContent=formatMusicTime(elapsed)+' / '+formatMusicTime(duration);
+    bar.title='Click to seek';
+}
+
+function updateWsDebugBanner(){
+    applyTopMusicProgress();
+}
+
+function updateMicInteractivity(){
+    const btn=document.getElementById('micBtn');
+    const menuBtn=document.getElementById('micMenuBtn');
+    if(!btn) return;
+    const connected=!!S.wsConnected;
+    btn.disabled=!connected;
+    btn.classList.toggle('opacity-60', !connected);
+    btn.classList.toggle('cursor-not-allowed', !connected);
+    if(menuBtn){
+      menuBtn.disabled=!connected;
+      menuBtn.classList.toggle('opacity-60', !connected);
+      menuBtn.classList.toggle('cursor-not-allowed', !connected);
+    }
+    btn.classList.toggle('bg-gray-700', !connected);
+    btn.classList.toggle('border-gray-500', !connected);
+    if(!connected){
+        btn.title='Microphone disabled: WebSocket not connected';
+    } else {
+        btn.title='Microphone';
+    }
+}
+
+function startWsPingTimer(){
+    if(S.wsPingTimer) clearInterval(S.wsPingTimer);
+    S.wsPingTimer=setInterval(()=>{
+        if(S.ws && S.ws.readyState === WebSocket.OPEN){
+            try { S.ws.send(JSON.stringify({type:'ping'})); } catch(_) {}
+        }
+    }, 30000);
+}
+
+function stopWsPingTimer(){
+    if(S.wsPingTimer){ clearInterval(S.wsPingTimer); S.wsPingTimer=null; }
+}
+
+function updateChatComposerState(){
+    const input=document.getElementById('chatInput');
+    const sendBtn=document.getElementById('chatSendBtn');
+    const isPending=S.pendingChatSends.size>0;
+    if(input){
+        input.disabled=isPending;
+        input.placeholder=isPending?'Sending...':'Type a message';
+    }
+    if(sendBtn){
+        sendBtn.disabled=isPending;
+        sendBtn.classList.toggle('opacity-60',isPending);
+        sendBtn.classList.toggle('cursor-not-allowed',isPending);
+        sendBtn.textContent=isPending?'Sending...':'Send';
+    }
+}
+
+function isChatAtBottom(){
+    const area=document.getElementById('chatArea');
+    if(!area) return true;
+    return (area.scrollTop + area.clientHeight) >= (area.scrollHeight - 8);
+}
+
+function updateScrollDownButton(){
+    const wrap=document.getElementById('scrollDownWrap');
+    if(!wrap) return;
+    const area=document.getElementById('chatArea');
+    if(!area || S.page!=='home'){
+        wrap.classList.add('hidden');
+        wrap.classList.remove('flex');
+        return;
+    }
+    const overflow=area.scrollHeight > (area.clientHeight + 1);
+    const atBottom=isChatAtBottom();
+    const shouldShow=overflow && !atBottom;
+    wrap.classList.toggle('hidden', !shouldShow);
+    wrap.classList.toggle('flex', shouldShow);
+}
+
+function getScrollUpArea(){
+    if(S.page==='home') return document.getElementById('chatArea');
+    if(S.page==='music') return document.getElementById('main');
+    return null;
+}
+
+function updateScrollUpButton(){
+    const wrap=document.getElementById('scrollUpWrap');
+    if(!wrap) return;
+    const area=getScrollUpArea();
+    if(!area){
+        wrap.classList.add('hidden');
+        wrap.classList.remove('flex');
+        return;
+    }
+    const overflow=area.scrollHeight > (area.clientHeight + 1);
+    const partiallyScrolled=area.scrollTop > 8;
+    const shouldShow=overflow && partiallyScrolled;
+    wrap.classList.toggle('hidden', !shouldShow);
+    wrap.classList.toggle('flex', shouldShow);
+}
+
+function scrollCurrentViewUp(){
+    const area=getScrollUpArea();
+    if(!area) return;
+    area.scrollTop=0;
+    updateScrollUpButton();
+    updateScrollDownButton();
+}
+
+function requestScrollToBottomBurst(){
+    S.scrollToBottomPending=true;
+    S.autoScrollUntilTs=Date.now()+12000;
+}
+
+function getPage(){ const h=location.hash.replace('#',''); return h==='/music'?'music':'home'; }
+function navigate(p){ location.hash='#/'+p; }
+function updateNavActiveState(){
+    document.querySelectorAll('[data-nav]').forEach(el=>{
+        const isActive=(el.dataset.nav||'')===S.page;
+        el.classList.toggle('bg-gray-700', isActive);
+        el.classList.toggle('text-white', isActive);
+        el.classList.toggle('text-gray-300', !isActive);
+    });
+}
+window.addEventListener('hashchange',()=>{ S.page=getPage(); renderPage(); updateNavActiveState(); closeMenu(); });
+
+function closeMenu(){ document.getElementById('menuDropdown').classList.add('hidden'); }
+function closeMicControlMenu(){ const m=document.getElementById('micControlDropdown'); if(m) m.classList.add('hidden'); }
+document.getElementById('menuBtn').addEventListener('click',e=>{ e.stopPropagation(); document.getElementById('menuDropdown').classList.toggle('hidden'); });
+document.getElementById('micMenuBtn').addEventListener('click',e=>{ e.stopPropagation(); const m=document.getElementById('micControlDropdown'); if(m) m.classList.toggle('hidden'); });

@@ -5,6 +5,7 @@ This orchestrator can expose a lightweight web UI + WebSocket bridge for continu
 ## What it provides
 
 - Browser microphone capture with continuous streaming to the orchestrator over WebSocket
+- Static UI hosting from `orchestrator/web/static`
 - Browser-side VU meter (local mic level)
 - Realtime orchestrator status indicators:
   - sleep / awake
@@ -24,6 +25,16 @@ Set in your env profile (`.env`, `.env.docker`, or `.env.pi`):
 - `WEB_UI_WS_PORT=18911`
 - `WEB_UI_STATUS_HZ=12`
 - `WEB_UI_HOTWORD_ACTIVE_MS=2000`
+- `WEB_UI_STATIC_ROOT=orchestrator/web/static`
+
+Optional file mounts (no authentication at this stage):
+
+- `WEB_UI_WORKSPACE_FILES_ENABLED=true`
+- `WEB_UI_WORKSPACE_FILES_ROOT=/path/to/workspace`
+- `WEB_UI_WORKSPACE_FILES_ALLOW_LISTING=false`
+- `WEB_UI_MEDIA_FILES_ENABLED=true`
+- `WEB_UI_MEDIA_FILES_ROOT=/path/to/media/library`
+- `WEB_UI_MEDIA_FILES_ALLOW_LISTING=false`
 
 Then restart the native orchestrator.
 
@@ -32,6 +43,8 @@ Then restart the native orchestrator.
 - UI: `http://<host>:<WEB_UI_PORT>/`
 - Health: `http://<host>:<WEB_UI_PORT>/health`
 - WebSocket: `ws://<host>:<WEB_UI_WS_PORT>/ws`
+- Workspace files (optional): `http://<host>:<WEB_UI_PORT>/files/workspace/`
+- Media files (optional): `http://<host>:<WEB_UI_PORT>/files/media/`
 
 ## Embed example
 
