@@ -50,6 +50,7 @@ class MusicRouter:
             "load_playlist": self._handle_load_playlist,
             "save_playlist": self._handle_save_playlist,
             "list_playlists": self._handle_list_playlists,
+            "add_songs": self._handle_add_songs,
             
             # Library management
             "update_library": self._handle_update_library,
@@ -225,6 +226,11 @@ class MusicRouter:
         play_result = await self.manager.play(0)
         return play_result if self._is_error(play_result) else f"Now playing: {name}"
 
+    async def _handle_add_songs(self, query: str, count: int = 5) -> str:
+        """Add songs to existing queue without clearing it."""
+        result = await self.manager.add_songs_to_queue(query, count)
+        return result
+
     async def _handle_load_playlist(self, name: str) -> str:
         """Handle load playlist command."""
         return await self.manager.load_playlist(name)
@@ -291,6 +297,10 @@ class MusicRouter:
             "music_play_playlist": lambda: self._handle_play_playlist(arguments.get("name", "")),
             "music_search": lambda: self._handle_search(arguments.get("query", "")),
             "music_load_playlist": lambda: self.manager.load_playlist(arguments.get("name", "")),
+            "music_add_songs": lambda: self._handle_add_songs(
+                arguments.get("query", ""),
+                int(arguments.get("count", 5)),
+            ),
             "music_update_library": lambda: self.manager.update_library(),
         }
         

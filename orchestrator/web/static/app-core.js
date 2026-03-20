@@ -547,3 +547,54 @@ function closeMenu(){ document.getElementById('menuDropdown').classList.add('hid
 function closeMicControlMenu(){ const m=document.getElementById('micControlDropdown'); if(m) m.classList.add('hidden'); }
 document.getElementById('menuBtn').addEventListener('click',e=>{ e.stopPropagation(); document.getElementById('menuDropdown').classList.toggle('hidden'); });
 document.getElementById('micMenuBtn').addEventListener('click',e=>{ e.stopPropagation(); const m=document.getElementById('micControlDropdown'); if(m) m.classList.toggle('hidden'); });
+
+let S_msgToastTimer=null;
+
+function showMessageToast(message, role) {
+    if (S.page === 'home') return;
+    
+    const container = document.getElementById('msgToastContainer');
+    if (!container) return;
+    
+    // Clear existing toast and timer if any
+    if (S_msgToastTimer) {
+        clearTimeout(S_msgToastTimer);
+        S_msgToastTimer = null;
+    }
+    
+    const existingToast = container.querySelector('.msg-toast');
+    if (existingToast) {
+        existingToast.classList.add('exit');
+        setTimeout(() => {
+            existingToast.remove();
+        }, 300);
+    }
+    
+    const toastEl = document.createElement('div');
+    toastEl.className = 'msg-toast px-3 py-2 rounded-lg text-sm bg-gray-800 border border-gray-700 shadow-lg mb-2';
+    
+    if (role === 'user') {
+        toastEl.classList.add('border-blue-600', 'text-blue-100');
+        toastEl.innerHTML = `<strong class="text-blue-300">You:</strong> ${escapeHtml(message.substring(0, 100))}${message.length > 100 ? '...' : ''}`;
+    } else if (role === 'assistant') {
+        toastEl.classList.add('border-green-600', 'text-green-100');
+        toastEl.innerHTML = `<strong class="text-green-300">Assistant:</strong> ${escapeHtml(message.substring(0, 100))}${message.length > 100 ? '...' : ''}`;
+    }
+    
+    container.appendChild(toastEl);
+    
+    // Auto-hide after 2 seconds
+    S_msgToastTimer = setTimeout(() => {
+        toastEl.classList.add('exit');
+        setTimeout(() => {
+            toastEl.remove();
+            S_msgToastTimer = null;
+        }, 300);
+    }, 2000);
+}
+
+function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+}

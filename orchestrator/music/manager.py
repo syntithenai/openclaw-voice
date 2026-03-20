@@ -383,9 +383,71 @@ class MusicManager:
     
     # ========== Queue Management ==========
 
+    def get_loaded_playlist_name(self) -> str:
+        """Return currently loaded playlist name, if any."""
+        return str(self._loaded_playlist_name or "").strip()
+
     @staticmethod
     def _quote(value: str) -> str:
         return str(value).replace('\\', '\\\\').replace('"', '\\"')
+
+    async def add_songs_to_queue(self, query: str, count: int = 5) -> str:
+        """Append matching songs to the END of the current queue without clearing it.
+
+        Tries a genre-specific MPD search first; falls back to any-field search.
+        Picks up to *count* random tracks from the results.
+        """
+        import random
+        try:
+            count = max(1, min(50, int(count)))
+            safe_q = str(query or "").strip().replace('"', '\\"')
+            if not safe_q:
+                return "Search query is required"
+
+            limit = count * 10  # fetch a larger pool for random selection
+            tracks: List[Dict[str, str]] = []
+
+            # Try genre-specific search first (most accurate for genre requests)
+            try:
+                rows = await self.pool.execute_list(f'search genre "{safe_q}" window 0:{limit - 1}')
+                if rows:
+                    tracks = rows
+            except Exception:
+                try:
+                    tracks = await self.pool.execute_list(f'search genre "{safe_q}"')
+                except Exception:
+                    pass
+
+            # Fallback: any-field search
+            if not tracks:
+                try:
+                    rows = await self.pool.execute_list(f'search any "{safe_q}" window 0:{limit - 1}')
+                    if rows:
+                        tracks = rows
+                except Exception:
+                    try:
+                        tracks = await self.pool.execute_list(f'search any "{safe_q}"')
+                    except Exception:
+                        pass
+
+            if not tracks:
+                return f"No songs found matching: {query}"
+
+            selected = random.sample(tracks, min(count, len(tracks)))
+            files = [t.get("file", "") for t in selected if t.get("file", "")]
+            if not files:
+                return f"No playable songs found matching: {query}"
+
+            result = await self.add_many_to_queue(files, batch_size=40)
+            if str(result).lower().startswith("error"):
+                return result
+
+            added = len(files)
+            logger.info("\u2795 add_songs_to_queue '%s' count=%d: added %d", query, count, added)
+            return f"Added {added} {'song' if added == 1 else 'songs'} to queue"
+        except Exception as e:
+            logger.error("Failed to add songs to queue '%s': %s", query, e)
+            return f"Error: {e}"
     
     async def clear_queue(self) -> str:
         """Clear the playback queue."""

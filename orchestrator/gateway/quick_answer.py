@@ -1,4 +1,5 @@
 """Quick answer LLM client for fast factual responses."""
+import asyncio
 import logging
 import re
 import httpx
@@ -567,7 +568,7 @@ MUSIC_TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "music_play_genre",
-            "description": "Play music from a specific genre",
+            "description": "Replace the current queue with music from a genre and start playing. Use for 'play some blues', 'play jazz'. Do NOT use when the user says 'add' songs to the queue.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -612,6 +613,27 @@ MUSIC_TOOL_DEFINITIONS = [
                     "query": {
                         "type": "string",
                         "description": "Search query"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "music_add_songs",
+            "description": "Add songs to the END of the current queue without clearing it. Use when the user says 'add X songs', 'add some blues songs', 'put more jazz on', etc. Supports genre, artist, title, or any search term.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Genre, artist, title, or search term (e.g. 'blues', 'jazz', 'Bob Dylan')"
+                    },
+                    "count": {
+                        "type": "integer",
+                        "description": "Number of songs to add (default: 5)"
                     }
                 },
                 "required": ["query"]
@@ -830,38 +852,40 @@ class QuickAnswerClient:
     async def _sync_web_music_state(self) -> None:
         if not (self.web_service and self.music_router and self.music_router.manager):
             return
-        async def _publish_transport() -> None:
-            try:
-                transport = await asyncio.wait_for(
-                    self.music_router.manager.get_ui_music_state(),
-                    timeout=1.5,
-                )
-                # Push transport state immediately so voice-driven actions are reflected right away.
-                self.web_service.update_music_transport(**transport)
-            except Exception as update_exc:
-                logger.debug("Failed to update web music transport: %s", update_exc)
+        manager = self.music_router.manager
 
-        async def _publish_queue_and_playlists() -> None:
+        # Step 1+2: fetch transport and queue concurrently, then push a single
+        # combined state.  This reduces total latency from ~1.5 s + queue fetch
+        # to roughly the slower of the two calls.
+        transport: dict | None = None
+        queue: list[dict] | None = None
+        for attempt in (1, 2, 3):
             try:
-                queue = await asyncio.wait_for(
-                    self.music_router.manager.get_ui_playlist(),
-                    timeout=4.0,
-                )
-                self.web_service.update_music_queue(queue)
-            except Exception as queue_exc:
-                logger.debug("Failed to update web music queue: %s", queue_exc)
+                transport_task = asyncio.wait_for(manager.get_ui_music_state(), timeout=1.5)
+                queue_task = asyncio.wait_for(manager.get_ui_playlist(), timeout=5.0)
+                transport, queue = await asyncio.gather(transport_task, queue_task)
+                # If MPD reports a non‑zero queue length but we got an empty list,
+                # retry a short delay – this can happen when the playlist is still
+                # being materialised.
+                expected_len = int((transport or {}).get("queue_length", 0) or 0)
+                if expected_len > 0 and (queue is None or len(queue) == 0) and attempt < 3:
+                    await asyncio.sleep(0.2 * attempt)
+                    continue
+                if transport is not None:
+                    await self.web_service.push_music_state_now(queue=queue or [], **transport)
+                break
+            except Exception as exc:
+                if attempt == 3:
+                    logger.debug("Failed to push combined music state after retries: %s", exc)
+                else:
+                    await asyncio.sleep(0.3 * attempt)
 
-            try:
-                playlists = await asyncio.wait_for(
-                    self.music_router.manager.list_playlists(),
-                    timeout=3.0,
-                )
-                self.web_service.update_music_playlists(playlists)
-            except Exception as playlists_exc:
-                logger.debug("Failed to update web playlists: %s", playlists_exc)
-
-        asyncio.create_task(_publish_transport())
-        asyncio.create_task(_publish_queue_and_playlists())
+        # Step 3: update playlist sidebar.
+        try:
+            playlists = await asyncio.wait_for(manager.list_playlists(), timeout=3.0)
+            self.web_service.update_music_playlists(playlists)
+        except Exception as playlists_exc:
+            logger.debug("Failed to update web playlists: %s", playlists_exc)
         
     async def get_quick_answer(self, user_query: str, *, chat_history: list[dict] | None = None) -> tuple[bool, str]:
         """
@@ -1016,7 +1040,10 @@ class QuickAnswerClient:
                         await self._emit_music_action_error("music_load_playlist", voice_music_action_id, music_result)
                     else:
                         await self._emit_music_action_ack("music_load_playlist", voice_music_action_id)
-                await self._sync_web_music_state()
+                # Fire-and-forget: ack already sent, client starts polling via
+                # requestMusicStateRetry; state sync runs in background so TTS
+                # is returned to the user without waiting for MPD queue fetch.
+                asyncio.create_task(self._sync_web_music_state())
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
         
@@ -1167,7 +1194,7 @@ class QuickAnswerClient:
                             if func_name.startswith("music_") and self.music_enabled and self.music_router:
                                 voice_music_action_id: str | None = None
                                 voice_action_name: str | None = None
-                                if func_name == "music_load_playlist":
+                                if func_name in ("music_load_playlist", "music_play_playlist"):
                                     voice_action_name = "music_load_playlist"
                                     voice_music_action_id = self._new_voice_music_action_id()
                                     await self._emit_music_action_pending(voice_action_name, voice_music_action_id)
@@ -1179,7 +1206,8 @@ class QuickAnswerClient:
                                         await self._emit_music_action_error(voice_action_name, voice_music_action_id, result)
                                     else:
                                         await self._emit_music_action_ack(voice_action_name, voice_music_action_id)
-                                await self._sync_web_music_state()
+                                # Fire-and-forget (same rationale as fast-path above).
+                                asyncio.create_task(self._sync_web_music_state())
                             elif func_name == "recorder" and self.recorder_enabled and self.recorder_tool:
                                 result = await self.recorder_tool.execute_tool(**args_dict)
                             elif func_name == "start_new_session" and self.new_session_enabled and self.new_session_handler:

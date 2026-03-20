@@ -1944,8 +1944,12 @@ async def run_orchestrator() -> None:
                 try:
                     queue = await music_manager.get_ui_playlist()
                 except Exception as exc:
-                    logger.warning("Web UI snapshot queue fetch failed; reusing last queue: %s", exc)
-                    queue = list(getattr(web_service, "_music_queue", []) if web_service else [])
+                    logger.warning("Web UI snapshot queue fetch failed; retrying with smaller limit: %s", exc)
+                    try:
+                        queue = await music_manager.get_ui_playlist(limit=80)
+                    except Exception as exc2:
+                        logger.warning("Web UI snapshot queue retry failed; sending empty queue: %s", exc2)
+                        queue = []
                 return transport, queue
 
             async def _ui_music_toggle(client_id: str) -> None:
@@ -1986,6 +1990,11 @@ async def run_orchestrator() -> None:
                         result = await music_manager.clear_queue()
                         if str(result).strip().lower().startswith("error:"):
                             raise RuntimeError(result)
+                        loaded_playlist = music_manager.get_loaded_playlist_name()
+                        if loaded_playlist:
+                            save_result = await music_manager.save_playlist(loaded_playlist)
+                            if str(save_result).strip().lower().startswith("error:"):
+                                raise RuntimeError(save_result)
                         asyncio.create_task(_ui_refresh_music_state("music_clear_queue"))
                     except Exception as exc:
                         logger.warning("Web UI music_clear_queue: %s", exc)
@@ -1997,7 +2006,14 @@ async def run_orchestrator() -> None:
             ) -> None:
                 if music_manager:
                     try:
-                        await music_manager.remove_from_queue_positions(positions, song_ids=song_ids)
+                        result = await music_manager.remove_from_queue_positions(positions, song_ids=song_ids)
+                        if str(result).strip().lower().startswith("error:"):
+                            raise RuntimeError(result)
+                        loaded_playlist = music_manager.get_loaded_playlist_name()
+                        if loaded_playlist:
+                            save_result = await music_manager.save_playlist(loaded_playlist)
+                            if str(save_result).strip().lower().startswith("error:"):
+                                raise RuntimeError(save_result)
                         await _ui_refresh_music_state("music_remove_selected")
                     except Exception as exc:
                         logger.warning("Web UI music_remove_selected: %s", exc)
@@ -2008,6 +2024,11 @@ async def run_orchestrator() -> None:
                         result = await music_manager.add_files_to_queue(files)
                         if str(result).strip().lower().startswith("error:"):
                             raise RuntimeError(result)
+                        loaded_playlist = music_manager.get_loaded_playlist_name()
+                        if loaded_playlist:
+                            save_result = await music_manager.save_playlist(loaded_playlist)
+                            if str(save_result).strip().lower().startswith("error:"):
+                                raise RuntimeError(save_result)
                         await _ui_refresh_music_state("music_add_files")
                     except Exception as exc:
                         logger.warning("Web UI music_add_files: %s", exc)

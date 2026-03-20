@@ -72,6 +72,8 @@ function handleMsg(msg){
                 }
                 S.selectedChatId='active';
                 persistChatCache();
+                // Show toast notification on non-home pages
+                if(nextMsg) showMessageToast(String(nextMsg.text || ''), nextMsg.role);
                 if(S.page==='home'){
                     renderThreadList('active');
                     renderChatMessages('active');
@@ -88,6 +90,8 @@ function handleMsg(msg){
                     const idx = S.chat.findIndex(m => m.id === updatedMsg.id);
                     if(idx >= 0){
                         S.chat[idx] = updatedMsg;
+                        // Show toast notification on non-home pages
+                        showMessageToast(String(updatedMsg.text || ''), updatedMsg.role);
                         if(S.page==='home') renderChatMessages('active');
                     }
                 }
@@ -174,7 +178,7 @@ function handleMsg(msg){
             S.musicActionError='';
             S.musicActionErrorTs=0;
             if(String(msg.action||'')==='music_load_playlist'){
-                requestMusicStateRetry('music_load_playlist ack', 8, 600);
+                requestMusicStateRetry('music_load_playlist ack', 20, 750);
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
