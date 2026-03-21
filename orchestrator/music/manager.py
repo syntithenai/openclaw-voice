@@ -18,6 +18,7 @@ import time
 from collections import defaultdict, deque
 from typing import Dict, List, Optional
 from .mpd_client import MPDClientPool
+from orchestrator.observability.latency_trace import emit as emit_latency_trace
 
 logger = logging.getLogger(__name__)
 
@@ -28,11 +29,13 @@ class MusicManager:
     def __init__(
         self,
         pool: MPDClientPool,
+        control_pool: MPDClientPool | None = None,
         genre_queue_limit: int = 120,
         pipewire_stream_normalize_enabled: bool = True,
         pipewire_stream_target_percent: int = 100,
     ):
         self.pool = pool
+        self.control_pool = control_pool if control_pool is not None else pool
         self.genre_queue_limit = max(1, int(genre_queue_limit))
         self.pipewire_stream_normalize_enabled = bool(pipewire_stream_normalize_enabled)
         self.pipewire_stream_target_percent = max(1, min(150, int(pipewire_stream_target_percent)))
@@ -59,6 +62,15 @@ class MusicManager:
         self._fts_indexed_so_far = 0
         self._fts_total_estimate = 0
         self._fts_build_started_ts = 0.0
+        self._playlist_names_cache: list[str] = []
+        self._playlist_names_cache_ts: float = 0.0
+        self._playlist_names_cache_ttl_s: float = 30.0
+
+    async def _control_execute(self, command: str, timeout: float | None = None) -> Dict[str, str]:
+        return await self.control_pool.execute(command, timeout=timeout)
+
+    async def _control_execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
+        return await self.control_pool.execute_list(command, timeout=timeout)
 
     async def _normalize_pipewire_mpd_stream_volume(self) -> None:
         """Best-effort: set PipeWire per-app stream volume for MPD to target percent.
@@ -679,6 +691,10 @@ class MusicManager:
                     f'playlistadd "{self._quote(playlist_name)}" "{self._quote(file_uri)}"'
                 )
 
+            self._playlist_names_cache = [p for p in self._playlist_names_cache if p.lower() != playlist_name.lower()]
+            self._playlist_names_cache.append(playlist_name)
+            self._playlist_names_cache_ts = time.monotonic()
+
             return f"Created playlist '{playlist_name}' with {len(files)} track(s)"
         except Exception as e:
             logger.error(f"Failed to create playlist from queue positions: {e}")
@@ -1002,11 +1018,21 @@ class MusicManager:
     
     async def list_playlists(self) -> List[str]:
         """List available playlists."""
+        now = time.monotonic()
+        if self._playlist_names_cache and (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s:
+            return list(self._playlist_names_cache)
+
         for attempt in (1, 2):
             try:
-                result = await self.pool.execute_list("listplaylists", timeout=8.0)
-                return [item.get("playlist", "") for item in result if "playlist" in item]
+                emit_latency_trace("music_load.list_playlists_start", attempt=attempt)
+                result = await self._control_execute_list("listplaylists", timeout=8.0)
+                emit_latency_trace("music_load.list_playlists_done", attempt=attempt, count=len(result))
+                playlists = [item.get("playlist", "") for item in result if "playlist" in item]
+                self._playlist_names_cache = [p for p in playlists if str(p).strip()]
+                self._playlist_names_cache_ts = time.monotonic()
+                return list(self._playlist_names_cache)
             except Exception as e:
+                emit_latency_trace("music_load.list_playlists_error", attempt=attempt, error=str(e))
                 if attempt == 1:
                     logger.warning(f"list_playlists attempt 1 failed, retrying: {e}")
                     await asyncio.sleep(0.05)
@@ -1014,50 +1040,78 @@ class MusicManager:
                 logger.error(f"Failed to list playlists: {e}")
                 return []
         return []
+
+    async def resolve_playlist_name(self, requested_name: str, refresh_if_miss: bool = True) -> str:
+        """Resolve a playlist name case-insensitively using cache first."""
+        requested = str(requested_name or "").strip()
+        if not requested:
+            return ""
+
+        now = time.monotonic()
+        cached = self._playlist_names_cache if (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s else []
+        for available in cached:
+            if str(available).lower() == requested.lower():
+                return str(available)
+
+        if not refresh_if_miss:
+            return ""
+
+        available_playlists = await self.list_playlists()
+        for available in available_playlists:
+            if str(available).lower() == requested.lower():
+                return str(available)
+        return ""
     
     async def load_playlist(self, name: str) -> str:
         """Load a saved playlist (case-insensitive matching)."""
         # Signal that a playlist load is in progress
         self._loading_playlist_event.clear()
+        emit_latency_trace("music_load.manager_enter", playlist=name)
         
         start_ms = time.monotonic() * 1000
         try:
             playlist_name = str(name or "").strip()
             if not playlist_name:
+                emit_latency_trace("music_load.manager_return", playlist=name, ok=False, reason="empty_playlist_name")
                 self._loading_playlist_event.set()  # Signal load complete (even though it failed)
                 return "Playlist name is required"
 
-            # Find the actual playlist name (case-insensitive matching)
-            # This handles voice commands like "load fred" matching "Fred.m3u" on disk
-            available_playlists = await self.list_playlists()
-            actual_playlist_name = None
-            
-            for available in available_playlists:
-                if available.lower() == playlist_name.lower():
-                    actual_playlist_name = available
-                    break
-            
+            # Fast path: resolve from cache first to avoid MPD list calls on every load.
+            cached = self._playlist_names_cache if (time.monotonic() - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s else []
+            actual_playlist_name = await self.resolve_playlist_name(playlist_name, refresh_if_miss=True)
+            emit_latency_trace(
+                "music_load.cache_lookup",
+                playlist=playlist_name,
+                cache_size=len(cached),
+                hit=bool(actual_playlist_name and any(str(p).lower() == playlist_name.lower() for p in cached)),
+            )
+
             if not actual_playlist_name:
                 self._loading_playlist_event.set()  # Signal load complete
                 logger.warning(
-                    f"Playlist '{playlist_name}' not found. Available: {available_playlists}"
+                    f"Playlist '{playlist_name}' not found. Available: {await self.list_playlists()}"
                 )
                 return f"Error: Playlist '{playlist_name}' not found"
 
             clear_start = time.monotonic() * 1000
-            await self.pool.execute("clear", timeout=8.0)
+            emit_latency_trace("music_load.clear_start", playlist=actual_playlist_name)
+            await self._control_execute("clear", timeout=8.0)
             clear_ms = time.monotonic() * 1000 - clear_start
+            emit_latency_trace("music_load.clear_done", playlist=actual_playlist_name, elapsed_ms=clear_ms)
             
             load_start = time.monotonic() * 1000
             load_ok = False
             last_exc: Exception | None = None
             for attempt in (1, 2):
                 try:
-                    await self.pool.execute(f'load "{self._quote(actual_playlist_name)}"', timeout=25.0)
+                    emit_latency_trace("music_load.load_start", playlist=actual_playlist_name, attempt=attempt)
+                    await self._control_execute(f'load "{self._quote(actual_playlist_name)}"', timeout=25.0)
+                    emit_latency_trace("music_load.load_done", playlist=actual_playlist_name, attempt=attempt, elapsed_ms=(time.monotonic() * 1000 - load_start))
                     load_ok = True
                     break
                 except Exception as exc:
                     last_exc = exc
+                    emit_latency_trace("music_load.load_error", playlist=actual_playlist_name, attempt=attempt, error=str(exc))
                     if attempt == 1:
                         logger.warning("load_playlist first attempt failed for '%s', retrying: %s", actual_playlist_name, exc)
                         await asyncio.sleep(0.05)
@@ -1081,10 +1135,19 @@ class MusicManager:
                 f"📂 Load playlist '{actual_playlist_name}'{case_info}: {total_ms:.1f}ms total "
                 f"(clear:{clear_ms:.1f}ms, load:{load_ms:.1f}ms)"
             )
+            emit_latency_trace(
+                "music_load.manager_return",
+                playlist=actual_playlist_name,
+                ok=True,
+                elapsed_ms=total_ms,
+                clear_ms=clear_ms,
+                load_ms=load_ms,
+            )
             return f"Loaded playlist: {actual_playlist_name}"
         except Exception as e:
             elapsed = time.monotonic() * 1000 - start_ms
             logger.error(f"Failed to load playlist '{name}' after {elapsed:.1f}ms: {e}")
+            emit_latency_trace("music_load.manager_return", playlist=name, ok=False, elapsed_ms=elapsed, error=str(e))
             return f"Error: {e}"
         finally:
             # Always signal that the load operation is complete
@@ -1097,11 +1160,14 @@ class MusicManager:
             if not playlist_name:
                 return "Playlist name is required"
             try:
-                await self.pool.execute(f'rm "{self._quote(playlist_name)}"')
+                await self._control_execute(f'rm "{self._quote(playlist_name)}"')
             except Exception:
                 pass
-            await self.pool.execute(f'save "{self._quote(playlist_name)}"')
+            await self._control_execute(f'save "{self._quote(playlist_name)}"')
             self._loaded_playlist_name = playlist_name
+            self._playlist_names_cache = [p for p in self._playlist_names_cache if p.lower() != playlist_name.lower()]
+            self._playlist_names_cache.append(playlist_name)
+            self._playlist_names_cache_ts = time.monotonic()
             return f"Saved playlist: {playlist_name}"
         except Exception as e:
             logger.error(f"Failed to save playlist: {e}")
@@ -1130,7 +1196,9 @@ class MusicManager:
                 )
                 return f"Error: Playlist '{playlist_name}' not found"
             
-            await self.pool.execute(f'rm "{self._quote(actual_playlist_name)}"')
+            await self._control_execute(f'rm "{self._quote(actual_playlist_name)}"')
+            self._playlist_names_cache = [p for p in self._playlist_names_cache if p.lower() != actual_playlist_name.lower()]
+            self._playlist_names_cache_ts = time.monotonic()
             
             case_info = ""
             if actual_playlist_name != playlist_name:
@@ -1511,6 +1579,7 @@ class MusicManager:
                 "elapsed": float(status.get("elapsed", 0) or 0),
                 "duration": float(status.get("duration", status.get("time", "0").split(":")[0] if "time" in status else 0) or 0),
                 "queue_length": int(status.get("playlistlength", 0) or 0),
+                "playlist_version": str(status.get("playlist", "") or ""),
                 "position": position,
                 "volume": int(vol_raw) if vol_raw is not None else None,
                 "title": track.get("title") or track.get("Title", ""),
@@ -1525,12 +1594,13 @@ class MusicManager:
             logger.error(f"Failed to get UI music state: {e}")
             return {"state": "error", "queue_length": 0}
 
-    async def get_ui_playlist(self, limit: int = 200) -> list:
+    async def get_ui_playlist(self, limit: int = 200, timeout: float = 6.0) -> list:
         """Return a compact queue list for the web UI music page."""
         t0 = time.monotonic()
         try:
             # Fetch only as many items as we'll display to avoid connection timeouts on huge queues
-            queue = await self.get_queue(limit=limit, timeout=6.0)
+            query_timeout = max(0.5, float(timeout))
+            queue = await self.get_queue(limit=limit, timeout=query_timeout)
             t_queue = time.monotonic()
             result = []
             for i, item in enumerate(queue[:limit]):

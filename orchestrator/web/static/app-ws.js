@@ -194,6 +194,7 @@ function handleMsg(msg){
             if(msg.queue!==undefined){
                 S.musicQueue=msg.queue;
                 syncMusicFromQueue();
+                reconcilePendingMusicLoads();
             }
             if(S.page==='music') {
                 const t0 = performance.now();
@@ -217,6 +218,7 @@ function handleMsg(msg){
             if(msg.queue!==undefined) S.musicQueue=msg.queue;
             else if(msg.music&&msg.music.queue!==undefined) S.musicQueue=msg.music.queue;
             syncMusicFromQueue();
+            reconcilePendingMusicLoads();
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
             break;
@@ -233,23 +235,22 @@ function handleMsg(msg){
             S.musicActionError='';
             S.musicActionErrorTs=0;
             if(String(msg.action||'')==='music_load_playlist'){
-                if(S._musicStateRetryTimer){
-                    clearTimeout(S._musicStateRetryTimer);
-                }
-                S._musicStateRetryTimer = setTimeout(()=>{
-                    S._musicStateRetryTimer = null;
-                    sendAction({type:'music_get_state'});
-                }, 1500);
+                // Poll for state updates after a playlist load. The server will push a
+                // music_queue broadcast once the queue is ready, but we also poll as
+                // belt-and-suspenders in case the broadcast is missed.
+                requestMusicStateRetry('post_load_ack', 8, 2000);
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
             break;
         case 'music_action_pending':
             if(msg.action_id){
-                S.pendingMusicActions[String(msg.action_id)]={
+                const pendingItem={
                     type:String(msg.action||''),
                     ts:Date.now(),
                 };
+                if(msg.name!==undefined) pendingItem.name=String(msg.name||'');
+                S.pendingMusicActions[String(msg.action_id)]=pendingItem;
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
             applyMusicHeader();
@@ -440,10 +441,37 @@ function applyMusic(m){
     Object.assign(S.music,payload);
     S.music._clientElapsedAnchorTs=Date.now();
     S.music.state=normalizeMusicState(S.music.state);
+    reconcilePendingMusicLoads();
     syncMusicFromQueue();
     applyTopMusicProgress();
     applyMusicHeader();
     applyMusicQueueHighlight();
+}
+
+function reconcilePendingMusicLoads(){
+    const pending=S.pendingMusicActions||{};
+    const currentLoaded=String((S.music&&S.music.loaded_playlist)||'').trim().toLowerCase();
+    const queueLen=Math.max(0, Number((S.music&&S.music.queue_length)||0) || (Array.isArray(S.musicQueue)?S.musicQueue.length:0));
+    let changed=false;
+    Object.keys(pending).forEach((actionId)=>{
+        const item=pending[actionId];
+        if(!item || String(item.type||'')!=='music_load_playlist') return;
+        const requested=String(item.name||'').trim().toLowerCase();
+        if(requested && currentLoaded && requested===currentLoaded){
+            delete pending[actionId];
+            changed=true;
+            return;
+        }
+        if(!requested && currentLoaded && queueLen>0){
+            delete pending[actionId];
+            changed=true;
+        }
+    });
+    if(changed){
+        S.musicActionError='';
+        S.musicActionErrorTs=0;
+    }
+    return changed;
 }
 function applyTimers(t){
   const now=Date.now()/1000;

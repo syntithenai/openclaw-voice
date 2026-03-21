@@ -81,6 +81,7 @@ from orchestrator.metrics import AECStatus, WakeWordResult
 from orchestrator.services.mpd_manager import MPDManager
 from orchestrator.runtime.config_validation import validate_runtime_config
 from orchestrator.platform.hardware import is_raspberry_pi
+from orchestrator.music.parser import MusicFastPathParser
 from orchestrator.tools.recorder import RecorderTool
 from orchestrator.vad.model_loader import ensure_silero_model
 import numpy as np
@@ -142,6 +143,19 @@ GHOST_ARTIFACT_PATTERNS = (
     re.compile(r"\bi(?:'m|\s+am)?\s+going\s+to\s+go\s+ahead\s+and\s+stop\s+(?:the\s+)?record(?:ing)?\b"),
 )
 
+GHOST_SHORT_COMMAND_PARSER = MusicFastPathParser()
+GHOST_SHORT_COMMAND_ALLOW_CMDS = {
+    "next_track",
+    "previous_track",
+    "play",
+    "stop",
+    "volume_up",
+    "volume_down",
+    "set_volume",
+    "get_current_track",
+    "get_status",
+}
+
 
 def canonicalize_transcript_for_match(text: str) -> str:
     lowered = (text or "").strip().lower()
@@ -189,6 +203,19 @@ def is_greeting_token(canonical: str) -> bool:
     return canonical in GREETING_TOKENS
 
 
+def has_supported_short_command(canonical: str, token_count: int) -> bool:
+    if not canonical or token_count <= 0 or token_count > 3:
+        return False
+    try:
+        parsed = GHOST_SHORT_COMMAND_PARSER.parse(canonical)
+        if not parsed:
+            return False
+        command, _params = parsed
+        return command in GHOST_SHORT_COMMAND_ALLOW_CMDS
+    except Exception:
+        return False
+
+
 def score_self_echo_similarity(transcript: str, recent_tts_texts: Sequence[str]) -> float:
     canonical = canonicalize_transcript_for_match(transcript)
     if not canonical:
@@ -224,6 +251,7 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
     has_alnum = bool(re.search(r"[a-zA-Z0-9]", transcript))
     is_single_word = bool(ctx.get("is_single_word"))
     is_short_transcript = bool(ctx.get("is_short_transcript"))
+    short_command_supported = has_supported_short_command(canonical, token_count)
 
     if not transcript:
         return GhostDecision(False, ("empty_transcript",), -9, "hard_reject_empty")
@@ -324,6 +352,11 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
 
     if is_short_transcript and has_inflight_user_request and not is_ack_token(canonical) and not is_greeting_token(canonical):
         return GhostDecision(True, ("allow_inflight_short_continuation",), score, "continuation_allow_inflight")
+
+    # If a short transcript already matches the deterministic music fast-path,
+    # treat it as a supported command instead of dropping it as unsupported noise.
+    if is_short_transcript and short_command_supported:
+        return GhostDecision(True, ("allow_supported_short_command",), score, "hard_allow_supported_short_command")
 
     if token_count >= 4:
         return GhostDecision(True, ("default_accept_normal_length",), score, "default_accept")
@@ -852,11 +885,20 @@ async def run_orchestrator() -> None:
                 pool_size=config.mpd_pool_size,
                 timeout=config.mpd_timeout,
             )
+            # Dedicated low-contention control pool for latency-sensitive commands
+            # (e.g., clear/load/save/rm) so they do not queue behind heavy list calls.
+            mpd_control_pool = MPDClientPool(
+                host=config.mpd_host,
+                port=config.mpd_port,
+                pool_size=1,
+                timeout=config.mpd_timeout,
+            )
             mpd_initialized = False
             mpd_attempts = 3
             for attempt in range(1, mpd_attempts + 1):
                 try:
                     await mpd_pool.initialize()
+                    await mpd_control_pool.initialize()
                     mpd_initialized = True
                     break
                 except Exception as mpd_init_err:
@@ -874,6 +916,7 @@ async def run_orchestrator() -> None:
             # Initialize music manager
             music_manager = MusicManager(
                 mpd_pool,
+                control_pool=mpd_control_pool,
                 genre_queue_limit=config.music_genre_queue_limit,
                 pipewire_stream_normalize_enabled=config.music_pipewire_stream_normalize_enabled,
                 pipewire_stream_target_percent=config.music_pipewire_stream_target_percent,
@@ -1986,6 +2029,10 @@ async def run_orchestrator() -> None:
                         mic_enabled=True,
                     )
 
+            # Event set by music_load_playlist handler to bypass queue-refresh backoff.
+            # Cleared by _web_ui_publisher on each iteration after processing.
+            _post_load_queue_event = asyncio.Event()
+
             async def _ui_refresh_music_state(source: str) -> None:
                 """Refresh music state on UI.
                 
@@ -2112,6 +2159,9 @@ async def run_orchestrator() -> None:
                         if str(result).strip().lower().startswith("error:"):
                             raise RuntimeError(result)
                         asyncio.create_task(_ui_refresh_music_state("music_load_playlist"))
+                        # Signal the publisher to immediately refresh the queue,
+                        # bypassing any existing backoff from previous failures.
+                        _post_load_queue_event.set()
                     except Exception as exc:
                         logger.warning("Web UI music_load_playlist '%s': %s", name, exc)
                         raise
@@ -2286,13 +2336,31 @@ async def run_orchestrator() -> None:
                 timer_poll = config.web_ui_timer_poll_ms / 1000.0
                 music_tick = 0.0
                 music_queue_tick = 0.0
+                music_queue_failures = 0
+                music_queue_retry_after = 0.0
+                music_transport_dirty = True
+                music_queue_dirty = True
+                music_idle_connected = False
                 timer_tick = 0.0
                 music_queue_task: asyncio.Task | None = None
+                music_idle_task: asyncio.Task | None = None
 
-                async def _refresh_music_queue(reason: str) -> None:
-                    nonlocal last_music_queue_hash, music_queue_tick
+                def _mark_music_dirty(*subsystems: str) -> None:
+                    nonlocal music_transport_dirty, music_queue_dirty
+                    for subsystem in subsystems:
+                        name = str(subsystem or "").strip().lower()
+                        if name in {"player", "mixer", "options"}:
+                            music_transport_dirty = True
+                        if name == "playlist":
+                            music_transport_dirty = True
+                            music_queue_dirty = True
+
+                async def _refresh_music_queue(reason: str, timeout_override: float | None = None) -> None:
+                    nonlocal last_music_queue_hash, music_queue_tick, music_queue_failures, music_queue_retry_after
                     try:
-                        q = await music_manager.get_ui_playlist()
+                        base_timeout = min(2.5, max(1.0, float(config.mpd_timeout)))
+                        q_timeout = float(timeout_override) if timeout_override is not None else base_timeout
+                        q = await music_manager.get_ui_playlist(timeout=q_timeout)
                         qh = str([
                             (
                                 item.get("id", ""),
@@ -2308,11 +2376,23 @@ async def run_orchestrator() -> None:
                             last_music_queue_hash = qh
                             web_service.update_music_queue(q)
                         music_queue_tick = time.monotonic()
+                        music_queue_failures = 0
+                        music_queue_retry_after = 0.0
                     except Exception as exc:
-                        logger.debug("Web UI music queue refresh failed (%s): %s", reason, exc)
+                        music_queue_failures += 1
+                        backoff_s = min(60.0, max(5.0, float(2 ** min(music_queue_failures, 5))))
+                        music_queue_retry_after = time.monotonic() + backoff_s
+                        if music_queue_failures <= 3 or music_queue_failures % 10 == 0:
+                            logger.warning(
+                                "Web UI music queue refresh failed (%s) x%d; backing off %.1fs: %s",
+                                reason,
+                                music_queue_failures,
+                                backoff_s,
+                                exc,
+                            )
                         music_queue_tick = time.monotonic()  # Back off — prevents tight retry loop on slow playlists
 
-                def _schedule_music_queue_refresh(reason: str) -> None:
+                def _schedule_music_queue_refresh(reason: str, timeout_override: float | None = None) -> None:
                     nonlocal music_queue_task
                     if music_queue_task is not None and not music_queue_task.done():
                         return
@@ -2320,99 +2400,168 @@ async def run_orchestrator() -> None:
                     async def _runner() -> None:
                         nonlocal music_queue_task
                         try:
-                            await _refresh_music_queue(reason)
+                            await _refresh_music_queue(reason, timeout_override=timeout_override)
                         finally:
                             music_queue_task = None
 
                     music_queue_task = asyncio.create_task(_runner())
 
-                while True:
-                    await asyncio.sleep(0.2)
-                    if not web_service:
-                        break
-                    now = time.monotonic()
-                    if timer_manager:
+                async def _mpd_idle_notifier() -> None:
+                    nonlocal music_idle_connected
+                    while True:
+                        reader = None
+                        writer = None
                         try:
-                            timers = timer_manager.list_ui_timers()
-                            alarms = alarm_manager.list_ui_alarms() if alarm_manager else []
-                            entries = []
-                            for t in timers:
-                                item = dict(t)
-                                item.setdefault("kind", "timer")
-                                entries.append(item)
-                            for a in alarms:
-                                entries.append(dict(a))
-                            entries.sort(key=lambda x: (0 if str(x.get("kind", "timer")).lower() == "alarm" else 1, float(x.get("remaining_seconds", 0.0))))
-                            sh = str([
-                                (
-                                    e.get("kind", "timer"),
-                                    e.get("id"),
-                                    int(round(float(e.get("remaining_seconds", 0.0)))),
-                                    bool(e.get("ringing", False)),
-                                )
-                                for e in entries
-                            ])
-                            shape_hash = str([
-                                (
-                                    e.get("kind", "timer"),
-                                    e.get("id"),
-                                    bool(e.get("ringing", False)),
-                                    bool(e.get("enabled", True)),
-                                    bool(e.get("triggered", False)),
-                                )
-                                for e in entries
-                            ])
-                            immediate_shape_change = shape_hash != last_schedule_shape_hash
-                            periodic_refresh_due = (now - timer_tick) >= timer_poll
-                            if immediate_shape_change or (periodic_refresh_due and sh != last_schedule_hash):
-                                last_schedule_hash = sh
-                                last_schedule_shape_hash = shape_hash
-                                timer_tick = now
-                                web_service.update_timers_state(entries)
-                            timer_failures = 0
+                            reader, writer = await asyncio.open_connection(config.mpd_host, config.mpd_port)
+                            welcome = await asyncio.wait_for(reader.readline(), timeout=max(1.0, config.mpd_timeout))
+                            if not welcome.startswith(b"OK MPD"):
+                                raise RuntimeError(f"Invalid MPD welcome: {welcome!r}")
+                            music_idle_connected = True
+                            logger.info("↻ MPD idle notifier connected")
+                            while True:
+                                writer.write(b"idle playlist player mixer options\n")
+                                await asyncio.wait_for(writer.drain(), timeout=max(1.0, config.mpd_timeout))
+                                changed: list[str] = []
+                                while True:
+                                    line = await reader.readline()
+                                    if not line:
+                                        raise ConnectionError("MPD idle notifier disconnected")
+                                    text = line.decode("utf-8", errors="replace").strip()
+                                    if text == "OK":
+                                        break
+                                    if text.startswith("ACK"):
+                                        raise RuntimeError(f"MPD idle notifier error: {text}")
+                                    if text.startswith("changed: "):
+                                        changed.append(text.split(": ", 1)[1].strip())
+                                if changed:
+                                    logger.info("↻ MPD idle changed: %s", ", ".join(changed))
+                                    _mark_music_dirty(*changed)
+                        except asyncio.CancelledError:
+                            raise
                         except Exception as exc:
-                            timer_failures += 1
-                            if timer_failures <= 3 or timer_failures % 20 == 0:
-                                logger.warning(
-                                    "Web UI timer publisher failed (%d): %s",
-                                    timer_failures,
-                                    exc,
-                                )
-                    if music_manager and (now - music_tick) >= music_poll:
-                        music_tick = now
+                            music_idle_connected = False
+                            logger.warning("MPD idle notifier error: %s", exc)
+                            await asyncio.sleep(1.0)
+                        finally:
+                            music_idle_connected = False
+                            if writer is not None:
+                                try:
+                                    writer.close()
+                                    await writer.wait_closed()
+                                except Exception:
+                                    pass
+
+                if music_manager:
+                    music_idle_task = asyncio.create_task(_mpd_idle_notifier())
+
+                try:
+                    while True:
+                        await asyncio.sleep(0.2)
+                        if not web_service:
+                            break
+                        now = time.monotonic()
+                        if timer_manager:
+                            try:
+                                timers = timer_manager.list_ui_timers()
+                                alarms = alarm_manager.list_ui_alarms() if alarm_manager else []
+                                entries = []
+                                for t in timers:
+                                    item = dict(t)
+                                    item.setdefault("kind", "timer")
+                                    entries.append(item)
+                                for a in alarms:
+                                    entries.append(dict(a))
+                                entries.sort(key=lambda x: (0 if str(x.get("kind", "timer")).lower() == "alarm" else 1, float(x.get("remaining_seconds", 0.0))))
+                                sh = str([
+                                    (
+                                        e.get("kind", "timer"),
+                                        e.get("id"),
+                                        int(round(float(e.get("remaining_seconds", 0.0)))),
+                                        bool(e.get("ringing", False)),
+                                    )
+                                    for e in entries
+                                ])
+                                shape_hash = str([
+                                    (
+                                        e.get("kind", "timer"),
+                                        e.get("id"),
+                                        bool(e.get("ringing", False)),
+                                        bool(e.get("enabled", True)),
+                                        bool(e.get("triggered", False)),
+                                    )
+                                    for e in entries
+                                ])
+                                immediate_shape_change = shape_hash != last_schedule_shape_hash
+                                periodic_refresh_due = (now - timer_tick) >= timer_poll
+                                if immediate_shape_change or (periodic_refresh_due and sh != last_schedule_hash):
+                                    last_schedule_hash = sh
+                                    last_schedule_shape_hash = shape_hash
+                                    timer_tick = now
+                                    web_service.update_timers_state(entries)
+                                timer_failures = 0
+                            except Exception as exc:
+                                timer_failures += 1
+                                if timer_failures <= 3 or timer_failures % 20 == 0:
+                                    logger.warning(
+                                        "Web UI timer publisher failed (%d): %s",
+                                        timer_failures,
+                                        exc,
+                                    )
+                        if music_manager and (music_transport_dirty or (now - music_tick) >= music_poll):
+                            music_tick = now
+                            try:
+                                music_timeout_s = max(0.2, min(1.0, music_poll))
+                                ms = await asyncio.wait_for(music_manager.get_ui_music_state(), timeout=music_timeout_s)
+                                th = str(sorted(ms.items()))
+                                if th != last_music_transport_hash:
+                                    last_music_transport_hash = th
+                                    web_service.update_music_transport(**ms)
+                                queue_meta_hash = str((
+                                    ms.get("queue_length", 0),
+                                    ms.get("loaded_playlist", ""),
+                                    ms.get("playlist_version", ""),
+                                ))
+                                queue_poll_due = (not music_idle_connected) and ((now - music_queue_tick) >= music_queue_poll)
+                                # Fast path: a music_load_playlist action just completed.
+                                # Reset any backoff and kick an immediate queue refresh with
+                                # a more generous timeout for freshly-loaded large playlists.
+                                if _post_load_queue_event.is_set():
+                                    _post_load_queue_event.clear()
+                                    music_queue_failures = 0
+                                    music_queue_retry_after = 0.0
+                                    music_queue_dirty = True
+                                    _schedule_music_queue_refresh("post_load_urgent", timeout_override=5.0)
+                                    last_music_queue_meta_hash = queue_meta_hash
+                                can_refresh_queue = now >= music_queue_retry_after
+                                if can_refresh_queue and (music_queue_dirty or queue_meta_hash != last_music_queue_meta_hash or queue_poll_due):
+                                    last_music_queue_meta_hash = queue_meta_hash
+                                    _schedule_music_queue_refresh("publisher")
+                                    music_queue_dirty = False
+                                music_transport_dirty = False
+                                music_failures = 0
+                            except asyncio.TimeoutError:
+                                music_failures += 1
+                                if music_failures <= 3 or music_failures % 20 == 0:
+                                    logger.warning(
+                                        "Web UI music publisher timed out (%d) after %.0fms",
+                                        music_failures,
+                                        music_timeout_s * 1000.0,
+                                    )
+                            except Exception as exc:
+                                music_failures += 1
+                                if music_failures <= 3 or music_failures % 20 == 0:
+                                    logger.warning(
+                                        "Web UI music publisher failed (%d): %s",
+                                        music_failures,
+                                        exc,
+                                    )
+                finally:
+                    if music_idle_task is not None:
+                        music_idle_task.cancel()
                         try:
-                            music_timeout_s = max(0.2, min(1.0, music_poll))
-                            ms = await asyncio.wait_for(music_manager.get_ui_music_state(), timeout=music_timeout_s)
-                            th = str(sorted(ms.items()))
-                            if th != last_music_transport_hash:
-                                last_music_transport_hash = th
-                                web_service.update_music_transport(**ms)
-                            queue_meta_hash = str((
-                                ms.get("queue_length", 0),
-                                ms.get("loaded_playlist", ""),
-                                ms.get("state", ""),
-                            ))
-                            queue_poll_due = (now - music_queue_tick) >= music_queue_poll
-                            if queue_meta_hash != last_music_queue_meta_hash or queue_poll_due:
-                                last_music_queue_meta_hash = queue_meta_hash
-                                _schedule_music_queue_refresh("publisher")
-                            music_failures = 0
-                        except asyncio.TimeoutError:
-                            music_failures += 1
-                            if music_failures <= 3 or music_failures % 20 == 0:
-                                logger.warning(
-                                    "Web UI music publisher timed out (%d) after %.0fms",
-                                    music_failures,
-                                    music_timeout_s * 1000.0,
-                                )
-                        except Exception as exc:
-                            music_failures += 1
-                            if music_failures <= 3 or music_failures % 20 == 0:
-                                logger.warning(
-                                    "Web UI music publisher failed (%d): %s",
-                                    music_failures,
-                                    exc,
-                                )
+                            await music_idle_task
+                        except asyncio.CancelledError:
+                            pass
 
             asyncio.create_task(_web_ui_publisher())
 

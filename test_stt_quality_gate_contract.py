@@ -121,3 +121,29 @@ def test_short_non_ack_fragment_is_accepted_when_request_inflight():
     )
     assert decision.accepted is True
     assert decision.matched_priority_rule == "continuation_allow_inflight"
+
+
+def test_supported_short_music_commands_are_accepted():
+    accepted_examples = (
+        ("Next track.", "next track", 2),
+        ("previous track", "previous track", 2),
+        ("resume", "resume", 1),
+        ("stop", "stop", 1),
+        ("volume up", "volume up", 2),
+        ("what's playing", "what's playing", 2),
+    )
+
+    for transcript_text, canonical_transcript, token_count in accepted_examples:
+        decision = decide_ghost_transcript(
+            _ctx(
+                transcript_text=transcript_text,
+                canonical_transcript=canonical_transcript,
+                token_count=token_count,
+                is_single_word=(token_count == 1),
+                is_short_transcript=True,
+                self_echo_similarity=0.92,
+                ms_since_tts_end=57598.0,
+            )
+        )
+        assert decision.accepted is True
+        assert decision.matched_priority_rule == "hard_allow_supported_short_command"

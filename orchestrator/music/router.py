@@ -273,7 +273,7 @@ class MusicRouter:
             Result string from executing the tool
         """
         logger.info(f"LLM tool call: {tool_name}({arguments})")
-        
+
         # Map tool names to handlers
         tool_map = {
             "music_play": lambda: self._handle_play(),

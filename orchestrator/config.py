@@ -6,6 +6,18 @@ import logging
 import os
 
 
+def _resolve_repo_relative_path(value: str) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (_ROOT_DIR / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+    return str(candidate)
+
+
 def _detect_env_file() -> Path:
     """Select the most appropriate env file for this runtime.
 
@@ -77,6 +89,11 @@ class VoiceConfig(BaseSettings):
         if s.isdigit():
             return int(s)
         return s
+
+    @field_validator("web_ui_ssl_certfile", "web_ui_ssl_keyfile", "web_ui_static_root", mode="before")
+    @classmethod
+    def _normalize_web_ui_repo_paths(cls, value):
+        return _resolve_repo_relative_path(value)
 
     # Audio
     audio_sample_rate: int = Field(16000)

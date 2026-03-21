@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 import websockets
+from orchestrator.observability.latency_trace import emit as emit_latency_trace
+from orchestrator.observability.latency_trace import scoped_action
 from orchestrator.web.http_server import start_http_servers
 
 logger = logging.getLogger("orchestrator.web.realtime")
@@ -861,6 +863,10 @@ class EmbeddedVoiceWebService:
         except json.JSONDecodeError:
             return
         msg_type = payload.get("type", "")
+        action_id = payload.get("action_id")
+        action_id_str = str(action_id) if action_id is not None else ""
+        if msg_type == "music_load_playlist":
+            emit_latency_trace("music_load.ws_received", action_id=action_id_str, client_id=client_id)
         if isinstance(msg_type, str) and msg_type.startswith("music_"):
             logger.info("Web UI music action received (%s) from %s", msg_type, client_id)
 
@@ -929,6 +935,9 @@ class EmbeddedVoiceWebService:
         async def _send_music_action_ack(action: str, action_id: Any) -> None:
             if not action_id:
                 return
+            action_id_text = str(action_id)
+            if action == "music_load_playlist":
+                emit_latency_trace("music_load.ack_send_start", action_id=action_id_text, action=action)
             await _send_ws_json(
                 {
                     "type": "music_action_ack",
@@ -936,6 +945,8 @@ class EmbeddedVoiceWebService:
                     "action_id": str(action_id),
                 }
             )
+            if action == "music_load_playlist":
+                emit_latency_trace("music_load.ack_send_done", action_id=action_id_text, action=action)
 
         async def _send_music_playlists_update() -> None:
             if self._on_music_list_playlists is None:
@@ -978,10 +989,14 @@ class EmbeddedVoiceWebService:
                     reason,
                 )
                 return
+            if reason == "music_load_playlist":
+                emit_latency_trace("music_load.state_push_scheduled", action_id=action_id_str, reason=reason)
 
             async def _runner() -> None:
                 try:
                     await _push_music_state_best_effort()
+                    if reason == "music_load_playlist":
+                        emit_latency_trace("music_load.state_push_done", action_id=action_id_str, reason=reason)
                 finally:
                     self._music_state_push_task = None
 
@@ -1207,20 +1222,29 @@ class EmbeddedVoiceWebService:
             return
 
         if msg_type == "music_load_playlist" and self._on_music_load_playlist:
-            action_id = payload.get("action_id")
             name = str(payload.get("name", "")).strip()
             try:
                 if name:
-                    await self._on_music_load_playlist(name, client_id)
-                    await _send_music_action_ack("music_load_playlist", action_id)
+                    handler_start = time.monotonic()
+                    with scoped_action(action_id_str):
+                        emit_latency_trace("music_load.handler_enter", action_id=action_id_str, playlist=name)
+                        await self._on_music_load_playlist(name, client_id)
+                        emit_latency_trace(
+                            "music_load.handler_exit",
+                            action_id=action_id_str,
+                            playlist=name,
+                            elapsed_ms=(time.monotonic() - handler_start) * 1000.0,
+                        )
+                        await _send_music_action_ack("music_load_playlist", action_id)
 
-                    # Push updated state/queue asynchronously to avoid blocking ACK timeout.
-                    # Large playlists can take longer to materialize on MPD; retries handled
-                    # inside _push_music_state_best_effort.
-                    _schedule_music_state_push("music_load_playlist")
-                    await _send_music_playlists_update()
+                        # Push updated state/queue asynchronously to avoid blocking ACK timeout.
+                        # Large playlists can take longer to materialize on MPD; retries handled
+                        # inside _push_music_state_best_effort.
+                        _schedule_music_state_push("music_load_playlist")
+                        asyncio.create_task(_send_music_playlists_update())
             except Exception as exc:
                 logger.warning("music_load_playlist handler error: %s", exc)
+                emit_latency_trace("music_load.handler_error", action_id=action_id_str, playlist=name, error=str(exc))
                 if action_id:
                     await _send_ws_json({
                         "type": "music_action_error",

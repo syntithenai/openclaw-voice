@@ -784,16 +784,19 @@ class QuickAnswerClient:
         self._voice_music_action_seq += 1
         return f"qa-music-{self._voice_music_action_seq}"
 
-    async def _emit_music_action_pending(self, action: str, action_id: str) -> None:
+    async def _emit_music_action_pending(self, action: str, action_id: str, *, name: str | None = None) -> None:
         if not self.web_service:
             return
         try:
+            payload = {
+                "type": "music_action_pending",
+                "action": str(action),
+                "action_id": str(action_id),
+            }
+            if name:
+                payload["name"] = str(name)
             await self.web_service.broadcast(
-                {
-                    "type": "music_action_pending",
-                    "action": str(action),
-                    "action_id": str(action_id),
-                }
+                payload
             )
         except Exception as exc:
             logger.debug("Failed to emit music_action_pending: %s", exc)
@@ -856,13 +859,9 @@ class QuickAnswerClient:
         trace_id = str((trace or {}).get("trace_id", "")).strip()
         voice_load_complete_ts = (trace or {}).get("voice_load_complete_ts")
 
-        # Mirror _ui_refresh_music_state exactly:
-        # 1. Push transport immediately (fast: just status + currentsong).
-        # 2. Push queue via update_music_queue — this sends a 'music_queue' message
-        #    which clears the client's requestMusicStateRetry timer, stopping the
-        #    20-retry polling loop that otherwise runs for 15 full seconds.
-        # Using push_music_state_now (sends 'music_state') does NOT clear the retry
-        # timer, causing 20x redundant re-renders over 15s after every voice load.
+        # Push transport immediately for responsiveness.
+        # Queue fetch is expensive on some MPD instances and can saturate the shared
+        # list-query path; only force queue snapshot for playlist-load traces.
         try:
             transport = await manager.get_ui_music_state()
             self.web_service.update_music_transport(**transport)
@@ -870,9 +869,14 @@ class QuickAnswerClient:
             logger.debug("Failed to push voice music transport: %s", exc)
             return
 
+        if not trace_id:
+            # Non-playlist actions (play/pause/next/volume/etc): do not force queue refresh.
+            # The periodic publisher updates queue when metadata indicates a change.
+            return
+
         async def _push_queue_async() -> None:
             try:
-                queue = await manager.get_ui_playlist()
+                queue = await manager.get_ui_playlist(limit=80, timeout=2.5)
                 queue_ready_ts = time.monotonic()
                 if trace_id:
                     logger.info(
@@ -1048,6 +1052,7 @@ class QuickAnswerClient:
         # Try music fast-path first if enabled
         if self.music_enabled and self.music_router:
             voice_music_action_id: str | None = None
+            voice_playlist_name = ""
             fast_match = None
             try:
                 fast_match = self.music_router.parser.parse(user_query)
@@ -1055,7 +1060,12 @@ class QuickAnswerClient:
                 fast_match = None
             if fast_match and fast_match[0] == "load_playlist":
                 voice_music_action_id = self._new_voice_music_action_id()
-                await self._emit_music_action_pending("music_load_playlist", voice_music_action_id)
+                voice_playlist_name = str((fast_match[1] or {}).get("name", "") or "").strip()
+                await self._emit_music_action_pending(
+                    "music_load_playlist",
+                    voice_music_action_id,
+                    name=voice_playlist_name or None,
+                )
 
             music_result = await self.music_router.handle_request(user_query, use_fast_path=True)
             if music_result is not None:

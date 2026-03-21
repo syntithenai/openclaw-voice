@@ -13,6 +13,7 @@ import logging
 import time
 from typing import Optional, Dict, List
 from contextlib import asynccontextmanager
+from orchestrator.observability.latency_trace import emit as emit_latency_trace
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,21 @@ def _log_command_timing(kind: str, command: str, conn_label: str, elapsed_ms: fl
         logger.warning("⏱️ MPD %s %s on %s took %.1fms%s", kind, preview, conn_label, elapsed_ms, suffix)
     else:
         logger.info("⏱️ MPD %s %s on %s took %.1fms%s", kind, preview, conn_label, elapsed_ms, suffix)
+
+
+def _command_kind(command: str) -> str:
+    stripped = str(command or "").strip().lower()
+    if not stripped:
+        return "unknown"
+    if stripped.startswith("playlistinfo") or stripped.startswith("listplaylists"):
+        return "list"
+    if stripped.startswith("search"):
+        return "search"
+    if stripped.startswith("status"):
+        return "status"
+    if stripped.startswith("clear") or stripped.startswith("load") or stripped.startswith("play") or stripped.startswith("pause") or stripped.startswith("stop"):
+        return "control"
+    return "other"
 
 
 class MPDConnection:
@@ -444,7 +460,15 @@ class MPDClientPool:
             await self.initialize()
         
         # Get connection from pool
+        acquire_started = time.monotonic()
+        emit_latency_trace("mpd_pool.acquire_start", pool_size=self.pool_size)
         conn: MPDConnection = await self._available.get()
+        emit_latency_trace(
+            "mpd_pool.acquire_done",
+            conn=conn.label,
+            pool_size=self.pool_size,
+            wait_ms=(time.monotonic() - acquire_started) * 1000.0,
+        )
 
         try:
             # Check if connection is still valid, reconnect if needed
@@ -477,10 +501,23 @@ class MPDClientPool:
             Dictionary of response key-value pairs
         """
         last_exc: Exception | None = None
+        started = time.monotonic()
+        cmd_kind = _command_kind(command)
+        emit_latency_trace("mpd_cmd.start", command=command, command_kind=cmd_kind, mode="single")
         for attempt in (1, 2, 3):
             async with self.get_connection() as conn:
                 try:
-                    return await conn.send_command(command, timeout=timeout)
+                    result = await conn.send_command(command, timeout=timeout)
+                    emit_latency_trace(
+                        "mpd_cmd.done",
+                        command=command,
+                        command_kind=cmd_kind,
+                        mode="single",
+                        conn=conn.label,
+                        attempt=attempt,
+                        elapsed_ms=(time.monotonic() - started) * 1000.0,
+                    )
+                    return result
                 except ConnectionError as exc:
                     last_exc = exc
                     logger.warning(
@@ -494,6 +531,14 @@ class MPDClientPool:
                     if attempt < 3:
                         await asyncio.sleep(0.05 * attempt)
                         continue
+        emit_latency_trace(
+            "mpd_cmd.error",
+            command=command,
+            command_kind=cmd_kind,
+            mode="single",
+            elapsed_ms=(time.monotonic() - started) * 1000.0,
+            error=str(last_exc or ""),
+        )
         raise ConnectionError(f"MPD command failed after retries: {last_exc}")
     
     async def execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
@@ -508,13 +553,37 @@ class MPDClientPool:
             List of dictionaries, one per item
         """
         last_exc: Exception | None = None
+        started = time.monotonic()
+        cmd_kind = _command_kind(command)
+        emit_latency_trace("mpd_cmd.start", command=command, command_kind=cmd_kind, mode="list")
         for attempt in (1, 2, 3):
             async with self.get_connection() as conn:
                 try:
-                    return await conn.send_command_list(send_cmd=command, timeout=timeout)
+                    result = await conn.send_command_list(send_cmd=command, timeout=timeout)
+                    emit_latency_trace(
+                        "mpd_cmd.done",
+                        command=command,
+                        command_kind=cmd_kind,
+                        mode="list",
+                        conn=conn.label,
+                        attempt=attempt,
+                        item_count=len(result),
+                        elapsed_ms=(time.monotonic() - started) * 1000.0,
+                    )
+                    return result
                 except ConnectionError as exc:
                     # Don't retry on timeout — MPD is just slow, retrying wastes 3× the time
                     if "timeout" in str(exc).lower():
+                        emit_latency_trace(
+                            "mpd_cmd.error",
+                            command=command,
+                            command_kind=cmd_kind,
+                            mode="list",
+                            conn=conn.label,
+                            attempt=attempt,
+                            elapsed_ms=(time.monotonic() - started) * 1000.0,
+                            error=str(exc),
+                        )
                         raise
                     last_exc = exc
                     logger.warning(
@@ -528,15 +597,35 @@ class MPDClientPool:
                     if attempt < 3:
                         await asyncio.sleep(0.05 * attempt)
                         continue
+        emit_latency_trace(
+            "mpd_cmd.error",
+            command=command,
+            command_kind=cmd_kind,
+            mode="list",
+            elapsed_ms=(time.monotonic() - started) * 1000.0,
+            error=str(last_exc or ""),
+        )
         raise ConnectionError(f"MPD list command failed after retries: {last_exc}")
 
     async def execute_batch(self, commands: List[str], timeout: float | None = None) -> None:
         """Execute multiple non-query commands using MPD command list mode."""
         last_exc: Exception | None = None
+        started = time.monotonic()
+        emit_latency_trace("mpd_cmd.start", command="command_list", command_kind="batch", mode="batch", batch_size=len(commands))
         for attempt in (1, 2, 3):
             async with self.get_connection() as conn:
                 try:
                     await conn.send_command_batch(commands, timeout=timeout)
+                    emit_latency_trace(
+                        "mpd_cmd.done",
+                        command="command_list",
+                        command_kind="batch",
+                        mode="batch",
+                        conn=conn.label,
+                        attempt=attempt,
+                        batch_size=len(commands),
+                        elapsed_ms=(time.monotonic() - started) * 1000.0,
+                    )
                     return
                 except ConnectionError as exc:
                     last_exc = exc
@@ -550,4 +639,13 @@ class MPDClientPool:
                     if attempt < 3:
                         await asyncio.sleep(0.05 * attempt)
                         continue
+        emit_latency_trace(
+            "mpd_cmd.error",
+            command="command_list",
+            command_kind="batch",
+            mode="batch",
+            batch_size=len(commands),
+            elapsed_ms=(time.monotonic() - started) * 1000.0,
+            error=str(last_exc or ""),
+        )
         raise ConnectionError(f"MPD batch command failed after retries: {last_exc}")

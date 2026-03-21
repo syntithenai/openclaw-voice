@@ -192,7 +192,9 @@ function renderMusicPage(main){
                 +'</div>'
               +'</div>'
               +'<div class="music-queue-table-container rounded-xl border border-gray-800" style="overflow-y:auto;overflow-x:auto;max-height:600px"><table class="w-full text-left"><thead style="position:sticky;top:0;z-index:10;background:rgb(17,24,39)"><tr class="text-xs text-gray-400 border-b border-gray-800"><th class="px-2 py-2">Sel</th><th class="px-2 py-2">#</th><th class="px-2 py-2">Title</th><th class="px-2 py-2">Artist</th><th class="px-2 py-2">Album</th><th class="px-2 py-2 text-right pr-4">Dur</th></tr></thead><tbody>'+rows+'</tbody></table></div>'
-            : '<p class="text-gray-500 text-center py-8 text-sm">No tracks match your filter</p>')
+            : (q.length === 0 && Number(m.queue_length) > 0
+                ? '<p class="text-gray-400 text-center py-8 text-sm"><span class="inline-flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-gray-400 border-t-transparent rounded-full animate-spin"></span>Loading tracks\u2026</span></p>'
+                : '<p class="text-gray-500 text-center py-8 text-sm">No tracks match your filter</p>'))
       +'</div>'
     +'</div>'
     +(S.musicPlaylistModalOpen
@@ -369,7 +371,11 @@ function sendMusicAction(actionType, extraPayload={}){
     applyMusicHeader();
     return null;
   }
-  S.pendingMusicActions[actionId]={type:actionType, ts:Date.now()};
+  const pendingItem={type:actionType, ts:Date.now()};
+  if(actionType==='music_load_playlist' && extraPayload && extraPayload.name!==undefined){
+    pendingItem.name=String(extraPayload.name||'');
+  }
+  S.pendingMusicActions[actionId]=pendingItem;
     if(S.page==='music') renderMusicPage(document.getElementById('main'));
     applyMusicHeader();
     return actionId;
