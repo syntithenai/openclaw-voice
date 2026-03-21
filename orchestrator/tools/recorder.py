@@ -328,14 +328,13 @@ class RecorderTool:
                     logger.info(
                         "Recorder remote pyannote unavailable: PYANNOTE_AUTH_TOKEN is missing on backend; continuing without diarization"
                     )
+                    return [], ""
                 else:
                     logger.warning("Recorder remote pyannote diarization failed: %s", exc)
-                remote_error = f"remote pyannote diarization failed: {exc}"
-            else:
-                remote_error = ""
-        else:
-            remote_error = ""
+                    return [], f"remote pyannote diarization failed: {exc}"
 
+        # Remote client not configured — attempt local pyannote install
+        remote_error = ""
         model_path = Path(self.pyannote_model)
         use_local_model = model_path.exists()
 

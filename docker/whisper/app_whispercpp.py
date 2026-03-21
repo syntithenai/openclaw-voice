@@ -109,8 +109,13 @@ async def transcribe(file: UploadFile):
             with open(temp_json_path, 'r') as f:
                 output = json.load(f)
                 
-            # Extract text from transcription
-            text = output.get("transcription", [{}])[0].get("text", "").strip() if output.get("transcription") else ""
+            # Join ALL transcription segments (each ~30s chunk is a separate entry)
+            segments = output.get("transcription") or []
+            text = " ".join(
+                seg.get("text", "").strip()
+                for seg in segments
+                if seg.get("text", "").strip()
+            )
             
             return {
                 "text": text,
