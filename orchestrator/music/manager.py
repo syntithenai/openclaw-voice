@@ -513,6 +513,55 @@ class MusicManager:
     def _quote(value: str) -> str:
         return str(value).replace('\\', '\\\\').replace('"', '\\"')
 
+    @staticmethod
+    def _artist_bucket_key(track: Dict[str, str], fallback_index: int) -> str:
+        artist = str(track.get("Artist") or track.get("artist") or "").strip().lower()
+        if artist:
+            return artist
+
+        album_artist = str(track.get("AlbumArtist") or track.get("albumartist") or "").strip().lower()
+        if album_artist:
+            return album_artist
+
+        file_uri = str(track.get("file") or "").strip().lower()
+        if file_uri:
+            return file_uri
+
+        return f"unknown-{fallback_index}"
+
+    def _spread_tracks_across_artists(self, tracks: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        import random
+
+        if len(tracks) <= 1:
+            return list(tracks)
+
+        artist_buckets: dict[str, deque[Dict[str, str]]] = {}
+        for index, track in enumerate(tracks):
+            bucket_key = self._artist_bucket_key(track, index)
+            artist_buckets.setdefault(bucket_key, deque()).append(track)
+
+        artist_keys = list(artist_buckets.keys())
+        random.shuffle(artist_keys)
+        for artist_key in artist_keys:
+            bucket_items = list(artist_buckets[artist_key])
+            random.shuffle(bucket_items)
+            artist_buckets[artist_key] = deque(bucket_items)
+
+        ordered: List[Dict[str, str]] = []
+        while artist_keys:
+            next_round: List[str] = []
+            for artist_key in artist_keys:
+                bucket = artist_buckets[artist_key]
+                if not bucket:
+                    continue
+                ordered.append(bucket.popleft())
+                if bucket:
+                    next_round.append(artist_key)
+            random.shuffle(next_round)
+            artist_keys = next_round
+
+        return ordered
+
     async def add_songs_to_queue(self, query: str, count: int = 5) -> str:
         """Append matching songs to the END of the current queue without clearing it.
 
@@ -1494,10 +1543,30 @@ class MusicManager:
                     f"Playlist '{playlist_name}' not found for deletion. Available: {available_playlists}"
                 )
                 return f"Error: Playlist '{playlist_name}' not found"
+
+            deleting_loaded_playlist = (
+                str(self._loaded_playlist_name or "").strip().lower()
+                == actual_playlist_name.lower()
+            )
             
             await self._control_execute(f'rm "{self._quote(actual_playlist_name)}"')
             self._playlist_names_cache = [p for p in self._playlist_names_cache if p.lower() != actual_playlist_name.lower()]
             self._playlist_names_cache_ts = time.monotonic()
+
+            if deleting_loaded_playlist:
+                clear_result = await self.clear_queue()
+                if str(clear_result).strip().lower().startswith("error:"):
+                    logger.warning(
+                        "Deleted active playlist '%s', but failed to clear queue: %s",
+                        actual_playlist_name,
+                        clear_result,
+                    )
+                    self._detach_loaded_playlist()
+                    return f"Deleted playlist: {playlist_name} (warning: {clear_result})"
+                logger.info(
+                    "Deleted active playlist '%s'; queue cleared and detached",
+                    actual_playlist_name,
+                )
             
             case_info = ""
             if actual_playlist_name != playlist_name:
@@ -1590,8 +1659,6 @@ class MusicManager:
         """Play tracks from a genre."""
         start_ms = time.monotonic() * 1000
         try:
-            # Use server-side query+enqueue to avoid client-side per-track loops
-            # that can stall for very large genres.
             clear_start = time.monotonic() * 1000
             await self.clear_queue()
             clear_ms = time.monotonic() * 1000 - clear_start
@@ -1599,41 +1666,21 @@ class MusicManager:
             safe_genre = genre.replace('"', '\\"')
             search_start = time.monotonic() * 1000
             limit = max(1, int(self.genre_queue_limit))
-            genre_tracks: List[Dict[str, str]] = []
-            window_size = min(200, limit)
-            offset = 0
-
-            while len(genre_tracks) < limit:
-                take = min(window_size, limit - len(genre_tracks))
-                cmd = f'search genre "{safe_genre}" window {offset}:{offset + take}'
-                try:
-                    rows = await self.pool.execute_list(cmd)
-                except Exception as window_exc:
-                    # Compatibility fallback for backends without window support.
-                    if offset == 0:
-                        logger.debug(
-                            "Genre window query failed, falling back to full search for '%s': %s",
-                            genre,
-                            window_exc,
-                        )
-                        rows = await self.pool.execute_list(f'search genre "{safe_genre}"')
-                        genre_tracks.extend(rows[:limit])
-                        break
-                    raise
-
-                if not rows:
-                    break
-
-                genre_tracks.extend(rows)
-                if len(rows) < take:
-                    break
-                offset += take
+            try:
+                genre_tracks = await self.pool.execute_list(f'search genre "{safe_genre}" window 0:999999')
+            except Exception as window_exc:
+                logger.debug(
+                    "Genre full-window query failed, falling back to full search for '%s': %s",
+                    genre,
+                    window_exc,
+                )
+                genre_tracks = await self.pool.execute_list(f'search genre "{safe_genre}"')
 
             search_ms = time.monotonic() * 1000 - search_start
-            
-            queue_len = len(genre_tracks)
 
-            if queue_len == 0:
+            total_matches = len(genre_tracks)
+
+            if total_matches == 0:
                 stats = await self.get_stats()
                 song_count = int(stats.get("songs", 0))
                 elapsed = time.monotonic() * 1000 - start_ms
@@ -1643,12 +1690,28 @@ class MusicManager:
                 logger.info(f"🎵 Play genre '{genre}': no matches found (search:{search_ms:.1f}ms, total:{elapsed:.1f}ms)")
                 return f"No tracks found for genre: {genre}"
 
-            if queue_len >= limit:
-                logger.info("Genre '%s' limited to %d tracks", genre, queue_len)
+            if shuffle:
+                import random
+
+                selected_tracks = list(genre_tracks)
+                if len(selected_tracks) > limit:
+                    selected_tracks = random.sample(selected_tracks, limit)
+                selected_tracks = self._spread_tracks_across_artists(selected_tracks)
+            else:
+                selected_tracks = genre_tracks[:limit]
+
+            queue_len = len(selected_tracks)
+
+            if total_matches > limit:
+                logger.info(
+                    "Genre '%s' sampled %d tracks from %d matches",
+                    genre,
+                    queue_len,
+                    total_matches,
+                )
             
-            # Add limited tracks to queue
             add_start = time.monotonic() * 1000
-            queue_files = [track.get("file", "") for track in genre_tracks if track.get("file", "")]
+            queue_files = [track.get("file", "") for track in selected_tracks if track.get("file", "")]
             add_result = await self.add_many_to_queue(queue_files, batch_size=40)
             if str(add_result).lower().startswith("error"):
                 return add_result

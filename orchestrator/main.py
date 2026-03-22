@@ -4003,35 +4003,6 @@ async def run_orchestrator() -> None:
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
 
-                    if web_service and not suppress_gateway_messages_for_new_session:
-                        web_service.append_chat_message(
-                            {
-                                "role": "raw_gateway",
-                                "text": message,
-                                "request_id": current_request_id,
-                                "source": "gateway_stream",
-                            }
-                        )
-
-                    payload_obj: dict[str, Any] | None = None
-                    try:
-                        parsed = json.loads(message)
-                        if isinstance(parsed, dict):
-                            payload_obj = parsed
-                    except Exception:
-                        payload_obj = None
-
-                    if payload_obj is not None and web_service:
-                        if suppress_gateway_messages_for_new_session:
-                            continue
-                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, current_request_id)
-                        if step_msg:
-                            web_service.append_chat_message(step_msg)
-                        if interim_msg:
-                            web_service.append_chat_message(interim_msg)
-                        if consumed:
-                            continue
-
                     text = strip_gateway_control_markers(extract_text_from_gateway_message(message))
                     if not text:
                         continue
@@ -4194,6 +4165,32 @@ async def run_orchestrator() -> None:
             await asyncio.sleep(reconnect_delay_s)
             reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
 
+    async def gateway_raw_listener() -> None:
+        nonlocal current_request_id
+        reconnect_delay_s = 1.0
+        reconnect_delay_max_s = 8.0
+        while True:
+            try:
+                async for raw_frame in gateway.listen_raw():
+                    reconnect_delay_s = 1.0
+                    if not web_service or suppress_gateway_messages_for_new_session:
+                        continue
+                    web_service.append_chat_message(
+                        {
+                            "role": "raw_gateway",
+                            "text": raw_frame,
+                            "request_id": current_request_id,
+                            "source": "gateway_stream",
+                        }
+                    )
+            except (ConnectionRefusedError, OSError) as exc:
+                logger.warning("Gateway raw listener unavailable (%s); retrying in %.1fs", exc, reconnect_delay_s)
+            except Exception as exc:
+                logger.error("Gateway raw listener error: %s (retrying in %.1fs)", exc, reconnect_delay_s)
+
+            await asyncio.sleep(reconnect_delay_s)
+            reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
+
     print("🎤 Audio capture starting. Press Ctrl+C to stop.", flush=True)
     logger.info("🎤 Audio capture starting. Press Ctrl+C to stop.")
     try:
@@ -4229,6 +4226,8 @@ async def run_orchestrator() -> None:
         asyncio.create_task(gateway_listener())
         if hasattr(gateway, "listen_steps"):
             asyncio.create_task(gateway_steps_listener())
+        if hasattr(gateway, "listen_raw"):
+            asyncio.create_task(gateway_raw_listener())
     
     # Start tool monitor for timers/alarms if enabled
     if timers_feature_enabled and tool_router and alert_gen:

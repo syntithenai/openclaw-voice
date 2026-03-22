@@ -1244,27 +1244,21 @@ function mkBubble(m){
         wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
         const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
         const rawMessages=Array.isArray(m.raw_messages) ? m.raw_messages : [];
-        const formatRaw=(raw)=>{
-            const txt=String(raw||'').trim();
-            if(!txt) return '';
-            try{ return JSON.stringify(JSON.parse(txt), null, 2); }catch(_){ return txt; }
-        };
-        const summarizeRaw=(raw)=>{
-            const txt=String(raw||'').replace(/\s+/g, ' ').trim();
-            if(!txt) return '(empty)';
-            return txt.length>80 ? txt.slice(0, 79)+'…' : txt;
-        };
-        const itemsHtml=rawMessages.map((msg, idx)=>{
+        const mergedFrames=rawMessages.map((msg, idx)=>{
             const rawText=String((msg&&msg.text)||'');
-            const formatted=formatRaw(rawText);
-            return '<details data-detail-key="'+esc('req:'+reqKey+':raw:'+String(idx))+'" class="rounded border border-gray-700/70 bg-gray-900/40">'
-                +'<summary class="px-2 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100 font-mono">'+esc(summarizeRaw(rawText))+'</summary>'
-                +'<pre class="px-2 pb-2 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(formatted||'(empty)')+'</pre>'
-              +'</details>';
-        }).join('');
+            if(!rawText.trim()) return {index:idx, rawText:''};
+            try{
+                return JSON.parse(rawText);
+            }catch(_){
+                return {index:idx, rawText};
+            }
+        });
+        const mergedJson=JSON.stringify(mergedFrames, null, 2);
         wrap.innerHTML='<details data-detail-key="'+esc('req:'+reqKey+':raw-group')+'" class="rounded-xl bg-gray-900/60 border border-fuchsia-700/60 text-xs overflow-hidden">'
             +'<summary class="px-3 py-1.5 cursor-pointer text-fuchsia-200 hover:text-fuchsia-100 select-none">Debug: raw gateway JSON ('+esc(String(rawMessages.length))+')</summary>'
-            +'<div class="px-2 pb-2 pt-1 space-y-1">'+itemsHtml+'</div>'
+            +'<div class="px-2 pb-2 pt-1">'
+                +'<pre class="whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(mergedJson||'[]')+'</pre>'
+            +'</div>'
           +'</details>';
         d.appendChild(wrap);
         return d;
