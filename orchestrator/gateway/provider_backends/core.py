@@ -201,6 +201,7 @@ class OpenClawGateway(BaseGateway):
         self._ws: Optional[Any] = None
         self._pending_requests: dict[str, tuple[asyncio.Future, bool]] = {}
         self._incoming_texts: asyncio.Queue[str] = asyncio.Queue()
+        self._incoming_raw_frames: asyncio.Queue[str] = asyncio.Queue()
         self._step_events: asyncio.Queue[dict] = asyncio.Queue()
         self._connection_lock = asyncio.Lock()
         self._reader_task: Optional[asyncio.Task] = None
@@ -577,14 +578,17 @@ class OpenClawGateway(BaseGateway):
             while self._ws and self._ws_is_open():
                 try:
                     message = await asyncio.wait_for(self._ws.recv(), timeout=self.timeout_s)
+                    raw_message = message.decode("utf-8", errors="replace") if isinstance(message, (bytes, bytearray)) else str(message)
+                    if raw_message:
+                        await self._incoming_raw_frames.put(raw_message)
                     try:
-                        data = json.loads(message)
+                        data = json.loads(raw_message)
                     except json.JSONDecodeError:
-                        self._dump_raw_frame(message, note="json_decode_error")
-                        logger.debug("Failed to parse WebSocket message: %s", message[:100])
+                        self._dump_raw_frame(raw_message, note="json_decode_error")
+                        logger.debug("Failed to parse WebSocket message: %s", raw_message[:100])
                         continue
 
-                    self._dump_raw_frame(message, parsed=data)
+                    self._dump_raw_frame(raw_message, parsed=data)
 
                     if not isinstance(data, dict):
                         continue
@@ -859,6 +863,17 @@ class OpenClawGateway(BaseGateway):
                     yield text
         except Exception as exc:
             logger.warning("OpenClaw listen error: %s", exc)
+
+    async def listen_raw(self) -> AsyncIterator[str]:
+        await self._ensure_connected()
+
+        try:
+            while self._ws and self._ws_is_open():
+                raw = await self._incoming_raw_frames.get()
+                if raw:
+                    yield raw
+        except Exception as exc:
+            logger.warning("OpenClaw listen_raw error: %s", exc)
 
     async def listen_steps(self) -> AsyncIterator[dict]:
         await self._ensure_connected()

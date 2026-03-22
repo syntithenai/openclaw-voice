@@ -109,7 +109,7 @@ function renderMusicPage(main){
     const active=item.pos===m.position;
     const songId=String(item.id||'').trim();
     const checked=!!S.musicQueueSelectionByIds[songId];
-    return '<tr class="hover:bg-gray-800 '+(active?'bg-gray-700 font-semibold text-green-300 border-l-4 border-green-400':'')+'">'
+    return '<tr data-queue-pos="'+item.pos+'" class="hover:bg-gray-800 '+(active?'bg-gray-700 font-semibold text-green-300 border-l-4 border-green-400':'')+'">'
       +'<td class="px-3 py-3 w-12"><input type="checkbox" data-action="music-queue-select" data-position="'+item.pos+'" data-song-id="'+esc(songId)+'" class="w-5 h-5 cursor-pointer" '+(checked?'checked':'')+'></td>'
       +'<td class="px-2 py-2 w-8 text-gray-500 text-xs">'+(item.pos+1)+'</td>'
       +'<td class="px-2 py-2 text-sm truncate max-w-xs cursor-pointer hover:text-blue-400" data-action="music-play-track" data-position="'+item.pos+'">'+esc(item.title||item.file||'—')+'</td>'

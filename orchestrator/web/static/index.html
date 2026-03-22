@@ -4,23 +4,13 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>OpenClaw Voice</title>
-  <script src="https://cdn.tailwindcss.com"></script>
+  <link rel="stylesheet" href="/tailwind.generated.css" />
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.css" />
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vanilla-jsoneditor/themes/jse-theme-dark.css" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
-  <script>
-    if (window.tailwind) {
-      tailwind.config = {
-        darkMode: 'class',
-        theme: { extend: { colors: {
-          gray: { 950: '#0f1117', 900: '#171b26', 800: '#242a3b', 700: '#2f3548' }
-        } } }
-      };
-    }
-  </script>
   <link rel="stylesheet" href="/app-base.css" />
   <link rel="stylesheet" href="/app-layout.css" />
   <link rel="stylesheet" href="/app-chat.css" />
@@ -115,6 +105,7 @@
 </div>
 
 <script>
+  const __openclawAuthUser = __AUTH_USER_JSON__;
   window.__OPENCLAW_RUNTIME__ = {
     wsPort: __WS_PORT__,
     micStartsDisabled: __MIC_STARTS_DISABLED__,
@@ -122,9 +113,11 @@
     serverInstanceId: '__SERVER_INSTANCE_ID__',
     authMode: '__AUTH_MODE__',
     authenticated: __AUTHENTICATED__,
-    authUser: __AUTH_USER_JSON__,
+    authUser: __openclawAuthUser,
     googleClientId: '__GOOGLE_CLIENT_ID__',
-    authUserEmail: (__AUTH_USER_JSON__ && JSON.parse(__AUTH_USER_JSON__).email) || '',
+    authUserEmail: (__openclawAuthUser && typeof __openclawAuthUser === 'object' && __openclawAuthUser.email)
+      ? String(__openclawAuthUser.email)
+      : '',
   };
 </script>
 <script src="/app-core.js"></script>

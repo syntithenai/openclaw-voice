@@ -361,6 +361,9 @@ class VoiceConfig(BaseSettings):
     music_cut_in_duck_timeout_ms: int = Field(2000)  # Restore cut-in ducking after this timeout if not paused
     music_pipewire_stream_normalize_enabled: bool = Field(True)  # Normalize PipeWire per-app stream volume on play/resume
     music_pipewire_stream_target_percent: int = Field(100)  # Target PipeWire sink-input volume for music stream (percent)
+    music_state_persist_enabled: bool = Field(True)  # Persist queue snapshot + loaded playlist marker across restarts
+    music_state_persist_path: str = Field(".openclaw/music_runtime_state.json")  # Relative to OPENCLAW_WORKSPACE_DIR unless absolute
+    music_state_snapshot_playlist: str = Field("__openclaw_runtime_queue__")  # Hidden playlist used for queue snapshot restore
 
     # Media Keys (Hardware button detection)
     media_keys_enabled: bool = Field(False)  # Enable hardware media key detection

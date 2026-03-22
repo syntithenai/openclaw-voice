@@ -1,5 +1,6 @@
 const RUNTIME = window.__OPENCLAW_RUNTIME__ || {};
-const WS_PORT = Number(RUNTIME.wsPort || 0);
+const DEFAULT_WS_PORT = 18911;
+const WS_PORT = Number(RUNTIME.wsPort || 0) > 0 ? Number(RUNTIME.wsPort) : DEFAULT_WS_PORT;
 const MIC_STARTS_DISABLED = !!RUNTIME.micStartsDisabled;
 const AUDIO_AUTHORITY = String(RUNTIME.audioAuthority || 'native');
 const SERVER_INSTANCE_ID = String(RUNTIME.serverInstanceId || '');

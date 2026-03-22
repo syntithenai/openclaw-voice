@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -354,6 +355,48 @@ class WorkspaceFileManager:
             raise FileManagerError(500, f"failed creating folder: {exc}") from exc
 
         return {"entry": self._entry(new_folder)}
+
+    def delete_file(self, path: str | None) -> dict[str, Any]:
+        api_path = self._normalize_api_path(path)
+        real = self._resolve_virtual_file(api_path) if self._is_virtual(api_path) else self._resolve_real(api_path)
+
+        if not real.exists() or not real.is_file():
+            raise FileManagerError(404, "file not found")
+
+        try:
+            real.unlink()
+        except Exception as exc:
+            raise FileManagerError(500, f"failed deleting file: {exc}") from exc
+
+        return {"ok": True, "path": api_path}
+
+    def delete_folder(self, path: str | None) -> dict[str, Any]:
+        api_path = self._normalize_api_path(path)
+        if api_path == "/":
+            raise FileManagerError(400, "cannot delete workspace root")
+        if self._is_virtual(api_path):
+            raise FileManagerError(400, "cannot delete virtual folder")
+
+        real = self._resolve_real(api_path)
+        if not real.exists() or not real.is_dir():
+            raise FileManagerError(404, "folder not found")
+
+        try:
+            next(real.iterdir())
+            raise FileManagerError(400, "folder is not empty")
+        except StopIteration:
+            pass
+        except FileManagerError:
+            raise
+        except Exception as exc:
+            raise FileManagerError(500, f"failed reading folder: {exc}") from exc
+
+        try:
+            shutil.rmtree(real)
+        except Exception as exc:
+            raise FileManagerError(500, f"failed deleting folder: {exc}") from exc
+
+        return {"ok": True, "path": api_path}
 
     def resolve_preview_path(self, path: str | None) -> Path:
         api_path = self._normalize_api_path(path)

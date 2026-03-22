@@ -202,6 +202,13 @@ function handleMsg(msg){
                 S._musicStateRetryTimer = null;
             }
             applyMusic(msg.music||msg);
+            if(
+                S.page==='music'
+                && document.querySelector('.music-queue-table-container tbody tr')
+                && !document.querySelector('.music-queue-table-container tbody tr[data-queue-pos]')
+            ){
+                renderMusicPage(document.getElementById('main'));
+            }
             // Transport updates can arrive frequently (elapsed/position changes).
             // Avoid full page re-render on each tick, especially with large queues.
             applyMusicHeader();
@@ -465,15 +472,30 @@ function applyMusicQueueHighlight(){
     if(S.page!=='music') return;
     const pos = Number(S.music && S.music.position);
     if(!Number.isFinite(pos) || pos < 0) return;
-    const rows = document.querySelectorAll('.music-queue-table-container tbody tr[data-queue-pos]');
+    const rows = document.querySelectorAll('.music-queue-table-container tbody tr');
     if(!rows || !rows.length) return;
 
     rows.forEach((row) => {
-        const rowPos = Number(row.getAttribute('data-queue-pos'));
+        // Back-compat: rows rendered before data-queue-pos may still be present.
+        let rowPos = Number(row.getAttribute('data-queue-pos'));
+        if(!Number.isFinite(rowPos)){
+            const playBtn = row.querySelector('[data-action="music-play-track"][data-position]');
+            if(playBtn) rowPos = Number(playBtn.getAttribute('data-position'));
+        }
+        if(!Number.isFinite(rowPos)){
+            const selectCb = row.querySelector('[data-action="music-queue-select"][data-position]');
+            if(selectCb) rowPos = Number(selectCb.getAttribute('data-position'));
+        }
         const isActive = Number.isFinite(rowPos) && rowPos === pos;
-        row.classList.toggle('bg-gray-800', isActive);
+        row.classList.toggle('bg-gray-700', isActive);
+        row.classList.toggle('border-l-4', isActive);
+        row.classList.toggle('border-green-400', isActive);
         row.classList.toggle('font-semibold', isActive);
-        row.classList.toggle('text-green-400', isActive);
+        row.classList.toggle('text-green-300', isActive);
+
+        if(!isActive){
+            row.classList.remove('bg-gray-700', 'border-l-4', 'border-green-400', 'font-semibold', 'text-green-300');
+        }
     });
 }
 function applyMusic(m){
@@ -526,11 +548,13 @@ function _syncBrowserMusicCurrentTime(audio, targetSeconds, force=false){
     }
 }
 
-function _mediaUrlForFile(filePath){
+function _mediaUrlForFile(filePath, version=''){
     const raw = String(filePath||'').trim();
     if(!raw) return '';
     const parts = raw.split('/').map(p=>encodeURIComponent(p));
-    return '/files/media/' + parts.join('/');
+    const base = '/files/media/' + parts.join('/');
+    const v = String(version||'').trim();
+    return v ? (base + '?v=' + encodeURIComponent(v)) : base;
 }
 
 function syncBrowserMusicPlayback(){
@@ -539,6 +563,7 @@ function syncBrowserMusicPlayback(){
         const music = S.music || {};
         const state = normalizeMusicState(music.state);
         const filePath = String(music.file||'').trim();
+        const songId = String(music.songid||'').trim();
         const targetElapsed = Math.max(0, Number(music.elapsed) || 0);
         const audio = _ensureBrowserMusicAudio();
 
@@ -552,7 +577,7 @@ function syncBrowserMusicPlayback(){
             return;
         }
 
-        const src = _mediaUrlForFile(filePath);
+        const src = _mediaUrlForFile(filePath, songId);
         const srcChanged = !!src && audio.dataset.currentSrc !== src;
         if(src && audio.dataset.currentSrc !== src){
             audio.src = src;

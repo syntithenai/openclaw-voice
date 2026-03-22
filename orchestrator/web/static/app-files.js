@@ -37,9 +37,28 @@
         jsonEditor: null,
         createFolderModalOpen: false,
         createFolderName: '',
+        deleteModalOpen: false,
+        deleteTargetType: '',
+        deleteTargetPath: '',
+        deleteTargetName: '',
+        deleteBusy: false,
       };
     }
     return S.fileManager;
+  }
+
+  function isVirtualPath(path) {
+    const p = String(path || '');
+    return p === '/__virtual__/openclaw-config' || p.startsWith('/__virtual__/openclaw-config/');
+  }
+
+  function parentPath(path) {
+    const p = String(path || '/');
+    if (p === '/' || !p.startsWith('/')) return '/';
+    const parts = p.split('/').filter(Boolean);
+    if (!parts.length) return '/';
+    parts.pop();
+    return parts.length ? ('/' + parts.join('/')) : '/';
   }
 
   function updateSaveBadgeDom() {
@@ -167,7 +186,8 @@
       const nodePath = String(node.path || '');
       const isFolder = String(node.kind || '') === 'folder' || String(node.kind || '') === 'virtual-folder';
       const isExpanded = !!st.expandedByPath[nodePath];
-      const isActive = st.selectedFolderPath === nodePath;
+      const isActive = isFolder ? (st.selectedFolderPath === nodePath) : (st.selectedFilePath === nodePath);
+      const rowAction = isFolder ? 'fm-select-folder' : 'fm-select-file';
       const left = 10 + (depth * 14);
 
       const branch = isFolder
@@ -175,7 +195,7 @@
         : '<span class="text-xs text-gray-500">.</span>';
 
       const row = ''
-        + '<div class="fm-tree-row ' + (isActive ? 'active' : '') + '" style="margin-left:' + left + 'px" data-action="fm-select-folder" data-path="' + fmEsc(nodePath) + '">'
+        + '<div class="fm-tree-row ' + (isActive ? 'active' : '') + '" style="margin-left:' + left + 'px" data-action="' + rowAction + '" data-path="' + fmEsc(nodePath) + '">'
         + branch
         + '<span class="text-sm">' + fmEsc(node.name) + '</span>'
         + '</div>';
@@ -463,6 +483,75 @@
     }
   }
 
+  function openDeleteModal(type, path, name) {
+    const st = fmState();
+    st.deleteModalOpen = true;
+    st.deleteTargetType = String(type || '');
+    st.deleteTargetPath = String(path || '');
+    st.deleteTargetName = String(name || '');
+    st.deleteBusy = false;
+    renderFileManagerPage(fmMain());
+  }
+
+  function closeDeleteModal() {
+    const st = fmState();
+    st.deleteModalOpen = false;
+    st.deleteTargetType = '';
+    st.deleteTargetPath = '';
+    st.deleteTargetName = '';
+    st.deleteBusy = false;
+    renderFileManagerPage(fmMain());
+  }
+
+  async function confirmDelete() {
+    const st = fmState();
+    if (st.deleteBusy) return;
+
+    const targetType = String(st.deleteTargetType || '');
+    const targetPath = String(st.deleteTargetPath || '');
+    if (!targetType || !targetPath) {
+      closeDeleteModal();
+      return;
+    }
+
+    st.deleteBusy = true;
+    st.error = '';
+    renderFileManagerPage(fmMain());
+
+    try {
+      if (targetType === 'file') {
+        await fmFetchJson(FM_API + '/file?path=' + encodeURIComponent(targetPath), { method: 'DELETE' });
+        if (st.saveTimersByPath[targetPath]) {
+          clearTimeout(st.saveTimersByPath[targetPath]);
+          delete st.saveTimersByPath[targetPath];
+        }
+        delete st.saveStateByPath[targetPath];
+        st.selectedFilePath = '';
+        st.currentFile = null;
+        destroyEditors();
+        st.treeByPath = {};
+        await loadTree('/');
+        await selectFolder(parentPath(targetPath));
+      } else if (targetType === 'folder') {
+        await fmFetchJson(FM_API + '/folder?path=' + encodeURIComponent(targetPath), { method: 'DELETE' });
+        st.treeByPath = {};
+        await loadTree('/');
+        await selectFolder(parentPath(targetPath));
+      }
+      st.deleteModalOpen = false;
+      st.deleteTargetType = '';
+      st.deleteTargetPath = '';
+      st.deleteTargetName = '';
+      st.deleteBusy = false;
+      renderFileManagerPage(fmMain());
+    } catch (err) {
+      st.deleteBusy = false;
+      st.deleteModalOpen = false;
+      st.error = String(err && err.message ? err.message : err);
+      renderFileManagerPage(fmMain());
+    }
+  }
+
   function saveBadgeHtml() {
     return '<span id="fmSaveBadge" class="hidden px-2 py-1 rounded text-xs bg-gray-700"></span>';
   }
@@ -474,16 +563,39 @@
 
     const treeRows = renderTreeRows('/', 0);
     const showingFile = !!st.currentFile;
+    const folderItems = Array.isArray(st.folderChildren) ? st.folderChildren : [];
+    const folderIsEmpty = !showingFile && folderItems.length === 0;
+    const selectedFolderPath = String(st.selectedFolderPath || '/');
+    const canDeleteEmptyFolder = folderIsEmpty && selectedFolderPath !== '/' && !isVirtualPath(selectedFolderPath);
     const mainPanelBody = showingFile ? renderEditorPane() : renderFolderRows();
     const mainPanelTitle = showingFile
       ? fmEsc(st.currentFile ? st.currentFile.name : 'Editor / Preview')
       : fmEsc(currentFolderName());
     const mainPanelActions = showingFile
-      ? '<div class="flex items-center gap-2"><button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-close-file">Back to folder</button>' + saveBadgeHtml() + '</div>'
-      : '<button type="button" class="px-2 py-1 text-xs rounded bg-blue-700 hover:bg-blue-600" data-action="fm-open-create-folder">Create Folder</button>';
+      ? '<div class="flex items-center gap-2"><button type="button" class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-700" data-action="fm-open-delete-file">Delete</button><button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-close-file">Back to folder</button>' + saveBadgeHtml() + '</div>'
+      : ('<div class="flex items-center gap-2">'
+        + (canDeleteEmptyFolder ? '<button type="button" class="px-2 py-1 text-xs rounded bg-red-800 hover:bg-red-700" data-action="fm-open-delete-folder">Delete Folder</button>' : '')
+        + '<button type="button" class="px-2 py-1 text-xs rounded bg-blue-700 hover:bg-blue-600" data-action="fm-open-create-folder">Create Folder</button>'
+        + '</div>');
 
-    const modal = st.createFolderModalOpen
-      ? ''
+    let modal = '';
+    if (st.deleteModalOpen) {
+      const typeLabel = st.deleteTargetType === 'folder' ? 'folder' : 'file';
+      const confirmLabel = st.deleteBusy ? 'Deleting...' : 'Delete';
+      const disabledAttr = st.deleteBusy ? ' disabled' : '';
+      modal = ''
+        + '<div class="fm-modal-backdrop">'
+        + '<div class="fm-modal space-y-3">'
+        + '<div class="text-sm font-semibold">Delete ' + typeLabel + '?</div>'
+        + '<div class="text-sm text-gray-300">This permanently deletes <span class="font-semibold">' + fmEsc(st.deleteTargetName || st.deleteTargetPath || typeLabel) + '</span>.</div>'
+        + '<div class="flex justify-end gap-2">'
+        + '<button type="button" class="px-3 py-1.5 rounded bg-gray-700" data-action="fm-delete-cancel"' + disabledAttr + '>Cancel</button>'
+        + '<button id="fmDeleteConfirm" type="button" class="px-3 py-1.5 rounded bg-red-800 hover:bg-red-700" data-action="fm-delete-confirm"' + disabledAttr + '>' + confirmLabel + '</button>'
+        + '</div>'
+        + '</div>'
+        + '</div>';
+    } else if (st.createFolderModalOpen) {
+      modal = ''
         + '<div class="fm-modal-backdrop">'
         + '<div class="fm-modal space-y-3">'
         + '<div class="text-sm font-semibold">Create folder</div>'
@@ -493,8 +605,8 @@
         + '<button type="button" class="px-3 py-1.5 rounded bg-blue-700" data-action="fm-create-confirm">Create</button>'
         + '</div>'
         + '</div>'
-        + '</div>'
-      : '';
+        + '</div>';
+    }
 
     if (st.loading) {
       main.innerHTML = '<div class="px-4 py-4 text-sm text-gray-400">Loading file manager...</div>';
@@ -526,6 +638,12 @@
       setTimeout(() => {
         const input = document.getElementById('fmCreateFolderName');
         if (input) input.focus();
+      }, 0);
+    }
+    if (st.deleteModalOpen) {
+      setTimeout(() => {
+        const btn = document.getElementById('fmDeleteConfirm');
+        if (btn && !st.deleteBusy) btn.focus();
       }, 0);
     }
 
@@ -579,6 +697,25 @@
       return true;
     }
 
+    const openDeleteFile = target.closest('[data-action="fm-open-delete-file"]');
+    if (openDeleteFile) {
+      event.preventDefault();
+      if (st.currentFile && st.currentFile.path) {
+        openDeleteModal('file', st.currentFile.path, st.currentFile.name || st.currentFile.path);
+      }
+      return true;
+    }
+
+    const openDeleteFolder = target.closest('[data-action="fm-open-delete-folder"]');
+    if (openDeleteFolder) {
+      event.preventDefault();
+      const path = String(st.selectedFolderPath || '/');
+      if (path !== '/' && !isVirtualPath(path)) {
+        openDeleteModal('folder', path, currentFolderName());
+      }
+      return true;
+    }
+
     const cancelCreate = target.closest('[data-action="fm-create-cancel"]');
     if (cancelCreate) {
       event.preventDefault();
@@ -592,6 +729,22 @@
     if (confirmCreate) {
       event.preventDefault();
       void createFolder();
+      return true;
+    }
+
+    const cancelDelete = target.closest('[data-action="fm-delete-cancel"]');
+    if (cancelDelete) {
+      event.preventDefault();
+      if (!st.deleteBusy) closeDeleteModal();
+      return true;
+    }
+
+    const confirmDeleteBtn = target.closest('[data-action="fm-delete-confirm"]');
+    if (confirmDeleteBtn) {
+      event.preventDefault();
+      if (!st.deleteBusy) {
+        void confirmDelete();
+      }
       return true;
     }
 
@@ -615,6 +768,16 @@
     if (t.id === 'fmCreateFolderName' && event.key === 'Enter') {
       event.preventDefault();
       void createFolder();
+      return true;
+    }
+    if (st.deleteModalOpen && event.key === 'Enter' && !st.deleteBusy) {
+      event.preventDefault();
+      void confirmDelete();
+      return true;
+    }
+    if (event.key === 'Escape' && st.deleteModalOpen) {
+      event.preventDefault();
+      if (!st.deleteBusy) closeDeleteModal();
       return true;
     }
     if (event.key === 'Escape' && st.createFolderModalOpen) {

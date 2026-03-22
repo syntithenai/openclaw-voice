@@ -123,6 +123,9 @@ class _NativeMusicBackend:
         self._startup_index_lock = asyncio.Lock()
         self._startup_index_task: asyncio.Task[None] | None = None
         self._indexing_active = False
+        # Single persistent background task that watches the current player proc
+        # and advances the queue when it exits naturally.
+        self._auto_advance_task: asyncio.Task[None] | None = None
 
     def _on_startup_index_done(self, task: asyncio.Task[None]) -> None:
         try:
@@ -232,25 +235,90 @@ class _NativeMusicBackend:
             return float(self.elapsed_anchor_value)
         return max(0.0, float(self.elapsed_anchor_value) + (time.monotonic() - self.elapsed_anchor_ts))
 
-    async def _maybe_advance_finished_track(self) -> None:
-        """Advance queue when local playback process has exited.
+    async def _maybe_advance_browser_route(self) -> None:
+        """Advance browser-route playback when elapsed reaches track duration.
 
-        Browser-route playback is managed externally and does not expose a local
-        process lifecycle we can use for automatic progression.
+        Browser route has no local subprocess to wait on, so we detect track end
+        using elapsed/duration from the indexed metadata.
         """
         if self.state != "play":
             return
-        if self.player.output_route == "browser":
+        if self.player.output_route != "browser":
             return
-        if self.player.is_active():
+        item = self._current_item()
+        if not item:
             return
-        if not self.queue:
-            self.current_pos = -1
-            self._set_state("stop")
+        track = self.library.get_track(item.file) or {}
+        try:
+            duration = float(track.get("duration", "0") or 0.0)
+        except Exception:
+            duration = 0.0
+        if duration <= 0.0:
             return
-
-        next_pos = 0 if self.current_pos < 0 else (self.current_pos + 1) % len(self.queue)
+        if self._elapsed_now() + 0.05 < duration:
+            return
+        next_pos = (self.current_pos + 1) % len(self.queue)
+        logger.debug(
+            "⏭ Browser-route auto-advance: pos %d → %d (queue length %d)",
+            self.current_pos,
+            next_pos,
+            len(self.queue),
+        )
         await self._play_pos(next_pos)
+
+    async def _auto_advance_loop(self) -> None:
+        """Persistent background loop: watches the current local player process
+        and advances the queue when it exits naturally.
+
+        Re-fetches player._proc each iteration so it handles seekcur and any
+        other operation that replaces the process without going through _play_pos.
+        """
+        while True:
+            # Not playing locally — park.
+            if (
+                self.state != "play"
+                or self.player.output_route == "browser"
+                or self.player._proc is None
+            ):
+                await asyncio.sleep(0.2)
+                continue
+
+            proc = self.player._proc
+            pos = self.current_pos
+
+            try:
+                await proc.wait()
+            except Exception:
+                await asyncio.sleep(0.1)
+                continue
+
+            # Guards: if anything changed while we waited, loop back and recheck.
+            if self.state != "play":
+                continue
+            if self.current_pos != pos:
+                continue
+            if self.player._proc is not proc:
+                continue
+            if not self.queue:
+                self.current_pos = -1
+                self._set_state("stop")
+                continue
+
+            next_pos = (pos + 1) % len(self.queue)
+            logger.debug(
+                "⏭ Auto-advancing queue: pos %d → %d (queue length %d)",
+                pos,
+                next_pos,
+                len(self.queue),
+            )
+            await self._play_pos(next_pos)
+
+    def start_auto_advance_loop(self) -> None:
+        """Start the background auto-advance loop (idempotent; safe to call multiple times)."""
+        if self._auto_advance_task is not None and not self._auto_advance_task.done():
+            return
+        self._auto_advance_task = asyncio.create_task(self._auto_advance_loop())
+        logger.debug("↻ Music auto-advance loop started")
 
     async def _play_pos(self, pos: int, seek_s: int = 0) -> None:
         if not self.queue:
@@ -282,7 +350,7 @@ class _NativeMusicBackend:
         op = parts[0].lower()
 
         if op == "status":
-            await self._maybe_advance_finished_track()
+            await self._maybe_advance_browser_route()
             current = self._current_item()
             track = self.library.get_track(current.file) if current else None
             duration = float(track.get("duration", "0") or 0.0) if track else 0.0
@@ -599,6 +667,11 @@ class NativeMusicClientPool:
             _BACKEND.start_startup_index()
         except Exception:
             pass
+            # Start the persistent queue-advance loop (idempotent).
+            try:
+                _BACKEND.start_auto_advance_loop()
+            except Exception:
+                pass
         return True
 
     async def close(self):

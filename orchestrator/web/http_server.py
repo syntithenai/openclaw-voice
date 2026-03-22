@@ -410,6 +410,21 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                 self._send_json({"error": exc.message}, status=exc.status)
                 return True
 
+        def _handle_file_manager_delete(self, path: str, query: dict[str, list[str]]) -> bool:
+            if path not in {"/api/file-manager/file", "/api/file-manager/folder"}:
+                return False
+            try:
+                manager = self._require_file_manager()
+                target_path = self._query_path(query, "/")
+                if path == "/api/file-manager/file":
+                    self._send_json(manager.delete_file(target_path))
+                    return True
+                self._send_json(manager.delete_folder(target_path))
+                return True
+            except FileManagerError as exc:
+                self._send_json({"error": exc.message}, status=exc.status)
+                return True
+
         def do_OPTIONS(self) -> None:  # noqa: N802
             self._send(b"", status=204, content_type="text/plain")
 
@@ -508,6 +523,19 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                 return
 
             if self._handle_file_manager_put(path, query, body):
+                return
+
+            self._send_json({"error": "Not found"}, status=404)
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            path = self._parse_request_path()
+            query = self._parse_query_params()
+
+            if service.should_protect_http_path(path) and not self._is_authenticated():
+                self._send(b"Authentication required", status=401, content_type="text/plain")
+                return
+
+            if self._handle_file_manager_delete(path, query):
                 return
 
             self._send_json({"error": "Not found"}, status=404)

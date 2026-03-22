@@ -509,6 +509,10 @@ class MusicManager:
             )
         self._loaded_playlist_name = ""
 
+    def set_loaded_playlist_name(self, name: str) -> None:
+        """Override the in-memory loaded playlist marker without changing queue contents."""
+        self._loaded_playlist_name = str(name or "").strip()
+
     @staticmethod
     def _quote(value: str) -> str:
         return str(value).replace('\\', '\\\\').replace('"', '\\"')
@@ -1434,6 +1438,43 @@ class MusicManager:
             logger.error(f"Failed to save playlist: {e}")
             return f"Error: {e}"
 
+    async def save_queue_snapshot_playlist(self, name: str) -> str:
+        """Save current queue to a playlist without changing loaded_playlist state."""
+        try:
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Snapshot playlist name is required"
+            try:
+                await self._control_execute(f'rm "{self._quote(playlist_name)}"')
+            except Exception:
+                pass
+            await self._control_execute(f'save "{self._quote(playlist_name)}"')
+            self._playlist_names_cache = [p for p in self._playlist_names_cache if p.lower() != playlist_name.lower()]
+            self._playlist_names_cache.append(playlist_name)
+            self._playlist_names_cache_ts = time.monotonic()
+            return f"Saved queue snapshot: {playlist_name}"
+        except Exception as e:
+            logger.error(f"Failed to save queue snapshot playlist: {e}")
+            return f"Error: {e}"
+
+    async def load_queue_snapshot_playlist(self, name: str) -> str:
+        """Load queue from a playlist without changing loaded_playlist state."""
+        try:
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Snapshot playlist name is required"
+
+            actual_playlist_name = await self.resolve_playlist_name(playlist_name, refresh_if_miss=True)
+            if not actual_playlist_name:
+                return f"Error: Playlist '{playlist_name}' not found"
+
+            await self._control_execute("clear", timeout=8.0)
+            await self._control_execute(f'load "{self._quote(actual_playlist_name)}"', timeout=25.0)
+            return f"Loaded queue snapshot: {actual_playlist_name}"
+        except Exception as e:
+            logger.error(f"Failed to load queue snapshot playlist '{name}': {e}")
+            return f"Error: {e}"
+
     async def rename_playlist(self, old_name: str, new_name: str) -> str:
         """Rename a saved playlist (case-insensitive source lookup)."""
         try:
@@ -1472,7 +1513,7 @@ class MusicManager:
             logger.error(f"Failed to rename playlist '{old_name}' -> '{new_name}': {e}")
             return f"Error: {e}"
     
-    async def delete_playlist(self, name: str) -> str:
+    async def delete_playlist(self, name: str, ignore_missing: bool = False) -> str:
         """Delete a saved playlist (case-insensitive matching)."""
         try:
             playlist_name = str(name or "").strip()
@@ -1490,6 +1531,13 @@ class MusicManager:
                     break
             
             if not actual_playlist_name:
+                if ignore_missing:
+                    logger.debug(
+                        "Playlist '%s' missing during cleanup delete; skipping. Available: %s",
+                        playlist_name,
+                        available_playlists,
+                    )
+                    return f"Playlist '{playlist_name}' not found"
                 logger.warning(
                     f"Playlist '{playlist_name}' not found for deletion. Available: {available_playlists}"
                 )
@@ -1880,6 +1928,7 @@ class MusicManager:
                 "queue_length": int(status.get("playlistlength", 0) or 0),
                 "playlist_version": str(status.get("playlist", "") or ""),
                 "position": position,
+                "songid": str(status.get("songid", "") or ""),
                 "volume": int(vol_raw) if vol_raw is not None else None,
                 "title": track.get("title") or track.get("Title", ""),
                 "artist": track.get("artist") or track.get("Artist", ""),

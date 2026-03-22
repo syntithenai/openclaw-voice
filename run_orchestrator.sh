@@ -104,8 +104,16 @@ fi
 
 # Ensure key runtime deps exist even for pre-existing venvs created before
 # requirements changed.
-if ! "$VENV_PATH/bin/python" -c "import httpx" >/dev/null 2>&1; then
-  echo "INFO: Missing Python dependency 'httpx' in $VENV_PATH. Installing requirements..."
+MISSING_DEPS=""
+for dep in httpx inotify_simple; do
+  if ! "$VENV_PATH/bin/python" -c "import $dep" >/dev/null 2>&1; then
+    MISSING_DEPS="$MISSING_DEPS $dep"
+  fi
+done
+
+if [ -n "$MISSING_DEPS" ]; then
+  echo "INFO: Missing Python dependencies in $VENV_PATH:$MISSING_DEPS"
+  echo "INFO: Installing requirements.txt to self-heal runtime environment..."
   if [ -f "$SCRIPT_DIR/requirements.txt" ]; then
     "$VENV_PATH/bin/python" -m pip install -r "$SCRIPT_DIR/requirements.txt" || {
       echo "ERROR: Failed to install requirements.txt"

@@ -24,6 +24,7 @@ import math
 import platform
 import re
 import threading
+import tempfile
 import time
 import unicodedata
 import wave
@@ -31,7 +32,7 @@ from collections import deque
 from contextlib import redirect_stderr
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Awaitable, Callable, Sequence
 from urllib.parse import urlsplit
 from urllib.request import urlretrieve
 
@@ -882,6 +883,10 @@ async def run_orchestrator() -> None:
     # Music Control System (native backend)
     music_router = None
     music_manager = None
+    music_state_persist_task: asyncio.Task | None = None
+    music_state_persist_path: Path | None = None
+    music_state_snapshot_playlist = ""
+    music_state_flush: Callable[[], Awaitable[None]] | None = None
     if config.music_enabled:
         print("→ Initializing Music Control System (native)...", flush=True)
         logger.info("→ Initializing Music Control System...")
@@ -987,6 +992,162 @@ async def run_orchestrator() -> None:
             print(f"✗ Music Control System initialization failed: {e}", flush=True)
             music_router = None
             music_manager = None
+
+    if config.music_enabled and music_manager and config.music_state_persist_enabled:
+        raw_state_path = str(config.music_state_persist_path or "").strip()
+        if raw_state_path:
+            state_path_candidate = Path(raw_state_path).expanduser()
+            if not state_path_candidate.is_absolute():
+                state_path_candidate = (workspace_root / state_path_candidate).resolve()
+        else:
+            state_path_candidate = (workspace_root / ".openclaw" / "music_runtime_state.json").resolve()
+
+        music_state_persist_path = state_path_candidate
+        music_state_snapshot_playlist = str(config.music_state_snapshot_playlist or "").strip() or "__openclaw_runtime_queue__"
+
+        def _build_music_state_payload(loaded_playlist: str, has_queue_snapshot: bool) -> dict[str, Any]:
+            return {
+                "version": 1,
+                "saved_ts": time.time(),
+                "loaded_playlist": str(loaded_playlist or "").strip(),
+                "queue_snapshot_playlist": music_state_snapshot_playlist,
+                "has_queue_snapshot": bool(has_queue_snapshot),
+            }
+
+        async def _persist_music_runtime_state(reason: str, force: bool = False) -> None:
+            if not music_manager or not music_state_persist_path:
+                return
+            try:
+                status = await music_manager.get_status()
+                try:
+                    queue_length = int(status.get("playlistlength", 0) or 0)
+                except Exception:
+                    queue_length = 0
+
+                has_queue_snapshot = False
+                if queue_length > 0:
+                    snapshot_result = await music_manager.save_queue_snapshot_playlist(music_state_snapshot_playlist)
+                    if str(snapshot_result).startswith("Error:"):
+                        logger.warning("Music runtime persist (%s): failed to save queue snapshot: %s", reason, snapshot_result)
+                    else:
+                        has_queue_snapshot = True
+                else:
+                    # Best-effort cleanup so old snapshots do not restore stale queues.
+                    try:
+                        await music_manager.delete_playlist(
+                            music_state_snapshot_playlist,
+                            ignore_missing=True,
+                        )
+                    except Exception:
+                        pass
+
+                payload = _build_music_state_payload(
+                    music_manager.get_loaded_playlist_name(),
+                    has_queue_snapshot,
+                )
+                music_state_persist_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_fd, tmp_path = tempfile.mkstemp(
+                    dir=music_state_persist_path.parent,
+                    prefix=".music_state_",
+                    suffix=".tmp",
+                )
+                try:
+                    with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                        json.dump(payload, f, ensure_ascii=False)
+                    os.replace(tmp_path, music_state_persist_path)
+                except Exception:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+                    raise
+
+                if force:
+                    logger.info(
+                        "Music runtime state persisted (%s): queue_snapshot=%s loaded_playlist='%s' path=%s",
+                        reason,
+                        has_queue_snapshot,
+                        payload["loaded_playlist"],
+                        music_state_persist_path,
+                    )
+            except Exception as exc:
+                logger.warning("Music runtime persist (%s) failed: %s", reason, exc)
+
+        async def _restore_music_runtime_state() -> None:
+            if not music_manager or not music_state_persist_path:
+                return
+            try:
+                if not music_state_persist_path.exists():
+                    logger.info("Music runtime restore: no state file at %s", music_state_persist_path)
+                    return
+
+                data = json.loads(music_state_persist_path.read_text(encoding="utf-8"))
+                persisted_snapshot = str(data.get("queue_snapshot_playlist") or "").strip() or music_state_snapshot_playlist
+                saved_loaded_playlist = str(data.get("loaded_playlist") or "").strip()
+                has_queue_snapshot = bool(data.get("has_queue_snapshot", False))
+
+                queue_restored = False
+                if has_queue_snapshot:
+                    load_result = await music_manager.load_queue_snapshot_playlist(persisted_snapshot)
+                    if str(load_result).startswith("Error:"):
+                        logger.warning("Music runtime restore: queue snapshot load failed: %s", load_result)
+                    else:
+                        queue_restored = True
+
+                restored_loaded_playlist = ""
+                if saved_loaded_playlist:
+                    resolved = await music_manager.resolve_playlist_name(saved_loaded_playlist, refresh_if_miss=True)
+                    if resolved:
+                        restored_loaded_playlist = resolved
+                    else:
+                        logger.warning(
+                            "Music runtime restore: saved loaded playlist '%s' was not found",
+                            saved_loaded_playlist,
+                        )
+
+                music_manager.set_loaded_playlist_name(restored_loaded_playlist)
+                logger.info(
+                    "Music runtime restore: queue_restored=%s loaded_playlist='%s' state_path=%s",
+                    queue_restored,
+                    restored_loaded_playlist,
+                    music_state_persist_path,
+                )
+            except Exception as exc:
+                logger.warning("Music runtime restore failed: %s", exc)
+
+        async def _music_state_persist_loop() -> None:
+            last_signature: tuple[int, str, str] | None = None
+            consecutive_failures = 0
+            while True:
+                await asyncio.sleep(1.0)
+                if not music_manager:
+                    break
+                try:
+                    status = await music_manager.get_status()
+                    queue_length = int(status.get("playlistlength", 0) or 0)
+                    queue_version = str(status.get("playlist", "") or "")
+                    loaded_playlist = music_manager.get_loaded_playlist_name()
+                    signature = (queue_length, queue_version, loaded_playlist)
+                    if signature != last_signature:
+                        await _persist_music_runtime_state("poll")
+                        last_signature = signature
+                    consecutive_failures = 0
+                except Exception as exc:
+                    consecutive_failures += 1
+                    if consecutive_failures <= 3 or consecutive_failures % 20 == 0:
+                        logger.warning(
+                            "Music runtime persistence loop error (%d): %s",
+                            consecutive_failures,
+                            exc,
+                        )
+
+        async def _flush_music_state() -> None:
+            await _persist_music_runtime_state("shutdown", force=True)
+
+        await _restore_music_runtime_state()
+        await _persist_music_runtime_state("startup_sync", force=True)
+        music_state_flush = _flush_music_state
+        music_state_persist_task = asyncio.create_task(_music_state_persist_loop())
     
     recorder_tool = None
     recording_blocks_tools = False
@@ -2075,6 +2236,23 @@ async def run_orchestrator() -> None:
                         music_manager.pool.set_output_route("browser" if enabled else "local")
                         if getattr(music_manager, "control_pool", None) is not None and hasattr(music_manager.control_pool, "set_output_route"):
                             music_manager.control_pool.set_output_route("browser" if enabled else "local")
+
+                        # Handoff when turning browser audio OFF while currently playing:
+                        # restart the same queue position on local output so local
+                        # process-based auto-advance remains active at track end.
+                        if not enabled:
+                            try:
+                                status = await music_manager.get_status()
+                                state = str(status.get("state", "stop") or "stop")
+                                if state == "play":
+                                    pos = int(status.get("song", -1) or -1)
+                                    elapsed_s = int(float(status.get("elapsed", 0) or 0))
+                                    if pos >= 0:
+                                        await music_manager.pool.execute(f"play {pos}")
+                                        if elapsed_s > 0:
+                                            await music_manager.pool.execute(f"seekcur {elapsed_s}")
+                            except Exception as handoff_exc:
+                                logger.debug("Browser->local music handoff skipped: %s", handoff_exc)
                     except Exception as exc:
                         logger.debug("Failed to update native music output route: %s", exc)
 
@@ -4003,16 +4181,6 @@ async def run_orchestrator() -> None:
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
 
-                    if web_service and not suppress_gateway_messages_for_new_session:
-                        web_service.append_chat_message(
-                            {
-                                "role": "raw_gateway",
-                                "text": message,
-                                "request_id": current_request_id,
-                                "source": "gateway_stream",
-                            }
-                        )
-
                     payload_obj: dict[str, Any] | None = None
                     try:
                         parsed = json.loads(message)
@@ -4143,6 +4311,34 @@ async def run_orchestrator() -> None:
             await asyncio.sleep(reconnect_delay_s)
             reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
 
+    async def gateway_raw_listener() -> None:
+        nonlocal current_request_id
+        reconnect_delay_s = 1.0
+        reconnect_delay_max_s = 8.0
+        while True:
+            try:
+                async for raw_message in gateway.listen_raw():
+                    reconnect_delay_s = 1.0
+                    if not isinstance(raw_message, str) or not web_service:
+                        continue
+                    if suppress_gateway_messages_for_new_session:
+                        continue
+                    web_service.append_chat_message(
+                        {
+                            "role": "raw_gateway",
+                            "text": raw_message,
+                            "request_id": current_request_id,
+                            "source": "gateway_stream",
+                        }
+                    )
+            except (ConnectionRefusedError, OSError) as exc:
+                logger.warning("Gateway raw listener unavailable (%s); retrying in %.1fs", exc, reconnect_delay_s)
+            except Exception as exc:
+                logger.error("Gateway raw listener error: %s (retrying in %.1fs)", exc, reconnect_delay_s)
+
+            await asyncio.sleep(reconnect_delay_s)
+            reconnect_delay_s = min(reconnect_delay_max_s, reconnect_delay_s * 2.0)
+
     async def gateway_steps_listener() -> None:
         nonlocal current_request_id
         reconnect_delay_s = 1.0
@@ -4227,6 +4423,8 @@ async def run_orchestrator() -> None:
     # Start gateway listener if supported
     if getattr(gateway, "supports_listen", False):
         asyncio.create_task(gateway_listener())
+        if hasattr(gateway, "listen_raw"):
+            asyncio.create_task(gateway_raw_listener())
         if hasattr(gateway, "listen_steps"):
             asyncio.create_task(gateway_steps_listener())
     
@@ -5697,6 +5895,18 @@ async def run_orchestrator() -> None:
     finally:
         if 'local_capture_paused_for_browser' in locals() and local_capture_paused_for_browser and hasattr(capture, "set_muted"):
             capture.set_muted(local_capture_prev_muted)
+        if music_state_flush:
+            try:
+                await music_state_flush()
+            except Exception as exc:
+                logger.warning("Music runtime state shutdown flush failed: %s", exc)
+        if music_state_persist_task:
+            logger.info("Stopping music runtime persistence task...")
+            music_state_persist_task.cancel()
+            try:
+                await music_state_persist_task
+            except asyncio.CancelledError:
+                pass
         if recordings_catalog:
             logger.info("Stopping recordings catalog...")
             await recordings_catalog.stop()
