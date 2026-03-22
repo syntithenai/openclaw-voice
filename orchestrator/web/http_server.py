@@ -3,6 +3,7 @@ from __future__ import annotations
 import html as html_utils
 import json
 import mimetypes
+import re
 from pathlib import Path
 import ssl
 import threading
@@ -76,9 +77,79 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
             return doc.encode("utf-8")
 
         def _send_file(self, file_path: Path) -> None:
-            data = file_path.read_bytes()
             content_type, _ = mimetypes.guess_type(str(file_path))
-            self._send(data, content_type=content_type or "application/octet-stream")
+            content_type = content_type or "application/octet-stream"
+            file_size = file_path.stat().st_size
+            range_header = str(self.headers.get("Range", "") or "").strip()
+
+            if range_header:
+                match = re.fullmatch(r"bytes=(\d*)-(\d*)", range_header)
+                if not match:
+                    self._send(
+                        b"Invalid Range",
+                        status=416,
+                        content_type="text/plain",
+                        extra_headers=[
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Range", f"bytes */{file_size}"),
+                        ],
+                    )
+                    return
+
+                start_str, end_str = match.groups()
+                if start_str:
+                    start = int(start_str)
+                    end = int(end_str) if end_str else (file_size - 1)
+                else:
+                    suffix_len = int(end_str or 0)
+                    if suffix_len <= 0:
+                        self._send(
+                            b"Invalid Range",
+                            status=416,
+                            content_type="text/plain",
+                            extra_headers=[
+                                ("Accept-Ranges", "bytes"),
+                                ("Content-Range", f"bytes */{file_size}"),
+                            ],
+                        )
+                        return
+                    start = max(0, file_size - suffix_len)
+                    end = file_size - 1
+
+                if start >= file_size or end < start:
+                    self._send(
+                        b"Invalid Range",
+                        status=416,
+                        content_type="text/plain",
+                        extra_headers=[
+                            ("Accept-Ranges", "bytes"),
+                            ("Content-Range", f"bytes */{file_size}"),
+                        ],
+                    )
+                    return
+
+                end = min(end, file_size - 1)
+                length = (end - start) + 1
+                with file_path.open("rb") as handle:
+                    handle.seek(start)
+                    body = handle.read(length)
+                self._send(
+                    body,
+                    status=206,
+                    content_type=content_type,
+                    extra_headers=[
+                        ("Accept-Ranges", "bytes"),
+                        ("Content-Range", f"bytes {start}-{end}/{file_size}"),
+                    ],
+                )
+                return
+
+            data = file_path.read_bytes()
+            self._send(
+                data,
+                content_type=content_type,
+                extra_headers=[("Accept-Ranges", "bytes")],
+            )
 
         def _render_ui_index(self) -> bytes:
             auth_bootstrap = service.auth_bootstrap_from_headers(self.headers)

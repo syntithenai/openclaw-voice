@@ -1,6 +1,7 @@
 """Music manager with high-level operations for native backend control."""
 
 import asyncio
+import difflib
 import logging
 import os
 import sqlite3
@@ -12,6 +13,46 @@ from .native_client import NativeMusicClientPool
 from orchestrator.observability.latency_trace import emit as emit_latency_trace
 
 logger = logging.getLogger(__name__)
+
+
+def _fuzzy_match_playlists(requested: str, available: List[str], threshold: float = 0.6) -> Optional[str]:
+    """
+    Fuzzy match a playlist name against available playlists.
+    
+    Priority:
+    1. Exact match
+    2. Case-insensitive match
+    3. Fuzzy match (using SequenceMatcher for similarity)
+    
+    Returns the matched playlist name or None if no good match found.
+    """
+    if not requested or not available:
+        return None
+    
+    requested_lower = requested.lower()
+    
+    # First try exact match
+    for playlist in available:
+        if playlist == requested:
+            return playlist
+    
+    # Then try case-insensitive match
+    for playlist in available:
+        if playlist.lower() == requested_lower:
+            return playlist
+    
+    # Finally try fuzzy match using difflib
+    best_match = None
+    best_ratio = threshold
+    
+    for playlist in available:
+        # Compare against lowercase versions for better fuzzy matching
+        ratio = difflib.SequenceMatcher(None, requested_lower, playlist.lower()).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_match = playlist
+    
+    return best_match
 
 
 class MusicManager:
@@ -69,7 +110,7 @@ class MusicManager:
         if raw is None:
             return None
         try:
-            # MPD reports elapsed as a decimal string (e.g. "123.456").
+            # Backend reports elapsed as a decimal string (e.g. "123.456").
             return max(0, int(float(raw)))
         except Exception:
             return None
@@ -505,6 +546,113 @@ class MusicManager:
             return f"Added {added} {'song' if added == 1 else 'songs'} to queue"
         except Exception as e:
             logger.error("Failed to add songs to queue '%s': %s", query, e)
+            return f"Error: {e}"
+    
+    async def add_songs_to_playlist(self, query: str, count: int = 5) -> str:
+        """Add matching songs to the loaded/active playlist.
+        
+        Searches for songs matching the query and adds them to the current loaded playlist.
+        Requires a loaded playlist (e.g., from create_playlist or load_playlist).
+        Supports artist names (e.g., "joni mitchell"), genres (e.g., "rock"), or any-field queries.
+        
+        Songs are randomly selected from the ENTIRE collection matching the query,
+        not just the first N results.
+        """
+        import random
+        try:
+            if not self._loaded_playlist_name:
+                return "No active playlist. Create or load a playlist first."
+            
+            count = max(1, min(100, int(count)))
+            safe_q = str(query or "").strip().replace('"', '\\"')
+            if not safe_q:
+                return "Search query is required"
+
+            tracks: List[Dict[str, str]] = []
+            
+            # Detect if query is likely a genre (single word, common genres)
+            common_genres = [
+                "rock", "pop", "jazz", "blues", "classical", "country",
+                "hip-hop", "hiphop", "rap", "metal", "punk", "folk",
+                "electronic", "dance", "reggae", "soul", "funk", "indie",
+                "alternative", "ambient", "ballad", "bebop", "bluegrass",
+                "bossa nova", "breakbeat", "britpop", "cajun", "calypso",
+                "chamber", "chillout", "cool jazz", "darkwave", "death metal",
+                "deep house", "delta blues", "dub", "dubstep", "easy listening",
+                "folk rock", "funk rock", "fusion", "garage", "garage rock",
+                "glam", "glitch", "gospel", "goth", "grunge", "hardcore",
+                "hard rock", "heavy metal", "house", "indie pop", "indie rock",
+                "industrial", "instrumental", "jazz funk", "jump blues", "k-pop",
+                "latin", "lo-fi", "lounge", "metal", "metalcore", "minimal",
+                "modern jazz", "new wave", "noise", "nu metal", "nu soul",
+            ]
+            
+            is_likely_genre = safe_q.lower() in common_genres
+
+            # Fetch all matching songs (use large window to get entire collection)
+            # Try genre-specific search first if it looks like a genre
+            if is_likely_genre:
+                try:
+                    # Fetch all genre matches with a large window
+                    rows = await self.pool.execute_list(f'search genre "{safe_q}" window 0:999999')
+                    if rows:
+                        tracks = rows
+                except Exception:
+                    try:
+                        tracks = await self.pool.execute_list(f'search genre "{safe_q}"')
+                    except Exception:
+                        pass
+            
+            # Try artist-specific search if no genre match
+            if not tracks:
+                try:
+                    # Fetch all artist matches with a large window
+                    rows = await self.pool.execute_list(f'search artist "{safe_q}" window 0:999999')
+                    if rows:
+                        tracks = rows
+                except Exception:
+                    try:
+                        tracks = await self.pool.execute_list(f'search artist "{safe_q}"')
+                    except Exception:
+                        pass
+
+            # Fallback: any-field search
+            if not tracks:
+                try:
+                    # Fetch all matches with a large window
+                    rows = await self.pool.execute_list(f'search any "{safe_q}" window 0:999999')
+                    if rows:
+                        tracks = rows
+                except Exception:
+                    try:
+                        tracks = await self.pool.execute_list(f'search any "{safe_q}"')
+                    except Exception:
+                        pass
+
+            if not tracks:
+                return f"No songs found matching: {query}"
+
+            # Randomly sample from ALL matching songs (entire collection)
+            selected = random.sample(tracks, min(count, len(tracks)))
+            files = [t.get("file", "") for t in selected if t.get("file", "")]
+            if not files:
+                return f"No playable songs found matching: {query}"
+
+            # Add each file to the playlist
+            for file_uri in files:
+                try:
+                    await self._control_execute(
+                        f'playlistadd "{self._quote(self._loaded_playlist_name)}" "{self._quote(file_uri)}"'
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to add song to playlist: {e}")
+
+            added = len(files)
+            total_available = len(tracks)
+            logger.info(f"⭐ add_songs_to_playlist '{self._loaded_playlist_name}': added {added}/{total_available} songs matching '{query}'")
+            return f"Added {added} {'song' if added == 1 else 'songs'} (from {total_available} available) to {self._loaded_playlist_name}"
+        except Exception as e:
+            logger.error("Failed to add songs to playlist '%s': %s", query, e)
             return f"Error: {e}"
     
     async def clear_queue(self) -> str:
@@ -1079,25 +1227,60 @@ class MusicManager:
         return []
 
     async def resolve_playlist_name(self, requested_name: str, refresh_if_miss: bool = True) -> str:
-        """Resolve a playlist name case-insensitively using cache first."""
+        """Resolve a playlist name using fuzzy matching with intelligent fallback."""
         requested = str(requested_name or "").strip()
         if not requested:
             return ""
 
         now = time.monotonic()
         cached = self._playlist_names_cache if (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s else []
-        for available in cached:
-            if str(available).lower() == requested.lower():
-                return str(available)
+        
+        # Try fuzzy match against cached playlists
+        if cached:
+            matched = _fuzzy_match_playlists(requested, cached)
+            if matched:
+                return matched
 
         if not refresh_if_miss:
             return ""
 
         available_playlists = await self.list_playlists()
-        for available in available_playlists:
-            if str(available).lower() == requested.lower():
-                return str(available)
-        return ""
+        # Try fuzzy match against all playlists
+        matched = _fuzzy_match_playlists(requested, available_playlists)
+        return matched if matched else ""
+    
+    async def create_playlist(self, name: str) -> str:
+        """Create an empty playlist with the given name.
+        
+        Returns an error if a playlist with this name already exists.
+        Sets the created playlist as the loaded/active playlist for subsequent operations.
+        """
+        try:
+            playlist_name = str(name or "").strip()
+            if not playlist_name:
+                return "Playlist name is required"
+            
+            # Check if playlist already exists
+            existing = await self.resolve_playlist_name(playlist_name, refresh_if_miss=True)
+            if existing:
+                return f"Error: Playlist '{playlist_name}' already exists"
+            
+            # Create the empty playlist
+            await self._control_execute(f'playlistcreate "{self._quote(playlist_name)}"')
+            
+            # Update cache
+            self._playlist_names_cache = [p for p in self._playlist_names_cache if p.lower() != playlist_name.lower()]
+            self._playlist_names_cache.append(playlist_name)
+            self._playlist_names_cache_ts = time.monotonic()
+            
+            # Set as loaded playlist so subsequent adds go to this playlist
+            self._loaded_playlist_name = playlist_name
+            
+            logger.info(f"📂 Created empty playlist '{playlist_name}'")
+            return f"Created playlist: {playlist_name}"
+        except Exception as e:
+            logger.error(f"Failed to create playlist: {e}")
+            return f"Error: {e}"
     
     async def load_playlist(self, name: str) -> str:
         """Load a saved playlist (case-insensitive matching)."""

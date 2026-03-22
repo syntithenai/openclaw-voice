@@ -4,7 +4,6 @@ from .native_client import (
     NativeMusicConnection,
     NativeMusicClientPool,
 )
-from .native_backend import MPDConnection, MPDClientPool
 from .library_index import LibraryIndex
 from .playlist_store import PlaylistStore
 from .native_player import NativePlayer
@@ -15,8 +14,6 @@ from .router import MusicRouter
 __all__ = [
     "NativeMusicConnection",
     "NativeMusicClientPool",
-    "MPDConnection",
-    "MPDClientPool",
     "LibraryIndex",
     "PlaylistStore",
     "NativePlayer",

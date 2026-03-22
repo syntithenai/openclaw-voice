@@ -271,6 +271,13 @@ class VoiceConfig(BaseSettings):
     ghost_filter_self_echo_similarity_threshold: float = Field(0.75)
     ghost_filter_debug_logging: bool = Field(True)
     ghost_filter_kill_switch: bool = Field(False)
+    # Repeated-input loop detection (catches Whisper stuck-loop hallucinations in the input stream)
+    ghost_filter_loop_history_size: int = Field(10)   # rolling window size
+    ghost_filter_loop_interval_s: float = Field(5.0)  # max seconds between occurrences
+    ghost_filter_loop_min_repeats: int = Field(3)     # occurrences needed to trigger rejection
+    # Post-collection Silero confidence gate (re-scores the PCM chunk before calling Whisper)
+    ghost_filter_silero_precall_enabled: bool = Field(False)      # requires VAD_CUT_IN_USE_SILERO=true
+    ghost_filter_silero_precall_threshold: float = Field(0.3)     # skip Whisper if avg confidence below this
 
     # Recorder Tool
     recorder_enabled: bool = Field(False)  # Enable quick-answer recorder tool

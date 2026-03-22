@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import pytest
 
-from orchestrator.music import mpd_client
+from orchestrator.music import native_backend as music_client
 
 
 @pytest.mark.asyncio
 async def test_update_uses_full_rebuild_for_empty_db(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
-    backend = mpd_client._BACKEND
+    backend = music_client._BACKEND
 
     calls: list[str] = []
 
@@ -95,13 +95,13 @@ async def test_startup_index_guard_runs_once_and_then_skips(monkeypatch: pytest.
 
 @pytest.mark.asyncio
 async def test_pool_initialize_schedules_startup_index_without_waiting(monkeypatch: pytest.MonkeyPatch) -> None:
-    pool = mpd_client.MPDClientPool()
+    pool = music_client.NativeMusicClientPool()
     calls: list[str] = []
 
     def fake_start_startup_index() -> None:
         calls.append("scheduled")
 
-    monkeypatch.setattr(mpd_client._BACKEND, "start_startup_index", fake_start_startup_index)
+    monkeypatch.setattr(music_client._BACKEND, "start_startup_index", fake_start_startup_index)
 
     initialized = await pool.initialize()
 
@@ -111,7 +111,7 @@ async def test_pool_initialize_schedules_startup_index_without_waiting(monkeypat
 
 @pytest.mark.asyncio
 async def test_playlistinfo_stays_available_while_indexing(monkeypatch: pytest.MonkeyPatch) -> None:
-    backend = mpd_client._BACKEND
+    backend = music_client._BACKEND
     original_queue = backend.queue
     original_indexing_active = backend._indexing_active
 

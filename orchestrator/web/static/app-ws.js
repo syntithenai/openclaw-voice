@@ -451,7 +451,8 @@ function syncMusicFromQueue(){
     if(artist) S.music.artist = artist;
     if(album) S.music.album = album;
     if(current.file){
-        const hasBrowserOverride = String(S.music.file||'').includes('/.openclaw-transcoded/');
+        const currentFile = String(S.music.file||'').trim();
+        const hasBrowserOverride = currentFile.includes('.openclaw-transcoded/');
         if(!(S.browserAudioEnabled && hasBrowserOverride)) S.music.file = current.file;
     }
 }
@@ -489,8 +490,35 @@ function _ensureBrowserMusicAudio(){
     const audio = new Audio();
     audio.preload = 'metadata';
     audio.crossOrigin = 'anonymous';
+    audio.addEventListener('loadedmetadata', ()=>{
+        const pendingSeek = Number(audio.dataset.pendingSeekSeconds || '');
+        if(!Number.isFinite(pendingSeek) || pendingSeek < 0) return;
+        try {
+            audio.currentTime = pendingSeek;
+            delete audio.dataset.pendingSeekSeconds;
+        } catch {}
+    });
     S._browserMusicAudio = audio;
     return audio;
+}
+
+function _syncBrowserMusicCurrentTime(audio, targetSeconds, force=false){
+    if(!audio) return;
+    const target = Math.max(0, Number(targetSeconds) || 0);
+    if(!Number.isFinite(target)) return;
+    const current = Math.max(0, Number(audio.currentTime) || 0);
+    const drift = Math.abs(current - target);
+    if(!force && drift < 0.75) return;
+    try {
+        if(audio.readyState > 0) {
+            audio.currentTime = target;
+            delete audio.dataset.pendingSeekSeconds;
+        } else {
+            audio.dataset.pendingSeekSeconds = String(target);
+        }
+    } catch {
+        audio.dataset.pendingSeekSeconds = String(target);
+    }
 }
 
 function _mediaUrlForFile(filePath){
@@ -506,6 +534,7 @@ function syncBrowserMusicPlayback(){
         const music = S.music || {};
         const state = normalizeMusicState(music.state);
         const filePath = String(music.file||'').trim();
+        const targetElapsed = Math.max(0, Number(music.elapsed) || 0);
         const audio = _ensureBrowserMusicAudio();
 
         if(!browserEnabled){
@@ -519,19 +548,24 @@ function syncBrowserMusicPlayback(){
         }
 
         const src = _mediaUrlForFile(filePath);
+        const srcChanged = !!src && audio.dataset.currentSrc !== src;
         if(src && audio.dataset.currentSrc !== src){
             audio.src = src;
             audio.dataset.currentSrc = src;
         }
 
         if(state === 'play'){
+            if(srcChanged || audio.paused || audio.dataset.pendingSeekSeconds){
+                _syncBrowserMusicCurrentTime(audio, targetElapsed, true);
+            }
             const playPromise = audio.play();
             if(playPromise && typeof playPromise.catch === 'function') playPromise.catch(()=>{});
         } else if(state === 'pause'){
+            _syncBrowserMusicCurrentTime(audio, targetElapsed, true);
             if(!audio.paused) audio.pause();
         } else {
             if(!audio.paused) audio.pause();
-            try { audio.currentTime = 0; } catch {}
+            _syncBrowserMusicCurrentTime(audio, targetElapsed, true);
         }
     }catch {}
 }

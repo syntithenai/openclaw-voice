@@ -357,6 +357,11 @@ class _NativeMusicBackend:
             self.playlists.append_to_playlist(name, file_uri)
             return {}
 
+        if op == "playlistcreate":
+            name = parts[1]
+            self.playlists.write_playlist(name, [])
+            return {}
+
         if op == "update":
             stats = self.library.stats()
             song_count = int(stats.get("songs", "0") or 0)
@@ -460,15 +465,15 @@ class _NativeMusicBackend:
 _BACKEND = _NativeMusicBackend()
 
 
-class MPDConnection:
+class NativeMusicConnection:
     _id = 0
 
     def __init__(self, host: str, port: int, timeout: float = 5.0):
         del host, port
         self.timeout = timeout
         self._connected = False
-        MPDConnection._id += 1
-        self._label = f"native#{MPDConnection._id}"
+        NativeMusicConnection._id += 1
+        self._label = f"native#{NativeMusicConnection._id}"
 
     @property
     def label(self) -> str:
@@ -496,11 +501,11 @@ class MPDConnection:
             await _BACKEND.execute(command, timeout)
 
 
-class MPDClientPool:
+class NativeMusicClientPool:
     def __init__(self, host: str = "localhost", port: int = 6600, pool_size: int = 3, timeout: float = 5.0):
         del host, port, pool_size
         self.timeout = timeout
-        self._conn = MPDConnection("", 0, timeout)
+        self._conn = NativeMusicConnection("", 0, timeout)
 
     async def initialize(self) -> bool:
         await self._conn.connect()
@@ -534,6 +539,4 @@ class MPDClientPool:
         _BACKEND.set_output_route(route)
 
 
-# Native-first names for the in-process compatibility backend.
-NativeMusicConnection = MPDConnection
-NativeMusicClientPool = MPDClientPool
+# Native-first names for the in-process backend.

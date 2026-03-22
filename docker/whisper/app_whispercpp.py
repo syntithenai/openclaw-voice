@@ -12,6 +12,10 @@ WHISPER_CPP_PATH = os.getenv("WHISPER_CPP_PATH", "/app/build/bin/whisper-cli")
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/ggml-base.en.bin")
 BACKEND_PREFERENCE = os.getenv("WHISPER_BACKEND_PREFERENCE", "auto").strip().lower() or "auto"
 CPU_FALLBACK_ENABLED = os.getenv("WHISPER_CPU_FALLBACK", "true").strip().lower() not in {"0", "false", "no"}
+# Hallucination suppression: greedy decode (--best-of 1) avoids beam-search loop completions.
+# --no-context prevents a hallucinated window from seeding the next one.
+WHISPER_CPP_BEST_OF = int(os.getenv("WHISPER_CPP_BEST_OF", "1"))
+WHISPER_CPP_NO_CONTEXT = os.getenv("WHISPER_CPP_NO_CONTEXT", "true").strip().lower() not in {"0", "false", "no"}
 
 
 def _safe_float(value, default=0.0):
@@ -100,7 +104,12 @@ def _run_whisper(temp_audio_path: str, backend: str) -> tuple[subprocess.Complet
         "-oj",
         "-of",
         temp_audio_path,
+        "--best-of",
+        str(WHISPER_CPP_BEST_OF),
     ]
+
+    if WHISPER_CPP_NO_CONTEXT:
+        cmd.append("--no-context")
 
     # The Vulkan build can still run on CPU; explicitly disable Vulkan when retrying
     # the fallback path so a bad GPU stack does not repeatedly poison requests.

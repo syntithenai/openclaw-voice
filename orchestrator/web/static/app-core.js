@@ -727,6 +727,18 @@ function onTopMusicProgressClick(event){
         // Reset the client‑side anchor timestamp used by getEffectiveMusicElapsed()
         S.music._clientElapsedAnchorTs = Date.now();
     }
+    if(S.browserAudioEnabled && S._browserMusicAudio){
+        try {
+            if(S._browserMusicAudio.readyState > 0) {
+                S._browserMusicAudio.currentTime = target;
+                delete S._browserMusicAudio.dataset.pendingSeekSeconds;
+            } else {
+                S._browserMusicAudio.dataset.pendingSeekSeconds = String(target);
+            }
+        } catch {
+            S._browserMusicAudio.dataset.pendingSeekSeconds = String(target);
+        }
+    }
     sendMusicAction('music_seek', {seconds: target});
 }
 

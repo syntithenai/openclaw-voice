@@ -137,6 +137,28 @@ GHOST_ARTIFACT_TOKENS = {
     "subtitles by the amara org community",
     "subtitles by amara org community",
     "subtitles by the amara org",
+    "we'll be right back",
+    "we will be right back",
+    "and we'll be right back",
+    "and we will be right back",
+    # Additional phrases from production hallucination data (Vexa/open-source blocklist)
+    "thanks for watching",
+    "thank you for watching",
+    "i ll see you next time",
+    "ill see you next time",
+    "see you next time",
+    "thank you for your time",
+    "thank you so much for joining us",
+    "thank you so much for joining us today",
+    "god bless you",
+    "well be right back",
+    "uh huh",
+    "bye",
+    "bye bye",
+    "all right",
+    "nice",
+    "all right thank you",
+    "have a good night guys",
 }
 
 GHOST_ARTIFACT_PATTERNS = (
@@ -257,6 +279,10 @@ def decide_ghost_transcript(ctx: dict[str, Any]) -> GhostDecision:
         return GhostDecision(False, ("empty_transcript",), -9, "hard_reject_empty")
     if not has_alnum:
         return GhostDecision(False, ("punctuation_only",), -9, "hard_reject_punctuation")
+
+    # Repeated-input loop detection: same phrase appearing rapidly in succession.
+    if bool(ctx.get("repeated_input_loop_detected")):
+        return GhostDecision(False, ("repeated_input_loop",), -9, "hard_reject_input_loop")
 
     recorder_active = bool(ctx.get("recorder_active"))
     if not recorder_active and any(pattern.search(canonical) for pattern in GHOST_ARTIFACT_PATTERNS):
@@ -669,6 +695,10 @@ async def run_orchestrator() -> None:
     ghost_suppressed_self_echo = 0
     ghost_accepted_short_after_question = 0
     ghost_accepted_short_after_upstream_question = 0
+    # Rolling ring buffer for repeated-input loop detection: (canonical_text, monotonic_ts)
+    ghost_transcript_ring: deque[tuple[str, float]] = deque(
+        maxlen=max(3, int(config.ghost_filter_loop_history_size))
+    )
     warned_wake_resample = False
     warned_aec_stub = False
     wake_sleep_ts: float | None = None
@@ -3382,7 +3412,39 @@ async def run_orchestrator() -> None:
         state = VoiceState.SENDING
         try:
             wav_bytes = pcm_to_wav_bytes(pcm, config.audio_sample_rate)
-            
+
+            # Post-collection Silero confidence gate: re-score the collected PCM chunk
+            # with Silero before sending it to Whisper.  The primary VAD already fired to
+            # trigger collection, but a chunk can still be mostly silence (transient noise,
+            # user paused mid-utterance).  Skipping the Whisper call on low-confidence audio
+            # is the most upstream defence against hallucinations.
+            if (
+                config.ghost_filter_silero_precall_enabled
+                and cut_in_silero is not None
+                and cut_in_silero.loaded
+            ):
+                import copy as _copy
+                import numpy as _np
+                frame_size = cut_in_silero.frame_samples * 2  # 16-bit samples → bytes
+                saved_state = _copy.deepcopy(cut_in_silero._state)
+                confidences: list[float] = []
+                for _i in range(0, len(pcm) - frame_size + 1, frame_size):
+                    _frame = pcm[_i : _i + frame_size]
+                    _res = cut_in_silero.is_speech(_frame)
+                    confidences.append(_res.confidence)
+                # Restore state: post-collection scoring must not advance the live state.
+                cut_in_silero._state = saved_state
+                if confidences:
+                    avg_conf = sum(confidences) / len(confidences)
+                    threshold = float(config.ghost_filter_silero_precall_threshold)
+                    if avg_conf < threshold:
+                        logger.info(
+                            "⊘ Pre-call Silero gate: avg_confidence=%.3f < threshold=%.3f; skipping STT",
+                            avg_conf,
+                            threshold,
+                        )
+                        return
+
             # STT phase
             logger.info("→ STT: Sending %d bytes to Whisper", len(wav_bytes))
             stt_start = time.monotonic()
@@ -3449,6 +3511,28 @@ async def run_orchestrator() -> None:
                 and (last_assistant_was_question or last_assistant_expects_short_reply)
             )
 
+            # Repeated-input loop detection: if the same canonical phrase appears
+            # ghost_filter_loop_min_repeats times within ghost_filter_loop_interval_s,
+            # flag it as a hallucination loop (only checked for short phrases ≤8 words).
+            loop_detected = False
+            loop_word_count = len(canonical_transcript.split()) if canonical_transcript else 0
+            if (
+                config.ghost_filter_loop_min_repeats > 0
+                and canonical_transcript
+                and loop_word_count <= 8
+            ):
+                loop_interval = float(config.ghost_filter_loop_interval_s)
+                recent_loop_matches = [
+                    ts
+                    for (text, ts) in ghost_transcript_ring
+                    if text == canonical_transcript and (now_ts - ts) <= loop_interval
+                ]
+                if len(recent_loop_matches) >= config.ghost_filter_loop_min_repeats - 1:
+                    loop_detected = True
+            # Record every attempted transcript so loops are detected even if prior
+            # occurrences were already suppressed by other rules.
+            ghost_transcript_ring.append((canonical_transcript, now_ts))
+
             ghost_ctx: dict[str, Any] = {
                 "transcript_text": transcript,
                 "canonical_transcript": canonical_transcript,
@@ -3475,6 +3559,7 @@ async def run_orchestrator() -> None:
                 "has_fresh_prompt_context": has_fresh_prompt_context,
                 "has_inflight_user_request": bool(processing_request or len(pending_transcripts) > 0),
                 "recorder_active": bool(recorder_capture_mode or (recorder_tool and recorder_tool.is_recording())),
+                "repeated_input_loop_detected": loop_detected,
             }
 
             ghost_filter_active = bool(config.ghost_filter_enabled and not config.ghost_filter_kill_switch)

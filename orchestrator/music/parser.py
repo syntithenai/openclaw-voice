@@ -74,6 +74,13 @@ class MusicFastPathParser:
     PLAY_SONG_PATTERN = r"^play\s+(?:the\s+)?(?:song\s+)?['\"]?(.+?)['\"]?$"
     PLAY_ALBUM_PATTERN = r"^play\s+(?:the\s+)?album\s+['\"]?(.+?)['\"]?$"
     
+    # Add songs to playlist patterns
+    ADD_SONGS_PATTERNS = [
+        r"^add\s+(\d+)\s+songs?\s+(?:by|from)\s+(.+)$",
+        r"^add\s+(?:me\s+)?(\d+)\s+songs?\s+(?:by|from)\s+(.+)$",
+        r"^add\s+(?:me\s+)?(\d+)\s+(\w+)\s+songs?$",  # e.g. "add 40 rock songs"
+    ]
+    
     # Playlist patterns
     LOAD_PLAYLIST_PATTERNS = [
         r"^(?:play|load)\s+playlist\s+['\"]?(.+?)['\"]?$",
@@ -81,6 +88,10 @@ class MusicFastPathParser:
         r"^load\s+(?:the\s+)?['\"]?(.+?)['\"]?$",
         r"^(?:switch|open)\s+(?:to\s+)?playlist\s+['\"]?(.+?)['\"]?$",
         r"^(?:switch|open)\s+(?:to\s+)?(?:the\s+)?['\"]?(.+?)['\"]?\s+playlist$",
+    ]
+    CREATE_PLAYLIST_PATTERNS = [
+        r"^(?:create|make|new)\s+playlist\s+['\"]?(.+?)['\"]?$",
+        r"^(?:create|make|new)\s+(?:the\s+)?['\"]?(.+?)['\"]?\s+playlist$",
     ]
     SAVE_PLAYLIST_PATTERN = r"^save\s+(?:playlist\s+)?(?:as\s+)?['\"]?(.+?)['\"]?$"
     
@@ -94,7 +105,7 @@ class MusicFastPathParser:
     COMMAND_START_HINT = (
         r"(?:play|put\s+on|resume|continue|unpause|pause|hold|stop|next|skip|previous|back|"
         r"volume|turn|increase|raise|decrease|lower|louder|quieter|what|current|"
-        r"now|update|scan|refresh|index|load|save)"
+        r"now|update|scan|refresh|index|load|save|add|create|make|new)"
     )
     
     def __init__(self):
@@ -118,6 +129,8 @@ class MusicFastPathParser:
         self.play_album_regex = re.compile(self.PLAY_ALBUM_PATTERN, re.IGNORECASE)
         
         self.load_playlist_regexes = [re.compile(p, re.IGNORECASE) for p in self.LOAD_PLAYLIST_PATTERNS]
+        self.create_playlist_regexes = [re.compile(p, re.IGNORECASE) for p in self.CREATE_PLAYLIST_PATTERNS]
+        self.add_songs_regexes = [re.compile(p, re.IGNORECASE) for p in self.ADD_SONGS_PATTERNS]
         self.save_playlist_regex = re.compile(self.SAVE_PLAYLIST_PATTERN, re.IGNORECASE)
         
         self.library_regexes = [re.compile(p, re.IGNORECASE) for p in self.LIBRARY_PATTERNS]
@@ -347,12 +360,37 @@ class MusicFastPathParser:
                 if playlist:
                     return ("load_playlist", {"name": playlist})
         
+        # Create playlist
+        if "playlist" in text or text.startswith("create ") or text.startswith("make ") or text.startswith("new "):
+            for regex in self.create_playlist_regexes:
+                match = regex.match(text)
+                if not match:
+                    continue
+                playlist = _clean_playlist_name(match.group(1))
+                if playlist:
+                    return ("create_playlist", {"name": playlist})
+        
         # Save playlist
         if text.startswith("save playlist") or text.startswith("save as"):
             match = self.save_playlist_regex.match(text)
             if match:
                 playlist = match.group(1).strip()
                 return ("save_playlist", {"name": playlist})
+        
+        # Add songs to playlist
+        if text.startswith("add "):
+            for regex in self.add_songs_regexes:
+                match = regex.match(text)
+                if not match:
+                    continue
+                count_str = match.group(1)
+                query = match.group(2).strip()
+                try:
+                    count = int(count_str)
+                    if 1 <= count <= 100:
+                        return ("add_songs_to_playlist", {"query": query, "count": count})
+                except ValueError:
+                    pass
         
         # No fast-path match - return None to trigger LLM fallback
         return None
