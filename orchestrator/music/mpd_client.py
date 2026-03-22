@@ -346,6 +346,12 @@ class _NativeMusicBackend:
             self.playlists.delete_playlist(name)
             return {}
 
+        if op == "rename":
+            old_name = parts[1]
+            new_name = parts[2]
+            self.playlists.rename_playlist(old_name, new_name)
+            return {}
+
         if op == "playlistadd":
             name = parts[1]
             file_uri = parts[2]

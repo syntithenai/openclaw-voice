@@ -263,7 +263,7 @@ function handleMsg(msg){
                 // belt-and-suspenders in case the broadcast is missed.
                 requestMusicStateRetry('post_load_ack', 8, 2000);
             }
-            if(['music_save_playlist','music_create_playlist','music_delete_playlist'].includes(String(msg.action||''))){
+            if(['music_save_playlist','music_create_playlist','music_delete_playlist','music_rename_playlist'].includes(String(msg.action||''))){
                 sendAction({type:'music_list_playlists'});
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));

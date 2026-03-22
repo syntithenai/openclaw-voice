@@ -302,6 +302,7 @@ document.addEventListener('click', e => {
         S.musicPlaylistModalOpen = false;
         S.musicPlaylistModalMode = '';
         S.musicPlaylistModalName = '';
+        S.musicPlaylistModalOriginalName = '';
         renderMusicPage(document.getElementById('main'));
         return;
     }
@@ -323,15 +324,26 @@ document.addEventListener('click', e => {
         }else if(mode==='delete'){
             if(!name) return;
             sendMusicAction('music_delete_playlist', {name});
+        }else if(mode==='edit-title'){
+            if(!name) return;
+            const origName = String(S.musicPlaylistModalOriginalName||'').trim();
+            if(!origName || origName === name) {
+                // No change, just close
+                S.musicPlaylistModalOpen = false;
+                S.musicPlaylistModalMode = '';
+                S.musicPlaylistModalName = '';
+                S.musicPlaylistModalOriginalName = '';
+                renderMusicPage(document.getElementById('main'));
+                return;
+            }
+            sendMusicAction('music_rename_playlist', {old_name: origName, new_name: name});
         }
         S.musicPlaylistModalOpen = false;
         S.musicPlaylistModalMode = '';
         S.musicPlaylistModalName = '';
+        S.musicPlaylistModalOriginalName = '';
         renderMusicPage(document.getElementById('main'));
-        return;
-    }
-
-    const loadPlaylistBtn = target.closest('[data-action="music-load-playlist"]');
+        return; = target.closest('[data-action="music-load-playlist"]');
     if (loadPlaylistBtn) {
         const name = String(loadPlaylistBtn.dataset.playlistName || '').trim();
         if(name){
@@ -351,6 +363,22 @@ document.addEventListener('click', e => {
         S.musicPlaylistModalMode = 'delete';
         S.musicPlaylistModalName = name;
         renderMusicPage(document.getElementById('main'));
+        return;
+    }
+
+    const openEditPlaylistBtn = target.closest('[data-action="music-open-edit-playlist"]');
+    if (openEditPlaylistBtn) {
+        const name = String(openEditPlaylistBtn.dataset.playlistName || '').trim();
+        if(!name) return;
+        S.musicPlaylistModalOpen = true;
+        S.musicPlaylistModalMode = 'edit-title';
+        S.musicPlaylistModalOriginalName = name;
+        S.musicPlaylistModalName = name;
+        renderMusicPage(document.getElementById('main'));
+        setTimeout(() => {
+            const inp = document.getElementById('musicPlaylistModalName');
+            if (inp) { inp.focus(); inp.select(); }
+        }, 50);
         return;
     }
 

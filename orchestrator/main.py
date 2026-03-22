@@ -2174,6 +2174,14 @@ async def run_orchestrator() -> None:
                     except Exception as exc:
                         logger.warning("Web UI music_delete_playlist '%s': %s", name, exc)
 
+            async def _ui_music_rename_playlist(old_name: str, new_name: str, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        await music_manager.rename_playlist(old_name, new_name)
+                        await _ui_refresh_music_state("music_rename_playlist")
+                    except Exception as exc:
+                        logger.warning("Web UI music_rename_playlist '%s' -> '%s': %s", old_name, new_name, exc)
+
             async def _ui_music_search_library(query: str, limit: int, client_id: str) -> list[dict[str, Any]]:
                 if not music_manager:
                     return []
@@ -2294,6 +2302,7 @@ async def run_orchestrator() -> None:
                 on_music_load_playlist=_ui_music_load_playlist,
                 on_music_save_playlist=_ui_music_save_playlist,
                 on_music_delete_playlist=_ui_music_delete_playlist,
+                on_music_rename_playlist=_ui_music_rename_playlist,
                 on_music_search_library=_ui_music_search_library,
                 on_music_list_playlists=_ui_music_list_playlists,
                 on_get_music_state=_ui_get_music_state_snapshot,

@@ -67,6 +67,14 @@ class PlaylistStore:
         path.unlink(missing_ok=True)
         return True
 
+    def rename_playlist(self, old_name: str, new_name: str) -> bool:
+        old_path = self._path_for(old_name)
+        if not old_path.exists():
+            return False
+        new_path = self._path_for(new_name)
+        old_path.rename(new_path)
+        return True
+
     def append_to_playlist(self, name: str, file_uri: str) -> None:
         rows = self.read_playlist(name)
         rows.append(str(file_uri).strip())

@@ -28,7 +28,7 @@ const S = {
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
         musicAddSearchPending:false, musicAddPendingQuery:'',
         musicNewPlaylistName:'',
-        musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'',
+        musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'', musicPlaylistModalOriginalName:'',
         recordings:[], recordingsDetail:null, recordingsDetailLoading:false,
         recordingsSelectionByIds:{}, recordingsLastCheckedId:null,
         recordingsActionError:'', recordingsActionErrorTs:0, lastRecordingsRev:0,

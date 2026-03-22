@@ -151,6 +151,7 @@ class EmbeddedVoiceWebService:
         self._on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None
         self._on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_music_rename_playlist: Callable[[str, str, str], Awaitable[None]] | None = None
         self._on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None
         self._on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None
         self._on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None
@@ -695,6 +696,7 @@ class EmbeddedVoiceWebService:
         on_music_load_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_save_playlist: Callable[[str, str], Awaitable[None]] | None = None,
         on_music_delete_playlist: Callable[[str, str], Awaitable[None]] | None = None,
+        on_music_rename_playlist: Callable[[str, str, str], Awaitable[None]] | None = None,
         on_music_search_library: Callable[[str, str], Awaitable[list[dict[str, Any]]]] | None = None,
         on_music_list_playlists: Callable[[str], Awaitable[list[str]]] | None = None,
         on_get_music_state: Callable[[], Awaitable[tuple[dict[str, Any], list[dict[str, Any]]]]] | None = None,
@@ -736,6 +738,8 @@ class EmbeddedVoiceWebService:
             self._on_music_save_playlist = on_music_save_playlist
         if on_music_delete_playlist is not None:
             self._on_music_delete_playlist = on_music_delete_playlist
+        if on_music_rename_playlist is not None:
+            self._on_music_rename_playlist = on_music_rename_playlist
         if on_music_search_library is not None:
             self._on_music_search_library = on_music_search_library
         if on_music_list_playlists is not None:
@@ -1338,6 +1342,26 @@ class EmbeddedVoiceWebService:
                     await _send_ws_json({
                         "type": "music_action_error",
                         "action": "music_delete_playlist",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    })
+            return
+
+        if msg_type == "music_rename_playlist" and self._on_music_rename_playlist:
+            action_id = payload.get("action_id")
+            old_name = str(payload.get("old_name", "")).strip()
+            new_name = str(payload.get("new_name", "")).strip()
+            try:
+                if old_name and new_name:
+                    await _send_music_action_ack("music_rename_playlist", action_id)
+                    await self._on_music_rename_playlist(old_name, new_name, client_id)
+                    await _send_music_playlists_update()
+            except Exception as exc:
+                logger.warning("music_rename_playlist handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "music_action_error",
+                        "action": "music_rename_playlist",
                         "action_id": str(action_id),
                         "error": str(exc),
                     })

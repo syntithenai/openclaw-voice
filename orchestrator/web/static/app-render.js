@@ -51,6 +51,7 @@ function renderMusicPage(main){
     const n=String(name||'').trim();
     if(!n) return '';
     return '<div class="flex w-full items-center justify-start gap-2 px-3 py-2 border-b border-gray-800 text-left">'
+      +'<button data-action="music-open-edit-playlist" data-playlist-name="'+esc(n)+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-yellow-600 transition-colors" title="Edit playlist title" aria-label="Edit">✎</button>'
       +'<button data-action="music-load-playlist" data-playlist-name="'+esc(n)+'" class="block flex-1 w-full text-left text-sm text-gray-200 hover:text-white truncate">'+esc(n)+'</button>'
       +'<button data-action="music-open-delete-playlist" data-playlist-name="'+esc(n)+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete playlist" aria-label="Delete playlist">✕</button>'
     +'</div>';
@@ -142,20 +143,31 @@ function renderMusicPage(main){
 
   const modalTitle = S.musicPlaylistModalMode==='save'
         ? 'Save Playlist'
-    : (S.musicPlaylistModalMode==='selected' ? 'Create Playlist from Selected' : 'Delete Playlist');
+    : (S.musicPlaylistModalMode==='selected' ? 'Create Playlist from Selected'
+      : (S.musicPlaylistModalMode==='edit-title' ? 'Edit Playlist Title' : 'Delete Playlist'));
     const modalName=String(S.musicPlaylistModalName||'').trim();
     const existingPlaylists=(S.musicPlaylists||[]).map(x=>String(x||'').trim().toLowerCase()).filter(Boolean);
     const loadedPlaylistName=String((S.music&&S.music.loaded_playlist)||'').trim();
     const loadedPlaylist=loadedPlaylistName.toLowerCase();
     const queueLabel=loadedPlaylistName ? ('Playlist '+loadedPlaylistName) : 'Queue';
     const hasNameConflict=!!modalName && existingPlaylists.includes(modalName.toLowerCase()) && modalName.toLowerCase()!==loadedPlaylist;
-  const modalBody = S.musicPlaylistModalMode==='delete'
-    ? '<p class="text-sm text-gray-300">Delete playlist <span class="font-semibold">'+esc(S.musicPlaylistModalName||'')+'</span>?</p>'
-        : '<div class="space-y-2">'
-            +'<input id="musicPlaylistModalName" value="'+esc(S.musicPlaylistModalName||'')+'" placeholder="Playlist name" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
-            +(hasNameConflict ? '<p class="text-xs text-amber-300">⚠ Playlist exists. Saving will overwrite it.</p>' : '')
-        +'</div>';
-    const modalConfirmLabel = S.musicPlaylistModalMode==='delete' ? 'Delete' : (hasNameConflict ? 'Overwrite' : 'Save');
+  let modalBody;
+  if (S.musicPlaylistModalMode==='delete') {
+    modalBody = '<p class="text-sm text-gray-300">Delete playlist <span class="font-semibold">'+esc(S.musicPlaylistModalName||'')+'</span>?</p>';
+  } else if (S.musicPlaylistModalMode==='edit-title') {
+    const origName = String(S.musicPlaylistModalOriginalName||'').trim();
+    modalBody = '<div class="space-y-2">'
+      +'<p class="text-xs text-gray-400">Renaming: <span class="font-semibold text-gray-200">'+esc(origName)+'</span></p>'
+      +'<input id="musicPlaylistModalName" value="'+esc(modalName)+"\""+' placeholder="New playlist title" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+      +(hasNameConflict ? '<p class="text-xs text-amber-300">⚠ A playlist with this name already exists.</p>' : '')
+    +'</div>';
+  } else {
+    modalBody = '<div class="space-y-2">'
+        +'<input id="musicPlaylistModalName" value="'+esc(S.musicPlaylistModalName||'')+'" placeholder="Playlist name" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+        +(hasNameConflict ? '<p class="text-xs text-amber-300">⚠ Playlist exists. Saving will overwrite it.</p>' : '')
+    +'</div>';
+  }
+    const modalConfirmLabel = S.musicPlaylistModalMode==='delete' ? 'Delete' : (S.musicPlaylistModalMode==='edit-title' ? 'Rename' : (hasNameConflict ? 'Overwrite' : 'Save'));
 
   main.innerHTML='<div class="max-w-6xl mx-auto px-2 py-4 space-y-3">'
     +'<div class="grid grid-cols-1 md:grid-cols-4 gap-3">'

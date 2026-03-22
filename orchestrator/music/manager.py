@@ -1210,6 +1210,38 @@ class MusicManager:
         except Exception as e:
             logger.error(f"Failed to delete playlist '{name}': {e}")
             return f"Error: {e}"
+
+    async def rename_playlist(self, old_name: str, new_name: str) -> str:
+        """Rename a playlist (case-insensitive match on old name)."""
+        try:
+            old = str(old_name or "").strip()
+            new = str(new_name or "").strip()
+            if not old:
+                return "Original playlist name is required"
+            if not new:
+                return "New playlist name is required"
+
+            available_playlists = await self.list_playlists()
+            actual_old = None
+            for available in available_playlists:
+                if available.lower() == old.lower():
+                    actual_old = available
+                    break
+
+            if not actual_old:
+                return f"Error: Playlist '{old}' not found"
+
+            await self._control_execute(f'rename "{self._quote(actual_old)}" "{self._quote(new)}"')
+            self._playlist_names_cache = [
+                new if p.lower() == actual_old.lower() else p
+                for p in self._playlist_names_cache
+            ]
+            self._playlist_names_cache_ts = time.monotonic()
+            logger.info(f"📂 Renamed playlist '{actual_old}' → '{new}'")
+            return f"Renamed playlist: {actual_old} → {new}"
+        except Exception as e:
+            logger.error(f"Failed to rename playlist '{old_name}' → '{new_name}': {e}")
+            return f"Error: {e}"
     
     # ========== High-Level Operations ==========
     
