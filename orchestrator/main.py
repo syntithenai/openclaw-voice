@@ -1518,6 +1518,11 @@ async def run_orchestrator() -> None:
                         logger.info("🎛️ Play button consumed by alarm dismiss")
                         return
 
+                    if tts_playing:
+                        tts_stop_event.set()
+                        _tts_clear_all("play button")
+                        logger.info("⏹️ Play button stopping TTS")
+
                     asyncio.create_task(pause_system_media_if_needed("play button"))
                     if wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
@@ -2011,6 +2016,11 @@ async def run_orchestrator() -> None:
                 if dismissed > 0:
                     tts_stop_event.set()
                     return
+
+                if tts_playing:
+                    tts_stop_event.set()
+                    _tts_clear_all("mic button")
+                    logger.info("⏹️ Mic button stopping TTS")
 
                 def _play_wake_feedback() -> None:
                     if not wake_click_sound:
@@ -4318,7 +4328,9 @@ async def run_orchestrator() -> None:
     last_tts_meter_ts = 0.0
     tts_meter_interval = 0.5
     tts_rms_baseline = 0.0
-    tts_rms_alpha = 0.05
+    tts_rms_alpha = 0.12  # faster convergence to TTS echo level (was 0.05)
+    tts_cutin_floor = 0.0
+    tts_cutin_floor_initialized = False
     cut_in_hits = 0
     silero_zero_hits = 0
     alarm_cut_in_hits = 0
@@ -4771,14 +4783,28 @@ async def run_orchestrator() -> None:
             except Exception:  # pragma: no cover
                 rms_cutin = 0.0
 
-            # Track baseline RMS during TTS playback to detect mic speech over speaker bleed
-            if tts_playing:
+            # Track baseline RMS during TTS playback to detect mic speech over speaker bleed.
+            # Only start tracking once actual audio playback begins (tts_playback_start_ts is set) —
+            # if we init during synthesis the baseline locks to ambient noise and the TTS echo
+            # immediately looks like a huge excess → false cut-in at the 150 ms arming point.
+            # Mirror the alarm cut-in approach: track max(raw, aec) so either path can feed the floor,
+            # and use faster alpha (0.12) so the floor converges to the TTS echo level within ~400 ms.
+            if tts_playing and tts_playback_start_ts is not None:
+                tts_cutin_signal = max(rms_raw, rms_cutin)
+                if not tts_cutin_floor_initialized:
+                    tts_cutin_floor = tts_cutin_signal
+                    tts_cutin_floor_initialized = True
+                else:
+                    tts_cutin_floor = (1.0 - tts_rms_alpha) * tts_cutin_floor + tts_rms_alpha * tts_cutin_signal
+                # tts_rms_baseline continues to track raw for the excess computation
                 if tts_rms_baseline == 0.0:
                     tts_rms_baseline = rms_raw
                 else:
                     tts_rms_baseline = (1.0 - tts_rms_alpha) * tts_rms_baseline + tts_rms_alpha * rms_raw
-            else:
+            elif not tts_playing:
                 tts_rms_baseline = 0.0
+                tts_cutin_floor = 0.0
+                tts_cutin_floor_initialized = False
                 cut_in_hits = 0
                 silero_zero_hits = 0
 
@@ -5421,32 +5447,44 @@ async def run_orchestrator() -> None:
             if tts_playing:
                 if now - last_tts_meter_ts >= tts_meter_interval:
                     logger.info(
-                        "🎚️ Cut-in RMS (raw=%.4f, aec=%.4f, baseline=%.4f, excess=%.4f) | VAD: %s | silero: %s (conf=%.2f) | threshold=%.4f",
+                        "🎚️ Cut-in RMS (raw=%.4f, aec=%.4f, floor=%.4f, baseline=%.4f, excess=%.4f, floor_excess=%.4f) | VAD raw=%s proc=%s | silero: %s (conf=%.2f) | threshold=%.4f",
                         rms_raw,
                         rms_cutin,
+                        tts_cutin_floor,
                         tts_rms_baseline,
                         max(0.0, rms_raw - tts_rms_baseline),
+                        max(0.0, max(rms_raw, rms_cutin) - tts_cutin_floor) if tts_cutin_floor_initialized else 0.0,
                         vad_result_cutin.speech_detected,
+                        vad_result.speech_detected,
                         silero_gate,
                         silero_conf if silero_conf is not None else -1.0,
                         config.vad_cut_in_rms,
                     )
                     logger.info(
-                        "🎚️ Cut-in gate (ready=%s, silero_gate=%s, rms_excess=%.4f, rms_cutin=%.4f, hits=%d/%d, min_ms=%d)",
+                        "🎚️ Cut-in gate (ready=%s, converged=%s, silero_gate=%s, floor_excess=%.4f, rms_cutin=%.4f, hits=%d/%d, min_ms=%d, converge_ms=%d)",
                         (tts_playback_start_ts is not None and int((now - tts_playback_start_ts) * 1000) >= config.vad_cut_in_min_ms),
+                        (tts_playback_start_ts is not None and int((now - tts_playback_start_ts) * 1000) >= max(750, config.vad_cut_in_min_ms + 600)),
                         silero_gate,
-                        max(0.0, rms_raw - tts_rms_baseline),
+                        max(0.0, max(rms_raw, rms_cutin) - tts_cutin_floor) if tts_cutin_floor_initialized else 0.0,
                         rms_cutin,
                         cut_in_hits,
                         config.vad_cut_in_frames,
                         config.vad_cut_in_min_ms,
+                        max(750, config.vad_cut_in_min_ms + 600),
                     )
                     last_tts_meter_ts = now
                 playback_ms = 0
                 if tts_playback_start_ts is not None:
                     playback_ms = int((now - tts_playback_start_ts) * 1000)
                 cut_in_ready = playback_ms >= config.vad_cut_in_min_ms
+                # Speech-like converge gate: wait until baseline has converged to the TTS echo
+                # level before applying the compound excess check.  Mirrors alarm's
+                # speech_like_min_ring_age_s (which uses ~1.2 s).  With alpha=0.12 the floor is
+                # ≥97 % converged after 750 ms, making false-positive excess drops below threshold.
+                tts_cutin_converge_ms = max(750, config.vad_cut_in_min_ms + 600)
+                tts_cutin_converged = playback_ms >= tts_cutin_converge_ms
                 rms_excess = max(0.0, rms_raw - tts_rms_baseline)
+                tts_cutin_signal_excess = max(0.0, max(rms_raw, rms_cutin) - tts_cutin_floor) if tts_cutin_floor_initialized else rms_excess
                 alarm_ringing_during_tts = bool(alarm_manager and alarm_manager.ringing_alarms)
                 if tts_playing and config.vad_cut_in_use_silero and silero_conf is not None:
                     if silero_conf <= 0.01 and vad_result_cutin.speech_detected and rms_excess >= config.vad_cut_in_rms:
@@ -5457,9 +5495,23 @@ async def run_orchestrator() -> None:
                         logger.warning("Silero gate stuck at low confidence; disabling Silero cut-in gate")
                         config.vad_cut_in_use_silero = False
                         silero_gate = True
+                # Dual VAD: raw OR processed, mirroring the alarm cut-in approach.
+                # AEC can suppress user voice in the processed frame; raw catches what AEC misses.
+                tts_vad_speech = bool(vad_result_cutin.speech_detected or vad_result.speech_detected)
+                tts_cutin_threshold = min(config.vad_cut_in_rms, max(config.vad_min_rms * 1.25, 0.0018))
+                tts_rms_or_excess = (
+                    (rms_raw >= tts_cutin_threshold)
+                    or (rms_cutin >= tts_cutin_threshold)
+                    or (tts_cutin_signal_excess >= max(0.0010, tts_cutin_threshold * 0.25))
+                )
                 cut_in_candidate = (not alarm_ringing_during_tts) and cut_in_ready and silero_gate and (
-                    (vad_result_cutin.speech_detected and rms_excess >= config.vad_cut_in_rms)
-                    or rms_cutin >= config.vad_cut_in_rms
+                    # Compound speech-like path (mirrors alarm): dual VAD + rms-or-excess +
+                    # strict excess gate + baseline-converge guard.
+                    (tts_vad_speech and tts_rms_or_excess and tts_cutin_converged
+                     and (tts_cutin_signal_excess >= max(0.0030, tts_cutin_threshold * 0.55)))
+                    # Fast AEC path: AEC strips echo so rms_cutin reflects user voice directly;
+                    # no convergence wait needed.
+                    or rms_cutin >= tts_cutin_threshold
                 )
                 if cut_in_candidate:
                     cut_in_hits += 1
@@ -5470,15 +5522,16 @@ async def run_orchestrator() -> None:
                 cut_in = cut_in_hits >= config.vad_cut_in_frames
                 if cut_in and now - last_tts_speech_log_ts >= tts_speech_log_interval:
                     logger.info(
-                        "✋ Cut-in triggered! (rms_raw=%.4f, rms_aec=%.4f, rms_excess=%.4f, vad=%s, silero=%s, silero_conf=%.2f, playback_ms=%d, cut_in_ready=%s)",
+                        "✋ Cut-in triggered! (rms_raw=%.4f, rms_aec=%.4f, floor_excess=%.4f, vad_raw=%s, vad_proc=%s, silero=%s, silero_conf=%.2f, playback_ms=%d, converged=%s)",
                         rms_raw,
                         rms_cutin,
-                        rms_excess,
+                        tts_cutin_signal_excess,
                         vad_result_cutin.speech_detected,
+                        vad_result.speech_detected,
                         silero_gate,
                         silero_conf if silero_conf is not None else -1.0,
                         playback_ms,
-                        cut_in_ready,
+                        tts_cutin_converged,
                     )
                     print("✋ Cut-in triggered → stopping TTS", flush=True)
                     last_tts_speech_log_ts = now
@@ -5525,11 +5578,12 @@ async def run_orchestrator() -> None:
                     if tts_gain != 0.5:
                         tts_gain = 0.5
                     logger.info(
-                        "⏹️ Setting tts_stop_event (rms_raw=%.4f, rms_aec=%.4f, rms_excess=%.4f, vad=%s, silero=%s, silero_conf=%.2f)",
+                        "⏹️ Setting tts_stop_event (rms_raw=%.4f, rms_aec=%.4f, floor_excess=%.4f, vad_raw=%s, vad_proc=%s, silero=%s, silero_conf=%.2f)",
                         rms_raw,
                         rms_cutin,
-                        rms_excess,
+                        tts_cutin_signal_excess,
                         vad_result_cutin.speech_detected,
+                        vad_result.speech_detected,
                         silero_gate,
                         silero_conf if silero_conf is not None else -1.0,
                     )
