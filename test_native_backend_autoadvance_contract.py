@@ -255,3 +255,54 @@ def test_status_browser_route_advances_when_elapsed_reaches_duration(monkeypatch
         backend.player.output_route = original_route
         backend.elapsed_anchor_ts = original_elapsed_anchor_ts
         backend.elapsed_anchor_value = original_elapsed_anchor_value
+
+
+def test_status_local_fallback_advances_once_for_finished_proc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When local proc has already exited, status fallback should advance once."""
+    backend = music_client._BACKEND
+    original_queue = list(backend.queue)
+    original_pos = backend.current_pos
+    original_state = backend.state
+    original_route = backend.player.output_route
+    original_proc = backend.player._proc
+    original_finished_proc_id = backend._last_finished_local_proc_id
+
+    played_files: list[str] = []
+    finished_proc = _FakeProc()
+    finished_proc.returncode = 0
+
+    async def fake_play(file_uri: str, seek_s: int = 0) -> bool:
+        del seek_s
+        played_files.append(file_uri)
+        # Keep the same finished proc object so a second status poll would
+        # double-advance unless the fallback single-fire guard works.
+        backend.player._proc = finished_proc
+        return True
+
+    try:
+        backend.queue = [
+            music_client.QueueItem(file="Artist/Album/first.mp3", id=601),
+            music_client.QueueItem(file="Artist/Album/second.mp3", id=602),
+        ]
+        backend.current_pos = 0
+        backend.state = "play"
+        backend.player.output_route = "local"
+        backend.player._proc = finished_proc
+        backend._last_finished_local_proc_id = None
+
+        monkeypatch.setattr(backend, "library", _FakeLibrary())
+        monkeypatch.setattr(backend.player, "play", fake_play)
+
+        status_one = asyncio.run(backend.execute("status"))
+        status_two = asyncio.run(backend.execute("status"))
+
+        assert played_files == ["Artist/Album/second.mp3"]
+        assert status_one["song"] == "1"
+        assert status_two["song"] == "1"
+    finally:
+        backend.queue = original_queue
+        backend.current_pos = original_pos
+        backend.state = original_state
+        backend.player.output_route = original_route
+        backend.player._proc = original_proc
+        backend._last_finished_local_proc_id = original_finished_proc_id

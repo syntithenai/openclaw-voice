@@ -126,6 +126,9 @@ class _NativeMusicBackend:
         # Single persistent background task that watches the current player proc
         # and advances the queue when it exits naturally.
         self._auto_advance_task: asyncio.Task[None] | None = None
+        # Guard to avoid double-advancing the same finished local process in
+        # status fallback mode.
+        self._last_finished_local_proc_id: int | None = None
 
     def _on_startup_index_done(self, task: asyncio.Task[None]) -> None:
         try:
@@ -266,6 +269,65 @@ class _NativeMusicBackend:
         )
         await self._play_pos(next_pos)
 
+    async def _maybe_advance_local_route_fallback(self) -> None:
+        """Fallback progression for local route when the process is already finished.
+
+        The primary path is _auto_advance_loop. This fallback keeps progression
+        reliable even if that task is unavailable or a process switch happened at
+        an unlucky time.
+        """
+        if self.state != "play":
+            return
+        if self.player.output_route == "browser":
+            return
+        if not self.queue:
+            return
+
+        proc = self.player._proc
+
+        # No local proc currently attached: use elapsed/duration to detect
+        # end-of-track and progress.
+        if proc is None:
+            item = self._current_item()
+            if not item:
+                return
+            track = self.library.get_track(item.file) or {}
+            try:
+                duration = float(track.get("duration", "0") or 0.0)
+            except Exception:
+                duration = 0.0
+            if duration <= 0.0:
+                return
+            if self._elapsed_now() + 0.05 < duration:
+                return
+            next_pos = (self.current_pos + 1) % len(self.queue)
+            logger.warning(
+                "⏭ Local fallback auto-advance (no proc): pos %d → %d (queue length %d)",
+                self.current_pos,
+                next_pos,
+                len(self.queue),
+            )
+            await self._play_pos(next_pos)
+            return
+
+        # Proc still active: nothing to do.
+        if proc.returncode is None:
+            return
+
+        proc_id = id(proc)
+        if self._last_finished_local_proc_id == proc_id:
+            return
+        self._last_finished_local_proc_id = proc_id
+
+        next_pos = (self.current_pos + 1) % len(self.queue)
+        logger.warning(
+            "⏭ Local fallback auto-advance (finished proc): pos %d → %d (queue length %d)",
+            self.current_pos,
+            next_pos,
+            len(self.queue),
+        )
+        await self._play_pos(next_pos)
+
     async def _auto_advance_loop(self) -> None:
         """Persistent background loop: watches the current local player process
         and advances the queue when it exits naturally.
@@ -311,13 +373,33 @@ class _NativeMusicBackend:
                 next_pos,
                 len(self.queue),
             )
-            await self._play_pos(next_pos)
+            try:
+                await self._play_pos(next_pos)
+            except Exception as exc:
+                logger.exception("Local auto-advance loop failed to start next track: %s", exc)
+                self._set_state("stop")
+
+    def _on_auto_advance_done(self, task: asyncio.Task[None]) -> None:
+        if self._auto_advance_task is task:
+            self._auto_advance_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            logger.debug("Music auto-advance loop cancelled")
+        except Exception as exc:
+            logger.exception("Music auto-advance loop crashed: %s", exc)
+            # Best-effort restart for resilience.
+            try:
+                self.start_auto_advance_loop()
+            except Exception:
+                pass
 
     def start_auto_advance_loop(self) -> None:
         """Start the background auto-advance loop (idempotent; safe to call multiple times)."""
         if self._auto_advance_task is not None and not self._auto_advance_task.done():
             return
         self._auto_advance_task = asyncio.create_task(self._auto_advance_loop())
+        self._auto_advance_task.add_done_callback(self._on_auto_advance_done)
         logger.debug("↻ Music auto-advance loop started")
 
     async def _play_pos(self, pos: int, seek_s: int = 0) -> None:
@@ -351,6 +433,7 @@ class _NativeMusicBackend:
 
         if op == "status":
             await self._maybe_advance_browser_route()
+            await self._maybe_advance_local_route_fallback()
             current = self._current_item()
             track = self.library.get_track(current.file) if current else None
             duration = float(track.get("duration", "0") or 0.0) if track else 0.0
