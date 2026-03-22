@@ -8,6 +8,8 @@
   <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/dompurify/dist/purify.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/mermaid/dist/mermaid.min.js"></script>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.css" />
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/vanilla-jsoneditor/themes/jse-theme-dark.css" />
   <script src="https://accounts.google.com/gsi/client" async defer></script>
   <script>
     if (window.tailwind) {
@@ -23,6 +25,7 @@
   <link rel="stylesheet" href="/app-layout.css" />
   <link rel="stylesheet" href="/app-chat.css" />
   <link rel="stylesheet" href="/app-music.css" />
+  <link rel="stylesheet" href="/app-files.css" />
 </head>
 <body class="bg-gray-950 text-gray-100 h-screen flex flex-col overflow-hidden">
 
@@ -41,6 +44,10 @@
         <span aria-hidden="true">🎙️</span>
         <span class="hidden lg:inline">Recordings</span>
       </a>
+      <a href="#/files" class="flex items-center gap-2 px-3 py-2 rounded-lg hover:bg-gray-700 text-sm" data-nav="files" title="Files" aria-label="Files">
+        <span aria-hidden="true">📁</span>
+        <span class="hidden lg:inline">Files</span>
+      </a>
     </nav>
     <button id="menuBtn" class="p-2 rounded-lg hover:bg-gray-700 transition-colors sm:hidden" title="Menu">
       <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -51,6 +58,7 @@
       <a href="#/home" class="flex items-center gap-2 px-4 py-2.5 hover:bg-gray-700 text-sm" data-nav="home">🏠 Home</a>
       <a href="#/music" class="flex items-center gap-2 px-4 py-2.5 hover:bg-gray-700 text-sm" data-nav="music">🎵 Music</a>
       <a href="#/recordings" class="flex items-center gap-2 px-4 py-2.5 hover:bg-gray-700 text-sm" data-nav="recordings">🎙️ Recordings</a>
+      <a href="#/files" class="flex items-center gap-2 px-4 py-2.5 hover:bg-gray-700 text-sm" data-nav="files">📁 Files</a>
     </div>
   </div>
 
@@ -122,6 +130,8 @@
 <script src="/app-core.js"></script>
 <script src="/app-events.js"></script>
 <script src="/app-render.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/easymde/dist/easymde.min.js"></script>
+<script src="/app-files.js"></script>
 <script src="/app-ws.js"></script>
 
 </body>

@@ -317,6 +317,16 @@ class VoiceConfig(BaseSettings):
     web_ui_workspace_files_enabled: bool = Field(False)  # Serve files under /files/workspace
     web_ui_workspace_files_root: str = Field("")  # Root directory for /files/workspace; empty = OPENCLAW_WORKSPACE_DIR
     web_ui_workspace_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/workspace
+    web_ui_file_manager_enabled: bool = Field(True)  # Enable file manager page + APIs
+    web_ui_file_manager_root: str = Field("")  # Empty = OPENCLAW_WORKSPACE_DIR
+    web_ui_file_manager_excluded_folders: str = Field("recordings,playlists,timers,.media,.openclaw")
+    web_ui_file_manager_top_level_config_files: str = Field("SOUL.md,BOOTSTRAP.md,TOOLS.md,HEARTBEAT.md,IDENTITY.md,USER.md,AGENTS.md")
+    web_ui_file_manager_max_editable_bytes: int = Field(2_000_000)
+    web_ui_file_manager_watch_enabled: bool = Field(True)
+    web_ui_file_manager_watch_max_watches: int = Field(4096)
+    web_ui_file_manager_watch_max_events_per_tick: int = Field(256)
+    web_ui_file_manager_watch_max_paths_per_push: int = Field(128)
+    web_ui_file_manager_watch_coalesce_ms: int = Field(75)
     web_ui_media_files_enabled: bool = Field(True)  # Serve files under /files/media
     web_ui_media_files_root: str = Field("music")  # Root directory for /files/media
     web_ui_media_files_allow_listing: bool = Field(False)  # Allow directory listing for /files/media

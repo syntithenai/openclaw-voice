@@ -121,8 +121,84 @@ class MusicManager:
     async def _control_execute_list(self, command: str, timeout: float | None = None) -> List[Dict[str, str]]:
         return await self.control_pool.execute_list(command, timeout=timeout)
 
+    async def _list_pipewire_music_stream_ids(self) -> List[str]:
+        if shutil.which("pactl") is None:
+            return []
+
+        proc = await asyncio.create_subprocess_exec(
+            "pactl",
+            "list",
+            "sink-inputs",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.debug(
+                "Skipping PipeWire music stream sync: pactl list failed: %s",
+                stderr.decode("utf-8", errors="ignore").strip(),
+            )
+            return []
+
+        text = stdout.decode("utf-8", errors="ignore")
+        blocks = text.split("Sink Input #")
+        stream_ids: List[str] = []
+
+        for block in blocks[1:]:
+            lines = block.splitlines()
+            if not lines:
+                continue
+            sink_input_id = lines[0].strip()
+            if not sink_input_id:
+                continue
+            if (
+                'application.name = "Music Player Daemon"' in block
+                or 'application.name = "ffplay"' in block
+                or 'application.process.binary = "ffplay"' in block
+            ):
+                stream_ids.append(sink_input_id)
+
+        return stream_ids
+
+    async def _set_pipewire_music_stream_volume(self, target_percent: int) -> bool:
+        if not self.pipewire_stream_normalize_enabled:
+            return False
+
+        stream_ids = await self._list_pipewire_music_stream_ids()
+        if not stream_ids:
+            return False
+
+        target = f"{max(0, min(150, int(target_percent)))}%"
+        updated = False
+        for sink_input_id in stream_ids:
+            set_proc = await asyncio.create_subprocess_exec(
+                "pactl",
+                "set-sink-input-volume",
+                sink_input_id,
+                target,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, set_err = await set_proc.communicate()
+            if set_proc.returncode != 0:
+                logger.debug(
+                    "Failed to sync music PipeWire stream volume (sink-input=%s): %s",
+                    sink_input_id,
+                    set_err.decode("utf-8", errors="ignore").strip(),
+                )
+                continue
+
+            updated = True
+            logger.info(
+                "🎚️ Synced music PipeWire stream volume: sink-input=%s target=%s",
+                sink_input_id,
+                target,
+            )
+
+        return updated
+
     async def _normalize_pipewire_music_stream_volume(self) -> None:
-        """Best-effort: set PipeWire per-app stream volume for the music app to target percent."""
+        """Best-effort: align PipeWire per-app stream volume with current music volume."""
         if not self.pipewire_stream_normalize_enabled:
             return
 
@@ -132,67 +208,10 @@ class MusicManager:
             return
         self._last_pipewire_normalize_ts = now
 
-        if shutil.which("pactl") is None:
-            return
-
         try:
-            proc = await asyncio.create_subprocess_exec(
-                "pactl",
-                "list",
-                "sink-inputs",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await proc.communicate()
-            if proc.returncode != 0:
-                logger.debug("Skipping PipeWire music stream normalize: pactl list failed: %s", stderr.decode("utf-8", errors="ignore").strip())
-                return
-
-            text = stdout.decode("utf-8", errors="ignore")
-            blocks = text.split("Sink Input #")
-            stream_ids: List[str] = []
-
-            for block in blocks[1:]:
-                lines = block.splitlines()
-                if not lines:
-                    continue
-                sink_input_id = lines[0].strip()
-                if not sink_input_id:
-                    continue
-                if (
-                    'application.name = "Music Player Daemon"' in block
-                    or 'application.name = "ffplay"' in block
-                    or 'application.process.binary = "ffplay"' in block
-                ):
-                    stream_ids.append(sink_input_id)
-
-            if not stream_ids:
-                return
-
-            target = f"{self.pipewire_stream_target_percent}%"
-            for sink_input_id in stream_ids:
-                set_proc = await asyncio.create_subprocess_exec(
-                    "pactl",
-                    "set-sink-input-volume",
-                    sink_input_id,
-                    target,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                _, set_err = await set_proc.communicate()
-                if set_proc.returncode != 0:
-                    logger.debug(
-                        "Failed to normalize music PipeWire stream volume (sink-input=%s): %s",
-                        sink_input_id,
-                        set_err.decode("utf-8", errors="ignore").strip(),
-                    )
-                    continue
-
-                logger.info(
-                    "🎚️ Normalized music PipeWire stream volume: sink-input=%s target=%s",
-                    sink_input_id,
-                    target,
-                )
+            current = await self.get_volume()
+            target = self.pipewire_stream_target_percent if current is None else min(current, self.pipewire_stream_target_percent)
+            await self._set_pipewire_music_stream_volume(target)
         except Exception as exc:
             logger.debug("PipeWire music stream normalize skipped: %s", exc)
     
@@ -354,6 +373,10 @@ class MusicManager:
         try:
             level = max(0, min(100, level))
             await self.pool.execute(f"setvol {level}")
+            try:
+                await self._set_pipewire_music_stream_volume(level)
+            except Exception as exc:
+                logger.debug("Failed to sync live music stream volume to %s%%: %s", level, exc)
             return f"Volume set to {level}%"
         except Exception as e:
             logger.error(f"Failed to set volume: {e}")
@@ -506,28 +529,40 @@ class MusicManager:
             limit = count * 10  # fetch a larger pool for random selection
             tracks: List[Dict[str, str]] = []
 
-            # Try genre-specific search first (most accurate for genre requests)
-            try:
-                rows = await self.pool.execute_list(f'search genre "{safe_q}" window 0:{limit - 1}')
-                if rows:
-                    tracks = rows
-            except Exception:
+            async def _search_backend(field: str) -> List[Dict[str, str]]:
                 try:
-                    tracks = await self.pool.execute_list(f'search genre "{safe_q}"')
+                    rows = await self.pool.execute_list(f'search {field} "{safe_q}" window 0:{limit - 1}')
+                    if rows:
+                        return rows
                 except Exception:
                     pass
+                try:
+                    return await self.pool.execute_list(f'search {field} "{safe_q}"')
+                except Exception:
+                    return []
+
+            # Try genre-specific search first (most accurate for genre requests)
+            tracks = await _search_backend("genre")
 
             # Fallback: any-field search
             if not tracks:
+                tracks = await _search_backend("any")
+
+            # During index writes, search can transiently return no rows.
+            # Retry once briefly before declaring a miss.
+            if not tracks:
+                await asyncio.sleep(0.15)
+                tracks = await _search_backend("genre")
+                if not tracks:
+                    tracks = await _search_backend("any")
+
+            # Align with the Add Songs page: if backend search still misses,
+            # use the UI library search path (indexed path/title/artist/album matching).
+            if not tracks and len(safe_q) >= 3:
                 try:
-                    rows = await self.pool.execute_list(f'search any "{safe_q}" window 0:{limit - 1}')
-                    if rows:
-                        tracks = rows
+                    tracks = await self.search_library_for_ui(safe_q, limit=max(limit, 50))
                 except Exception:
-                    try:
-                        tracks = await self.pool.execute_list(f'search any "{safe_q}"')
-                    except Exception:
-                        pass
+                    tracks = []
 
             if not tracks:
                 return f"No songs found matching: {query}"
@@ -646,6 +681,12 @@ class MusicManager:
                     )
                 except Exception as e:
                     logger.warning(f"Failed to add song to playlist: {e}")
+
+            # Also append to the live queue so the UI reflects the change immediately.
+            try:
+                await self.add_many_to_queue(files, batch_size=40)
+            except Exception as add_exc:
+                logger.warning("add_songs_to_playlist: failed to append to live queue: %s", add_exc)
 
             added = len(files)
             total_available = len(tracks)

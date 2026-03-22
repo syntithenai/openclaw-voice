@@ -314,6 +314,7 @@ class MusicRouter:
             "music_play_playlist": lambda: self._handle_play_playlist(arguments.get("name", "")),
             "music_search": lambda: self._handle_search(arguments.get("query", "")),
             "music_load_playlist": lambda: self.manager.load_playlist(arguments.get("name", "")),
+            "music_create_playlist": lambda: self.manager.create_playlist(arguments.get("name", "")),
             "music_add_songs": lambda: self._handle_add_songs(
                 arguments.get("query", ""),
                 int(arguments.get("count", 5)),

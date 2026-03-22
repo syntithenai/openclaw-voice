@@ -9,6 +9,12 @@ document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
 
+    if (S.page === 'files' && typeof handleFileManagerClick === 'function') {
+        if (handleFileManagerClick(target, e)) {
+            return;
+        }
+    }
+
     const authLoginBtn = target.closest('[data-action="auth-login"]');
     if (authLoginBtn) {
         triggerGoogleLogin();
@@ -531,6 +537,9 @@ document.addEventListener('submit', e => {
 document.addEventListener('keydown', e => {
     const t = e.target;
     if(!t) return;
+    if (S.page === 'files' && typeof handleFileManagerKeydown === 'function') {
+        if (handleFileManagerKeydown(e)) return;
+    }
     if(t.id==='musicAddSearch'){
         if(e.key!=='Enter') return;
         e.preventDefault();
@@ -687,10 +696,16 @@ function handleTextInputChange(t){
 }
 
 document.addEventListener('input', e => {
+    if (S.page === 'files' && typeof handleFileManagerInput === 'function') {
+        if (handleFileManagerInput(e.target)) return;
+    }
     handleTextInputChange(e.target);
 });
 
 document.addEventListener('search', e => {
+    if (S.page === 'files' && typeof handleFileManagerInput === 'function') {
+        if (handleFileManagerInput(e.target)) return;
+    }
     handleTextInputChange(e.target);
 });
 
@@ -851,6 +866,13 @@ function renderPage(){
         if(!Array.isArray(S.recordings) || S.recordings.length===0){
             sendAction({type:'recordings_list'});
         }
+    } else if (S.page==='files') {
+        if (typeof renderFileManagerPage === 'function') {
+            renderFileManagerPage(main);
+        }
+        if (typeof ensureFileManagerReady === 'function') {
+            ensureFileManagerReady();
+        }
     } else {
         renderHomePage(main);
     }
@@ -986,6 +1008,14 @@ function collateChatMessages(msgs){
 
     const flushBucket=()=>{
         if(!activeBucket) return;
+        if(activeBucket.rawMsgs.length>0){
+            out.push({
+                role:'gateway_debug_group',
+                request_id:activeBucket.reqId,
+                raw_messages:activeBucket.rawMsgs,
+                hasFinal:activeBucket.finals.length>0,
+            });
+        }
         if(activeBucket.events.length>0){
             out.push({role:'context_group',request_id:activeBucket.reqId,events:activeBucket.events,steps:activeBucket.steps,interim:activeBucket.interim,hasFinal:activeBucket.finals.length>0});
         }
@@ -1007,7 +1037,7 @@ function collateChatMessages(msgs){
     const ensureActiveBucket=(reqId)=>{
         if(!activeBucket || activeBucket.reqId!==reqId){
             flushBucket();
-            activeBucket={reqId,streams:[],steps:[],interim:[],events:[],finals:[]};
+            activeBucket={reqId,rawMsgs:[],streams:[],steps:[],interim:[],events:[],finals:[]};
         }
         return activeBucket;
     };
@@ -1030,6 +1060,11 @@ function collateChatMessages(msgs){
             const bucket=ensureActiveBucket(reqId);
             bucket.interim.push(m);
             bucket.events.push({kind:'lifecycle',payload:m});
+            return;
+        }
+        if(role==='raw_gateway'){
+            const bucket=ensureActiveBucket(reqId);
+            bucket.rawMsgs.push(m);
             return;
         }
         if(role==='assistant'){
@@ -1203,6 +1238,37 @@ function mkBubble(m){
     const role = (m&&m.role)||'';
     d.className='chat-msg flex '+(role==='user'?'justify-end':'justify-start');
         d.setAttribute('data-role', role);
+
+    if(role==='gateway_debug_group'){
+        const wrap=document.createElement('div');
+        wrap.className='max-w-xs sm:max-w-sm lg:max-w-md space-y-1';
+        const reqKey=String((m&&m.request_id)!==undefined && (m&&m.request_id)!==null ? m.request_id : 'na');
+        const rawMessages=Array.isArray(m.raw_messages) ? m.raw_messages : [];
+        const formatRaw=(raw)=>{
+            const txt=String(raw||'').trim();
+            if(!txt) return '';
+            try{ return JSON.stringify(JSON.parse(txt), null, 2); }catch(_){ return txt; }
+        };
+        const summarizeRaw=(raw)=>{
+            const txt=String(raw||'').replace(/\s+/g, ' ').trim();
+            if(!txt) return '(empty)';
+            return txt.length>80 ? txt.slice(0, 79)+'…' : txt;
+        };
+        const itemsHtml=rawMessages.map((msg, idx)=>{
+            const rawText=String((msg&&msg.text)||'');
+            const formatted=formatRaw(rawText);
+            return '<details data-detail-key="'+esc('req:'+reqKey+':raw:'+String(idx))+'" class="rounded border border-gray-700/70 bg-gray-900/40">'
+                +'<summary class="px-2 py-1 cursor-pointer text-[10px] text-gray-300 hover:text-gray-100 font-mono">'+esc(summarizeRaw(rawText))+'</summary>'
+                +'<pre class="px-2 pb-2 whitespace-pre-wrap break-words text-[11px] text-gray-300">'+esc(formatted||'(empty)')+'</pre>'
+              +'</details>';
+        }).join('');
+        wrap.innerHTML='<details data-detail-key="'+esc('req:'+reqKey+':raw-group')+'" class="rounded-xl bg-gray-900/60 border border-fuchsia-700/60 text-xs overflow-hidden">'
+            +'<summary class="px-3 py-1.5 cursor-pointer text-fuchsia-200 hover:text-fuchsia-100 select-none">Debug: raw gateway JSON ('+esc(String(rawMessages.length))+')</summary>'
+            +'<div class="px-2 pb-2 pt-1 space-y-1">'+itemsHtml+'</div>'
+          +'</details>';
+        d.appendChild(wrap);
+        return d;
+    }
 
     if(role==='assistant_stream_group'){
         const wrap=document.createElement('div');

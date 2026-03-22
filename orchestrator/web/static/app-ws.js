@@ -125,8 +125,13 @@ function handleMsg(msg){
             if(S.page==='home') updateChatComposerState();
             break;
         case 'navigate':
-            if(msg.page==='music' || msg.page==='home' || msg.page==='recordings'){
+            if(msg.page==='music' || msg.page==='home' || msg.page==='recordings' || msg.page==='files'){
                 navigate(msg.page);
+            }
+            break;
+        case 'file_manager_fs_changed':
+            if(typeof handleFileManagerFsChanged === 'function'){
+                handleFileManagerFsChanged(msg);
             }
             break;
         case 'recordings_state':
@@ -820,6 +825,7 @@ loadUiPrefs();
 hydrateChatCache();
 renderAuthButton();
 initGoogleSignIn();
+setupAuthSessionRefresh();
 S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity();
 if(wsAuthAllowed()) connectWs();
 refreshAuthSession({render:false, adjustWs:false}).catch(()=>{});

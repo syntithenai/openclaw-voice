@@ -670,6 +670,23 @@ MUSIC_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "music_create_playlist",
+            "description": "Create a new empty saved playlist",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Name for the new playlist"
+                    }
+                },
+                "required": ["name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "music_update_library",
             "description": "Scan music directory and update the library database",
             "parameters": {
@@ -1064,11 +1081,14 @@ class QuickAnswerClient:
         if self.music_enabled and self.music_router:
             voice_music_action_id: str | None = None
             voice_playlist_name = ""
+            add_songs_trace_id: str | None = None
             fast_match = None
             try:
                 fast_match = self.music_router.parser.parse(user_query)
             except Exception:
                 fast_match = None
+            if fast_match and fast_match[0] in ("add_songs_to_playlist", "add_songs_to_queue"):
+                add_songs_trace_id = self._new_voice_music_action_id()
             if fast_match and fast_match[0] == "load_playlist":
                 voice_music_action_id = self._new_voice_music_action_id()
                 voice_playlist_name = str((fast_match[1] or {}).get("name", "") or "").strip()
@@ -1099,6 +1119,8 @@ class QuickAnswerClient:
                         "trace_id": voice_music_action_id,
                         "voice_load_complete_ts": voice_load_complete_ts,
                     }
+                elif add_songs_trace_id and not str(music_result).lower().startswith("error"):
+                    sync_trace = {"trace_id": add_songs_trace_id}
                 asyncio.create_task(self._sync_web_music_state(sync_trace))
                 logger.info("← QUICK ANSWER: Music fast-path execution: %s", _preview(music_result))
                 return False, sanitize_quick_answer_text(music_result)
@@ -1254,6 +1276,15 @@ class QuickAnswerClient:
                                     voice_action_name = "music_load_playlist"
                                     voice_music_action_id = self._new_voice_music_action_id()
                                     await self._emit_music_action_pending(voice_action_name, voice_music_action_id)
+                                elif func_name == "music_create_playlist":
+                                    voice_action_name = "music_create_playlist"
+                                    voice_music_action_id = self._new_voice_music_action_id()
+                                    playlist_name = str(args_dict.get("name", "") or "").strip()
+                                    await self._emit_music_action_pending(
+                                        voice_action_name,
+                                        voice_music_action_id,
+                                        name=playlist_name or None,
+                                    )
                                 elif func_name == "music_clear_queue":
                                     voice_action_name = "music_clear_queue"
                                     voice_music_action_id = self._new_voice_music_action_id()

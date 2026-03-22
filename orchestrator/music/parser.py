@@ -79,6 +79,9 @@ class MusicFastPathParser:
         r"^add\s+(\d+)\s+songs?\s+(?:by|from)\s+(.+)$",
         r"^add\s+(?:me\s+)?(\d+)\s+songs?\s+(?:by|from)\s+(.+)$",
         r"^add\s+(?:me\s+)?(\d+)\s+(\w+)\s+songs?$",  # e.g. "add 40 rock songs"
+        r"^add\s+(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+songs?\s+(?:by|from)\s+(.+)$",
+        r"^add\s+(?:me\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+songs?\s+(?:by|from)\s+(.+)$",
+        r"^add\s+(?:me\s+)?(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty)\s+(\w+)\s+songs?$",  # e.g. "add ten blues songs"
     ]
     
     # Playlist patterns
@@ -92,6 +95,9 @@ class MusicFastPathParser:
     CREATE_PLAYLIST_PATTERNS = [
         r"^(?:create|make|new)\s+playlist\s+['\"]?(.+?)['\"]?$",
         r"^(?:create|make|new)\s+(?:the\s+)?['\"]?(.+?)['\"]?\s+playlist$",
+        r"^create\s+(?:a\s+)?new\s+playlist\s+(?:called|named)\s+['\"]?(.+?)['\"]?$",
+        r"^(?:create|make)\s+playlist\s+(?:called|named)\s+['\"]?(.+?)['\"]?$",
+        r"^new\s+playlist\s+(?:called|named)\s+['\"]?(.+?)['\"]?$",
     ]
     SAVE_PLAYLIST_PATTERN = r"^save\s+(?:playlist\s+)?(?:as\s+)?['\"]?(.+?)['\"]?$"
     
@@ -347,7 +353,9 @@ class MusicFastPathParser:
 
         def _clean_playlist_name(value: str) -> str:
             playlist = str(value or "").strip().strip('"').strip("'")
+            playlist = re.sub(r"^(?:called|named)\s+", "", playlist, flags=re.IGNORECASE).strip()
             playlist = re.sub(r"^the\s+", "", playlist, flags=re.IGNORECASE).strip()
+            playlist = re.sub(r"[\s\.,!?;:]+$", "", playlist).strip()
             return playlist
         
         # Load playlist
@@ -379,18 +387,42 @@ class MusicFastPathParser:
         
         # Add songs to playlist
         if text.startswith("add "):
+            number_words = {
+                "one": 1,
+                "two": 2,
+                "three": 3,
+                "four": 4,
+                "five": 5,
+                "six": 6,
+                "seven": 7,
+                "eight": 8,
+                "nine": 9,
+                "ten": 10,
+                "eleven": 11,
+                "twelve": 12,
+                "thirteen": 13,
+                "fourteen": 14,
+                "fifteen": 15,
+                "sixteen": 16,
+                "seventeen": 17,
+                "eighteen": 18,
+                "nineteen": 19,
+                "twenty": 20,
+            }
             for regex in self.add_songs_regexes:
                 match = regex.match(text)
                 if not match:
                     continue
-                count_str = match.group(1)
+                count_token = str(match.group(1) or "").strip().lower()
                 query = match.group(2).strip()
-                try:
-                    count = int(count_str)
-                    if 1 <= count <= 100:
-                        return ("add_songs_to_playlist", {"query": query, "count": count})
-                except ValueError:
-                    pass
+                count = number_words.get(count_token)
+                if count is None:
+                    try:
+                        count = int(count_token)
+                    except ValueError:
+                        count = None
+                if count is not None and 1 <= count <= 100:
+                    return ("add_songs_to_playlist", {"query": query, "count": count})
         
         # No fast-path match - return None to trigger LLM fallback
         return None

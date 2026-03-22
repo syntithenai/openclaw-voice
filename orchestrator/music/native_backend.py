@@ -24,10 +24,68 @@ class QueueItem:
     id: int
 
 
+def _load_env_file_values(env_file: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        for raw in env_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, val = line.split("=", 1)
+            key = key.strip()
+            if not key:
+                continue
+            values[key] = val.strip().strip('"').strip("'")
+    except Exception:
+        return {}
+    return values
+
+
+def _get_env_or_file(key: str, workspace: Path, default: str) -> str:
+    value = str(os.getenv(key, "") or "").strip()
+    if value:
+        return value
+
+    candidate_files: list[Path] = [workspace / ".env", workspace.parent / ".env"]
+    for env_file in candidate_files:
+        if not env_file.exists() or not env_file.is_file():
+            continue
+        file_values = _load_env_file_values(env_file)
+        file_value = str(file_values.get(key, "") or "").strip()
+        if file_value:
+            return file_value
+    return default
+
+
+def _resolve_default_playlist_root(workspace: Path) -> Path:
+    """Pick a sane default playlists directory for this workspace.
+
+    When running from inside the `openclaw-voice` repo (or one of its subdirs),
+    prefer the sibling workspace-level `playlists/` directory.
+    """
+    ws = workspace.resolve()
+
+    # Common local-dev layout:
+    #   <workspace>/openclaw-voice
+    #   <workspace>/playlists
+    for candidate in [ws, *ws.parents]:
+        if candidate.name != "openclaw-voice":
+            continue
+        sibling_playlists = (candidate.parent / "playlists").resolve()
+        if sibling_playlists.exists() and sibling_playlists.is_dir():
+            return sibling_playlists
+        break
+
+    return (ws / "playlists").resolve()
+
+
 class _NativeMusicBackend:
     def __init__(self) -> None:
-        workspace = Path(os.getenv("OPENCLAW_WORKSPACE_DIR", str(Path.cwd()))).resolve()
-        configured_library = Path(os.getenv("MEDIA_LIBRARY_ROOT", "/music")).expanduser()
+        cwd = Path.cwd().resolve()
+        # OPENCLAW_WORKSPACE_DIR should only come from explicit process env.
+        # Falling back to values in unrelated .env files can redirect indexing.
+        workspace = Path(os.getenv("OPENCLAW_WORKSPACE_DIR", str(cwd))).resolve()
+        configured_library = Path(_get_env_or_file("MEDIA_LIBRARY_ROOT", workspace, "/music")).expanduser()
         library_root = configured_library.resolve() if configured_library.is_absolute() else (workspace / configured_library).resolve()
         if not library_root.exists():
             try:
@@ -35,8 +93,14 @@ class _NativeMusicBackend:
             except Exception:
                 library_root = (workspace / "music").resolve()
                 library_root.mkdir(parents=True, exist_ok=True)
-        playlist_root = Path(os.getenv("PLAYLIST_ROOT", str(workspace / "playlists"))).expanduser().resolve()
-        db_path = Path(os.getenv("MEDIA_INDEX_DB_PATH", str(workspace / ".media" / "library.sqlite3"))).expanduser().resolve()
+        configured_playlist_root = _get_env_or_file("PLAYLIST_ROOT", workspace, "").strip()
+        if configured_playlist_root:
+            playlist_root = Path(configured_playlist_root).expanduser().resolve()
+        else:
+            playlist_root = _resolve_default_playlist_root(workspace)
+        db_path = Path(
+            _get_env_or_file("MEDIA_INDEX_DB_PATH", workspace, str(workspace / ".media" / "library.sqlite3"))
+        ).expanduser().resolve()
 
         self.library = LibraryIndex(str(db_path), str(library_root))
         self.library_root = library_root

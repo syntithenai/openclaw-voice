@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import html as html_utils
 import json
 import mimetypes
@@ -10,6 +11,8 @@ import threading
 from urllib.parse import parse_qs, quote, unquote, urlsplit
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
+
+from orchestrator.web.file_manager_service import FileManagerError
 
 
 def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None:
@@ -204,19 +207,29 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
             content_type: str = "text/html; charset=utf-8",
             extra_headers: list[tuple[str, str]] | None = None,
         ) -> None:
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Access-Control-Allow-Headers", "*")
-            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            for key, value in (extra_headers or []):
-                self.send_header(key, value)
-            self.end_headers()
-            self.wfile.write(body)
+            try:
+                self.send_response(status)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "*")
+                self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+                for key, value in (extra_headers or []):
+                    self.send_header(key, value)
+                self.end_headers()
+                self.wfile.write(body)
+            except ssl.SSLError:
+                # Most SSL write errors here are client disconnects (browser/nav cancel); ignore.
+                return
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except OSError as exc:
+                if exc.errno in (errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED):
+                    return
+                raise
 
         def _send_json(
             self,
@@ -246,7 +259,18 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
 
         def _handle_auth_get(self, path: str, query: dict[str, list[str]]) -> bool:
             if path == "/auth/session":
-                self._send_json(service.auth_bootstrap_from_headers(self.headers))
+                bootstrap = service.auth_bootstrap_from_headers(self.headers)
+                extra_headers: list[tuple[str, str]] = []
+                if bootstrap.get("authenticated"):
+                    session_id = service.extract_session_id_from_request(self.headers)
+                    if session_id:
+                        cookie_value = service.build_session_set_cookie(
+                            session_id=session_id,
+                            request_is_https=self._request_is_https(),
+                        )
+                        if cookie_value:
+                            extra_headers.append(("Set-Cookie", cookie_value))
+                self._send_json(bootstrap, extra_headers=extra_headers)
                 return True
 
             if path == "/auth/logout":
@@ -317,6 +341,75 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
             
             return False
 
+        def _require_file_manager(self):
+            manager = getattr(service, "file_manager", None)
+            enabled = bool(getattr(service, "file_manager_enabled", False))
+            if not enabled or manager is None:
+                raise FileManagerError(404, "file manager is disabled")
+            return manager
+
+        def _query_path(self, query: dict[str, list[str]], default: str = "/") -> str:
+            return str((query.get("path") or [default])[0] or default)
+
+        def _handle_file_manager_get(self, path: str, query: dict[str, list[str]]) -> bool:
+            if not path.startswith("/api/file-manager"):
+                return False
+            try:
+                manager = self._require_file_manager()
+                if path == "/api/file-manager/tree":
+                    self._send_json(manager.list_tree(self._query_path(query, "/")))
+                    return True
+                if path == "/api/file-manager/folder":
+                    self._send_json(manager.list_folder(self._query_path(query, "/")))
+                    return True
+                if path == "/api/file-manager/file":
+                    self._send_json(manager.get_file(self._query_path(query, "/")))
+                    return True
+                if path == "/api/file-manager/preview":
+                    preview_path = manager.resolve_preview_path(self._query_path(query, "/"))
+                    self._send_file(preview_path)
+                    return True
+                self._send_json({"error": "Not found"}, status=404)
+                return True
+            except FileManagerError as exc:
+                self._send_json({"error": exc.message}, status=exc.status)
+                return True
+
+        def _handle_file_manager_post(self, path: str, query: dict[str, list[str]], body: bytes) -> bool:
+            if path != "/api/file-manager/folder":
+                return False
+            try:
+                manager = self._require_file_manager()
+                payload = json.loads(body.decode("utf-8") or "{}")
+                name = str(payload.get("name", ""))
+                parent = self._query_path(query, "/")
+                self._send_json(manager.create_folder(parent, name))
+                return True
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid request body"}, status=400)
+                return True
+            except FileManagerError as exc:
+                self._send_json({"error": exc.message}, status=exc.status)
+                return True
+
+        def _handle_file_manager_put(self, path: str, query: dict[str, list[str]], body: bytes) -> bool:
+            if path != "/api/file-manager/file":
+                return False
+            try:
+                manager = self._require_file_manager()
+                payload = json.loads(body.decode("utf-8") or "{}")
+                content = str(payload.get("content", ""))
+                expected_etag = str(payload.get("expectedEtag", ""))
+                file_path = self._query_path(query, "/")
+                self._send_json(manager.save_file(file_path, content, expected_etag))
+                return True
+            except json.JSONDecodeError:
+                self._send_json({"error": "invalid request body"}, status=400)
+                return True
+            except FileManagerError as exc:
+                self._send_json({"error": exc.message}, status=exc.status)
+                return True
+
         def do_OPTIONS(self) -> None:  # noqa: N802
             self._send(b"", status=204, content_type="text/plain")
 
@@ -345,6 +438,9 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
 
             if service.should_protect_http_path(path) and not self._is_authenticated():
                 self._send(b"Authentication required", status=401, content_type="text/plain")
+                return
+
+            if self._handle_file_manager_get(path, query):
                 return
 
             if path in ("/", "/index.html"):
@@ -385,12 +481,35 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
 
         def do_POST(self) -> None:  # noqa: N802
             path = self._parse_request_path()
+            query = self._parse_query_params()
             content_length = int(self.headers.get("Content-Length", 0) or 0)
             body = self.rfile.read(content_length) if content_length > 0 else b""
+
+            if service.should_protect_http_path(path) and not self._is_authenticated():
+                self._send(b"Authentication required", status=401, content_type="text/plain")
+                return
             
             if self._handle_auth_post(path, body):
                 return
+
+            if self._handle_file_manager_post(path, query, body):
+                return
             
+            self._send_json({"error": "Not found"}, status=404)
+
+        def do_PUT(self) -> None:  # noqa: N802
+            path = self._parse_request_path()
+            query = self._parse_query_params()
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+
+            if service.should_protect_http_path(path) and not self._is_authenticated():
+                self._send(b"Authentication required", status=401, content_type="text/plain")
+                return
+
+            if self._handle_file_manager_put(path, query, body):
+                return
+
             self._send_json({"error": "Not found"}, status=404)
 
     class RedirectHandler(BaseHTTPRequestHandler):
@@ -405,12 +524,19 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
 
         def _redirect(self) -> None:
             target = self._redirect_target()
-            self.send_response(307)
-            self.send_header("Location", target)
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            self.end_headers()
+            try:
+                self.send_response(307)
+                self.send_header("Location", target)
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
+                self.end_headers()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            except OSError as exc:
+                if exc.errno in (errno.EPIPE, errno.ECONNRESET, errno.ECONNABORTED):
+                    return
+                raise
 
         def do_GET(self) -> None:  # noqa: N802
             self._redirect()

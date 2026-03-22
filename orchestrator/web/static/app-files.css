@@ -1,0 +1,117 @@
+.fm-layout {
+  display: grid;
+  grid-template-columns: 280px 320px minmax(420px, 1fr);
+  gap: 12px;
+  height: 100%;
+  min-height: 0;
+}
+
+.fm-panel {
+  border: 1px solid rgb(55 65 81);
+  border-radius: 12px;
+  background: rgba(17, 24, 39, 0.45);
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.fm-scroll {
+  overflow: auto;
+  min-height: 0;
+}
+
+.fm-tree-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.fm-tree-row:hover {
+  background: rgba(55, 65, 81, 0.6);
+}
+
+.fm-tree-row.active {
+  background: rgba(37, 99, 235, 0.35);
+  border: 1px solid rgba(59, 130, 246, 0.6);
+}
+
+.fm-file-row {
+  padding: 8px 10px;
+  border-bottom: 1px solid rgb(31 41 55);
+  cursor: pointer;
+}
+
+.fm-file-row:hover {
+  background: rgba(31, 41, 55, 0.7);
+}
+
+.fm-file-row.active {
+  background: rgba(37, 99, 235, 0.3);
+}
+
+.fm-editor-wrap {
+  height: 100%;
+  min-height: 0;
+}
+
+.fm-textarea {
+  width: 100%;
+  height: 100%;
+  min-height: 420px;
+  resize: vertical;
+  border-radius: 10px;
+  border: 1px solid rgb(55 65 81);
+  background: rgb(17 24 39);
+  color: rgb(229 231 235);
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.fm-preview img,
+.fm-preview video,
+.fm-preview audio {
+  max-width: 100%;
+  border-radius: 10px;
+}
+
+.fm-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 60;
+}
+
+.fm-modal {
+  width: min(480px, calc(100vw - 40px));
+  border: 1px solid rgb(55 65 81);
+  border-radius: 12px;
+  background: rgb(17 24 39);
+  padding: 14px;
+}
+
+@media (max-width: 1200px) {
+  .fm-layout {
+    grid-template-columns: 250px minmax(260px, 1fr);
+    grid-template-rows: 1fr 1fr;
+  }
+
+  .fm-layout .fm-panel:nth-child(3) {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (max-width: 780px) {
+  .fm-layout {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+}

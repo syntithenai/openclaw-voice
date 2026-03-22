@@ -1277,39 +1277,78 @@ async def run_orchestrator() -> None:
                     asyncio.create_task(_runner())
 
                 async def adjust_output_volume(direction: int):
-                    nonlocal tts_base_gain, tts_gain
+                    async def adjust_system_output_volume(step_direction: int, step_percent: int = 5) -> str:
+                        step = max(1, min(25, abs(int(step_percent))))
+                        suffix = "+" if step_direction > 0 else "-"
+                        delta = f"{step}%{suffix}"
 
-                    previous_tts_base_gain = tts_base_gain
-                    tts_base_gain = max(0.2, min(3.0, tts_base_gain + (0.12 * direction)))
+                        def _run_wpctl() -> bool:
+                            subprocess.run(
+                                ["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            result = subprocess.run(
+                                ["wpctl", "set-volume", "-l", "1.0", "@DEFAULT_AUDIO_SINK@", delta],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            return result.returncode == 0
 
-                    # Preserve cut-in ducking if active, otherwise keep live playback in sync.
-                    if abs(tts_gain - previous_tts_base_gain) < 1e-6:
-                        tts_gain = tts_base_gain
-                    else:
-                        tts_gain = min(tts_gain, tts_base_gain)
+                        def _run_pactl() -> bool:
+                            subprocess.run(
+                                ["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            result = subprocess.run(
+                                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", delta],
+                                check=False,
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
+                            return result.returncode == 0
 
-                    logger.info(
-                        "🔊 TTS base gain %s to %.2f",
-                        "increased" if direction > 0 else "decreased",
-                        tts_base_gain,
-                    )
+                        def _run_amixer() -> bool:
+                            controls = ["Master", "PCM", "Speaker"]
+                            for control in controls:
+                                result = subprocess.run(
+                                    ["amixer", "sset", control, delta, "unmute"],
+                                    check=False,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL,
+                                )
+                                if result.returncode == 0:
+                                    return True
+                            return False
 
-                    if config.music_enabled and music_manager:
-                        try:
-                            if direction > 0:
-                                result = await music_manager.increase_volume(5)
-                            else:
-                                result = await music_manager.decrease_volume(5)
-                            logger.info("🎵 Music volume update: %s", result)
-                        except Exception as e:
-                            logger.debug("Failed to adjust music volume: %s", e)
+                        if shutil.which("wpctl"):
+                            if await asyncio.to_thread(_run_wpctl):
+                                return f"system volume adjusted via wpctl ({delta})"
+                        if shutil.which("pactl"):
+                            if await asyncio.to_thread(_run_pactl):
+                                return f"system volume adjusted via pactl ({delta})"
+                        if shutil.which("amixer"):
+                            if await asyncio.to_thread(_run_amixer):
+                                return f"system volume adjusted via amixer ({delta})"
+                        return "no supported system volume command available"
 
-                    # Play feedback click proportional to current volume level.
+                    if not config.media_keys_exclusive_grab:
+                        logger.info(
+                            "🔊 Ignoring orchestrator volume-step for %s: exclusive grab disabled, leaving system volume to the OS",
+                            "up" if direction > 0 else "down",
+                        )
+                        return
+
+                    result = await adjust_system_output_volume(direction)
+                    logger.info("🔊 Hardware volume key handled by orchestrator: %s", result)
+
                     if volume_click_sound:
                         try:
-                            normalized_level = (tts_base_gain - 0.2) / max(0.01, 3.0 - 0.2)
-                            base_click_gain = float(max(0.0, config.volume_feedback_gain))
-                            feedback_gain = float(min(3.0, base_click_gain * (0.75 + 0.5 * normalized_level)))
+                            feedback_gain = float(min(3.0, max(0.0, config.volume_feedback_gain)))
                             play_feedback_async(volume_click_sound, feedback_gain, "volume feedback click")
                         except Exception as e:
                             logger.debug("Failed to play volume feedback click: %s", e)
@@ -1510,7 +1549,7 @@ async def run_orchestrator() -> None:
                     asyncio.create_task(pause_system_media_if_needed("phone button"))
                     await trigger_wake("phone button")
                 
-                # Volume controls -> orchestrator-managed TTS + music volume.
+                # Volume controls -> OS/system volume when orchestrator owns the device grab.
                 elif event.key == "volume_up":
                     await adjust_output_volume(1)
 
@@ -1899,6 +1938,16 @@ async def run_orchestrator() -> None:
                 workspace_files_enabled=config.web_ui_workspace_files_enabled,
                 workspace_files_root=config.web_ui_workspace_files_root,
                 workspace_files_allow_listing=config.web_ui_workspace_files_allow_listing,
+                file_manager_enabled=config.web_ui_file_manager_enabled,
+                file_manager_root=config.web_ui_file_manager_root,
+                file_manager_excluded_folders=config.web_ui_file_manager_excluded_folders,
+                file_manager_top_level_config_files=config.web_ui_file_manager_top_level_config_files,
+                file_manager_max_editable_bytes=config.web_ui_file_manager_max_editable_bytes,
+                file_manager_watch_enabled=config.web_ui_file_manager_watch_enabled,
+                file_manager_watch_max_watches=config.web_ui_file_manager_watch_max_watches,
+                file_manager_watch_max_events_per_tick=config.web_ui_file_manager_watch_max_events_per_tick,
+                file_manager_watch_max_paths_per_push=config.web_ui_file_manager_watch_max_paths_per_push,
+                file_manager_watch_coalesce_ms=config.web_ui_file_manager_watch_coalesce_ms,
                 media_files_enabled=config.web_ui_media_files_enabled,
                 media_files_root=config.web_ui_media_files_root,
                 media_files_allow_listing=config.web_ui_media_files_allow_listing,
@@ -3953,6 +4002,16 @@ async def run_orchestrator() -> None:
                         active_buffer_request_id = current_request_id
                         if flush_task and not flush_task.done():
                             flush_task.cancel()
+
+                    if web_service and not suppress_gateway_messages_for_new_session:
+                        web_service.append_chat_message(
+                            {
+                                "role": "raw_gateway",
+                                "text": message,
+                                "request_id": current_request_id,
+                                "source": "gateway_stream",
+                            }
+                        )
 
                     payload_obj: dict[str, Any] | None = None
                     try:

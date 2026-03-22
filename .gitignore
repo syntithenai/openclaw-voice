@@ -40,3 +40,5 @@ docker/pyannote-models/hub/
 docker/pyannote-models/xet/
 .media/library.sqlite3
 .media/library.sqlite3-journal
+playlists/Fun Times.m3u
+.openclaw/.media/music_search_idx.sqlite3
