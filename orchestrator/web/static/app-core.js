@@ -31,7 +31,8 @@ const S = {
         musicAddMode:false, musicAddQuery:'', musicAddSelection:{}, musicAddLastCheckedFile:'', musicAddHasSearched:false,
         musicAddSearchPending:false, musicAddPendingQuery:'',
         musicNewPlaylistName:'',
-        musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'', musicPlaylistModalOriginalName:'',
+            musicPlaylistModalOpen:false, musicPlaylistModalMode:'', musicPlaylistModalName:'', musicPlaylistModalOriginalName:'',
+            musicPlaylistModalAction:'', musicPlaylistModalActionName:'',
         recordings:[], recordingsDetail:null, recordingsDetailLoading:false,
         recordingsSelectionByIds:{}, recordingsLastCheckedId:null,
         recordingsActionError:'', recordingsActionErrorTs:0, lastRecordingsRev:0,
@@ -63,7 +64,26 @@ const S = {
     authMode: AUTH_MODE_BOOTSTRAP,
     isAuthenticated: AUTHENTICATED_BOOTSTRAP,
     authUser: AUTH_USER_BOOTSTRAP,
+    googleSignInInitialized:false,
+    googleSignInInitError:'',
 };
+
+function getMusicQueueLength(){
+    return Math.max(0, Number((S.music&&S.music.queue_length)||0) || (Array.isArray(S.musicQueue)?S.musicQueue.length:0));
+}
+
+function hasLoadedMusicPlaylist(){
+    return !!String((S.music&&S.music.loaded_playlist)||'').trim();
+}
+
+function hasUnsavedMusicQueue(){
+    return !hasLoadedMusicPlaylist() && getMusicQueueLength() > 0;
+}
+
+function isMusicLoadActionType(actionType){
+    const action = String(actionType||'').trim();
+    return action === 'music_load_playlist' || action === 'music_save_queue_then_load_playlist';
+}
 
 function authRequiresLogin(){
     return String(S.authMode||'disabled')==='required';
@@ -82,7 +102,15 @@ function renderAuthButton(){
     const btn = document.getElementById('loginBtn');
     if(!btn) return;
 
+    // Hide button if auth is disabled
     if(String(S.authMode||'disabled')==='disabled'){
+        btn.classList.add('hidden');
+        return;
+    }
+
+    // Hide button if auth is not configured (no Google client ID)
+    const hasGoogleClientId = Boolean(String(RUNTIME.googleClientId || '').trim());
+    if(!S.isAuthenticated && !hasGoogleClientId){
         btn.classList.add('hidden');
         return;
     }
@@ -90,9 +118,17 @@ function renderAuthButton(){
     btn.classList.remove('hidden');
     if(S.isAuthenticated){
         const displayName = String((S.authUser&&S.authUser.given_name) || (S.authUser&&S.authUser.name) || (S.authUser&&S.authUser.email) || 'Account');
-        const compact = displayName.length > 18 ? (displayName.slice(0, 17) + '…') : displayName;
-        btn.textContent = compact;
-        btn.setAttribute('title', 'Signed in as ' + String((S.authUser&&S.authUser.email)||displayName) + '. Click to sign out');
+        const profilePicUrl = String(S.authUser&&S.authUser.picture || '');
+        const email = String((S.authUser&&S.authUser.email) || displayName);
+        
+        // Build button with profile picture or fallback to name
+        if(profilePicUrl){
+            btn.innerHTML = '<img src="' + profilePicUrl.replace(/"/g, '&quot;') + '" alt="Profile" class="w-6 h-6 rounded-full" />';
+        } else {
+            btn.innerHTML = displayName.length > 18 ? (displayName.slice(0, 17) + '…') : displayName;
+        }
+        
+        btn.setAttribute('title', 'Signed in as ' + email + '. Click to sign out');
         btn.dataset.action = 'auth-logout';
         btn.classList.remove('bg-gray-800','hover:bg-gray-700','border-gray-700');
         btn.classList.add('bg-emerald-800','hover:bg-emerald-700','border-emerald-600');
@@ -135,14 +171,215 @@ async function refreshAuthSession(opts={}){
     if(typeof updateMicInteractivity==='function') updateMicInteractivity();
 }
 
+async function handleGoogleSignInResponse(response){
+    // This is called by Google Sign-In library with the credential (ID token)
+    if(!response || !response.credential){
+        console.error('No credential from Google Sign-In');
+        return;
+    }
+    
+    try{
+        const resp = await fetch('/auth/google/token', {
+            method: 'POST',
+            credentials: 'same-origin',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ idToken: response.credential })
+        });
+        
+        if(resp.ok){
+            const data = await resp.json();
+            S.authMode = String((data && data.mode) || S.authMode || 'disabled').toLowerCase();
+            S.isAuthenticated = !!(data && data.authenticated);
+            S.authUser = (data && data.user && typeof data.user === 'object') ? data.user : null;
+            
+            // Close the login dialog on successful signin
+            const modal = document.getElementById('googleSignInModal');
+            if(modal) modal.remove();
+            
+            renderAuthButton();
+            if(typeof renderPage === 'function') renderPage();
+            if(typeof connectWs === 'function'){
+                S.wsManualDisconnect = false;
+                connectWs();
+            }
+        } else {
+            const err = await resp.json().catch(() => ({}));
+            const errorMsg = err.error || 'unknown error';
+            console.error('Token verification failed:', errorMsg);
+            
+            // Check if user is not allowed
+            if(errorMsg === 'user_not_allowed'){
+                showAuthWarning(
+                    'Access Denied\n\n' +
+                    'Your Google account is not authorized to access this system.\n\n' +
+                    'If you believe this is an error, please contact the system administrator.'
+                );
+                // Close the login dialog and treat as if not logged in
+                const modal = document.getElementById('googleSignInModal');
+                if(modal) modal.remove();
+            }
+        }
+    } catch(e){
+        console.error('Google Sign-In token submission failed:', e);
+    }
+}
+
+function initGoogleSignIn(){
+    if(S.googleSignInInitialized) return { ok:true, reason:'' };
+    if(String(S.authMode || 'disabled') === 'disabled') return { ok:false, reason:'Authentication is disabled.' };
+    if(!window.google) return { ok:false, reason:'Google Sign-In library not loaded (blocked by network/adblock or script load race).' };
+    if(!window.google.accounts || !window.google.accounts.id) return { ok:false, reason:'Google Sign-In library loaded but google.accounts.id is unavailable.' };
+
+    const clientId = String(RUNTIME.googleClientId || '').trim();
+    if(!clientId){
+        return {
+            ok:false,
+            reason:'No Google client ID configured. Set WEB_UI_GOOGLE_CLIENT_SECRET_FILE or WEB_UI_GOOGLE_CLIENT_ID in .env and restart.'
+        };
+    }
+
+    try{
+        google.accounts.id.initialize({
+            client_id: clientId,
+            callback: handleGoogleSignInResponse,
+            auto_select: false,
+        });
+        S.googleSignInInitialized = true;
+        S.googleSignInInitError = '';
+        console.debug('[Auth] Google Sign-In initialized successfully');
+        return { ok:true, reason:'' };
+    }catch(e){
+        const reason = 'Google Sign-In initialization failed: ' + String((e && e.message) || e || 'unknown error');
+        S.googleSignInInitError = reason;
+        console.error('[Auth] ' + reason);
+        return { ok:false, reason };
+    }
+}
+
 function triggerGoogleLogin(){
-    window.location.assign(buildAuthLoginUrl());
+    const init = initGoogleSignIn();
+    if(!init.ok){
+        showAuthError(
+            init.reason + '\n\n' +
+            'Also confirm Google OAuth client settings:\n' +
+            '1. OAuth client type is Web application\n' +
+            '2. Authorized JavaScript origins include your UI origin (for example http://localhost:443 or https://doomsday.local)\n' +
+            '3. If OAuth app is in testing mode, add your Google account as a Test user'
+        );
+        return;
+    }
+    
+    // Create a modal to show the Google sign-in button
+    const existingModal = document.getElementById('googleSignInModal');
+    if(existingModal) existingModal.remove();
+    
+    const modal = document.createElement('div');
+    modal.id = 'googleSignInModal';
+    modal.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
+    modal.innerHTML = `
+        <div class="bg-gray-900 border border-gray-700 rounded-lg shadow-xl p-6 max-w-sm">
+            <h2 class="text-lg font-semibold mb-4">Sign in with Google</h2>
+            <div id="googleSignInContainer" class="mb-4 flex justify-center"></div>
+            <div id="googleSignInError" class="hidden mb-4 p-3 bg-red-900/30 border border-red-700 rounded text-sm text-red-200"></div>
+            <button type="button" class="w-full px-3 py-2 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors" onclick="document.getElementById('googleSignInModal').remove()">Cancel</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    modal.addEventListener('click', (e) => {
+        if(e.target === modal) modal.remove();
+    });
+    
+    // Render the Google Sign-In button in the modal
+    const container = document.getElementById('googleSignInContainer');
+    const errorDiv = document.getElementById('googleSignInError');
+    if(container){
+        setTimeout(() => {
+            try{
+                google.accounts.id.renderButton(container, {
+                    type: 'standard',
+                    theme: 'filled_black',
+                    size: 'large',
+                    locale: 'en_US',
+                    width: '300',
+                });
+                console.debug('[Auth] Google Sign-In button rendered');
+            } catch(e){
+                console.error('[Auth] Failed to render Google Sign-In button:', e);
+                if(errorDiv){
+                    errorDiv.classList.remove('hidden');
+                    errorDiv.textContent = 'Error rendering Google Sign-In button. Check browser console: ' + String(e.message || e);
+                }
+            }
+        }, 0);
+
+        // GIS can fail silently (for example invalid JS origin); surface a concrete hint.
+        setTimeout(() => {
+            if(container.childElementCount === 0 && errorDiv){
+                errorDiv.classList.remove('hidden');
+                errorDiv.textContent =
+                    'Google Sign-In button did not render. Most common fix: add this site to OAuth Authorized JavaScript origins in Google Cloud Console. ' +
+                    'Use your exact origin (scheme + host + port), e.g. http://localhost:443 or https://doomsday.local.';
+            }
+        }, 700);
+    }
+}
+
+function showAuthError(message){
+    const existingModal = document.getElementById('googleSignInModal');
+    if(existingModal) existingModal.remove();
+    
+    const modal = document.createElement('div');
+    modal.id = 'googleSignInModal';
+    modal.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
+    modal.innerHTML = `
+        <div class="bg-gray-900 border border-red-700 rounded-lg shadow-xl p-6 max-w-md">
+            <h2 class="text-lg font-semibold mb-4 text-red-200">Authentication Configuration Error</h2>
+            <div class="mb-4 p-3 bg-red-900/30 border border-red-700 rounded text-sm text-red-100 whitespace-pre-wrap font-mono" id="authErrorMsg"></div>
+            <button type="button" class="w-full px-3 py-2 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors" onclick="document.getElementById('googleSignInModal').remove()">Close</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    // Use textContent to avoid HTML injection
+    const errorMsg = modal.querySelector('#authErrorMsg');
+    if(errorMsg) errorMsg.textContent = message;
+    modal.addEventListener('click', (e) => {
+        if(e.target === modal) modal.remove();
+    });
+}
+
+function showAuthWarning(message){
+    const existingModal = document.getElementById('googleSignInModal');
+    if(existingModal) existingModal.remove();
+    
+    const modal = document.createElement('div');
+    modal.id = 'googleSignInModal';
+    modal.className = 'fixed inset-0 bg-black/50 flex items-center justify-center z-50';
+    modal.innerHTML = `
+        <div class="bg-gray-900 border border-amber-700 rounded-lg shadow-xl p-6 max-w-md">
+            <h2 class="text-lg font-semibold mb-4 text-amber-200">Access Denied</h2>
+            <div class="mb-4 p-3 bg-amber-900/30 border border-amber-700 rounded text-sm text-amber-100 whitespace-pre-wrap" id="authWarningMsg"></div>
+            <button type="button" class="w-full px-3 py-2 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors" onclick="document.getElementById('googleSignInModal').remove()">Close</button>
+        </div>
+    `;
+    document.body.appendChild(modal);
+    // Use textContent to avoid HTML injection
+    const warningMsg = modal.querySelector('#authWarningMsg');
+    if(warningMsg) warningMsg.textContent = message;
+    modal.addEventListener('click', (e) => {
+        if(e.target === modal) modal.remove();
+    });
 }
 
 async function triggerGoogleLogout(){
     try{
         await fetch('/auth/logout', { method:'POST', credentials:'same-origin' });
     }catch(_ ){}
+    // Revoke Google session as well
+    if(window.google && window.google.accounts){
+        try{
+            google.accounts.id.revoke(RUNTIME.authUserEmail || '', () => {});
+        } catch(e){}
+    }
     await refreshAuthSession({ render:true, adjustWs:true });
 }
 

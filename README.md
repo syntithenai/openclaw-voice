@@ -12,7 +12,7 @@ OpenClaw Voice is a low-latency voice assistant orchestrator built around a **tw
 Incoming voice requests are first handled by a **small, specialised model running locally** (IBM Granite is recommended for local hardware). This tier is optimised for minimal latency and handles a focused set of built-in skills that are tightly coupled to the audio system:
 
 - **Alarms & Timers** — set, cancel, and announce alarms with natural voice interaction
-- **Music Playback** — play, pause, skip, change volume, and load playlists via MPD
+- **Music Playback** — play, pause, skip, change volume, and load playlists
 - **Recording Mode** — start/stop audio capture sessions by voice
 
 For these tasks, the assistant responds in under a second without ever hitting the network.
@@ -23,7 +23,7 @@ When a request falls outside the local skill set, the voice orchestrator **forwa
 This split keeps everyday interactions snappy while still supporting the full power of an AI assistant when needed.
 
 ### Hardware Target
-The system is **built and optimised for the GMKTEK EVO-X2** mini PC, which runs local inference for STT (Whisper), TTS (Piper), and the fast-response model. However it works with any Linux host and scales up well with faster hardware or cloud-hosted models.
+The system is **built and optimised for the GMKTEK EVO-X2** mini PC. The EVO-X2 runs the full stack locally — STT (Whisper), TTS (Piper), the fast Granite response model, and the upstream MiniMax gateway model — making the entire system **self-contained with no cloud dependency**. It also works on any Linux host and scales up further with faster hardware.
 
 ---
 
@@ -52,7 +52,7 @@ Configurable confidence thresholds and automatic cooldown to prevent false posit
 
 ### 🧰 Skills & Tooling
 - **Timer & Alarm Skills** - File-backed timer/alarm tools with background monitoring, ringing state, and spoken notifications
-- **Music Player Skill (MPD)** - Play/pause/next/previous, set volume, list/load playlists, and resume-on-wake workflows
+- **Music Player Skill** - Play/pause/next/previous, set volume, list/load playlists, and resume-on-wake workflows
 - **Quick Answer + Tool Calls** - Fast local factual answers with deterministic tool fast-paths and upstream escalation for complex tasks
 
 ### 🖥️ Realtime Web UI
@@ -154,7 +154,7 @@ nano .env
 python -m orchestrator.main
 ```
 
-**Raspbian quick reference:** See [RASPBIAN_INSTALL.md](RASPBIAN_INSTALL.md) for detailed Raspberry Pi setup.
+**Raspbian quick reference:** See [RASPBIAN_INSTALL.md](docs/RASPBIAN_INSTALL.md) for detailed Raspberry Pi setup.
 
 ### Pairing with OpenClaw Gateway
 
@@ -244,7 +244,7 @@ python -m orchestrator.main
 
 **Resource requirements:** Pi 3/4/Zero 2W (1GB+ RAM), remote server (2GB+ RAM, 4+ cores).
 
-**Tip:** Use `hey_mycroft` wake word model for best Raspberry Pi performance (see [WAKEWORD_ENGINES.md](WAKEWORD_ENGINES.md)).
+**Tip:** Use `hey_mycroft` wake word model for best Raspberry Pi performance (see [WAKEWORD_ENGINES.md](docs/WAKEWORD_ENGINES.md)).
 
 ---
 
@@ -261,7 +261,7 @@ GitHub Release publication is automated via:
 
 For target compatibility and release steps, see:
 
-- [PRECISE_COMPATIBILITY_AND_RELEASE.md](PRECISE_COMPATIBILITY_AND_RELEASE.md)
+- [PRECISE_COMPATIBILITY_AND_RELEASE.md](docs/PRECISE_COMPATIBILITY_AND_RELEASE.md)
 
 ---
 
@@ -349,7 +349,7 @@ OPENWAKEWORD_MODELS_DIR=docker/wakeword-models
 PICOVOICE_KEY=your_key_here
 ```
 
-See [WAKEWORD_ENGINES.md](WAKEWORD_ENGINES.md) for detailed wake word configuration.
+See [WAKEWORD_ENGINES.md](docs/WAKEWORD_ENGINES.md) for detailed wake word configuration.
 
 ### Speech Services
 ```bash
@@ -613,12 +613,12 @@ EMOTION_MODELS_DIR=docker/emotion-models
 
 ## 📚 Additional Documentation
 
-- **[EMBEDDED_WEB_UI.md](EMBEDDED_WEB_UI.md)** - Setup and embedding guide for the realtime browser voice widget
-- **[WAKEWORD_ENGINES.md](WAKEWORD_ENGINES.md)** - Detailed comparison of wake word engines and model selection
-- **[RASPBIAN_INSTALL.md](RASPBIAN_INSTALL.md)** - Comprehensive Raspberry Pi installation guide
-- **[QUICK_REFERENCE.md](QUICK_REFERENCE.md)** - Common commands and troubleshooting
-- **[DEPLOYMENT_CHECKLIST.md](DEPLOYMENT_CHECKLIST.md)** - Production deployment checklist
-- **[RECENT_CHANGES.md](RECENT_CHANGES.md)** - Recent updates and fixes
+- **[EMBEDDED_WEB_UI.md](docs/EMBEDDED_WEB_UI.md)** - Setup and embedding guide for the realtime browser voice widget
+- **[WAKEWORD_ENGINES.md](docs/WAKEWORD_ENGINES.md)** - Detailed comparison of wake word engines and model selection
+- **[RASPBIAN_INSTALL.md](docs/RASPBIAN_INSTALL.md)** - Comprehensive Raspberry Pi installation guide
+- **[QUICK_REFERENCE.md](docs/QUICK_REFERENCE.md)** - Common commands and troubleshooting
+- **[DEPLOYMENT_CHECKLIST.md](docs/DEPLOYMENT_CHECKLIST.md)** - Production deployment checklist
+- **[RECENT_CHANGES.md](docs/RECENT_CHANGES.md)** - Recent updates and fixes
 
 ---
 

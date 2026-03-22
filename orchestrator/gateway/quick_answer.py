@@ -642,6 +642,17 @@ MUSIC_TOOL_DEFINITIONS = [
     {
         "type": "function",
         "function": {
+            "name": "music_clear_queue",
+            "description": "Clear all items from the current queue and detach from any currently loaded saved playlist so subsequent queue edits are not auto-saved to that playlist.",
+            "parameters": {
+                "type": "object",
+                "properties": {}
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "music_load_playlist",
             "description": "Load a saved playlist",
             "parameters": {
@@ -1243,6 +1254,10 @@ class QuickAnswerClient:
                                     voice_action_name = "music_load_playlist"
                                     voice_music_action_id = self._new_voice_music_action_id()
                                     await self._emit_music_action_pending(voice_action_name, voice_music_action_id)
+                                elif func_name == "music_clear_queue":
+                                    voice_action_name = "music_clear_queue"
+                                    voice_music_action_id = self._new_voice_music_action_id()
+                                    await self._emit_music_action_pending(voice_action_name, voice_music_action_id)
 
                                 result = await self.music_router.handle_tool_call(func_name, args_dict)
 
@@ -1252,7 +1267,7 @@ class QuickAnswerClient:
                                     else:
                                         voice_load_complete_ts = time.monotonic()
                                         logger.info(
-                                            "🧭 Voice playlist trace %s: voice load completed (tool-call %s)",
+                                            "🧭 Voice music trace %s: action completed (tool-call %s)",
                                             voice_music_action_id,
                                             func_name,
                                         )

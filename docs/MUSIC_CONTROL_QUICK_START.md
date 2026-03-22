@@ -229,6 +229,6 @@ validate_native_music_integration.py
 
 - [FFmpeg Documentation](https://ffmpeg.org/documentation.html)
 - [MUSIC_CONTROL_PLAN.md](MUSIC_CONTROL_PLAN.md) - Full implementation plan
-- [.env.example](.env.example) - All configuration options (baseline)
-- [.env.docker.example](.env.docker.example) - Docker profile template
-- [.env.pi.example](.env.pi.example) - Raspberry Pi profile template
+- [.env.example](../.env.example) - All configuration options (baseline)
+- [.env.docker.example](../.env.docker.example) - Docker profile template
+- [.env.pi.example](../.env.pi.example) - Raspberry Pi profile template

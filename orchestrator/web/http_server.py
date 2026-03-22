@@ -90,6 +90,7 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                 "__AUTH_MODE__": str(auth_bootstrap.get("mode", "disabled")),
                 "__AUTHENTICATED__": "true" if auth_bootstrap.get("authenticated") else "false",
                 "__AUTH_USER_JSON__": json.dumps(auth_bootstrap.get("user"), separators=(",", ":")),
+                "__GOOGLE_CLIENT_ID__": str(getattr(service, "_google_client_id", "")),
             }
             static_root = Path(getattr(service, "static_root", Path(__file__).resolve().parent / "static")).resolve()
             index_path = static_root / "index.html"
@@ -177,52 +178,6 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                 self._send_json(service.auth_bootstrap_from_headers(self.headers))
                 return True
 
-            if path == "/auth/google/login":
-                if not service.auth_enabled():
-                    self._send_json({"error": "web ui auth is disabled"}, status=404)
-                    return True
-                if not service.oauth_ready():
-                    self._send_json({"error": "google oauth not configured"}, status=503)
-                    return True
-                next_path = str((query.get("next") or ["/"])[0] or "/")
-                auth_url = service.begin_google_login(
-                    request_host=self._request_host(),
-                    request_is_https=self._request_is_https(),
-                    next_path=next_path,
-                )
-                if not auth_url:
-                    self._send_json({"error": "google oauth login unavailable"}, status=503)
-                    return True
-                self._send_redirect(auth_url, status=302)
-                return True
-
-            if path == "/auth/google/callback":
-                state = str((query.get("state") or [""])[0] or "")
-                code = str((query.get("code") or [""])[0] or "")
-                error = str((query.get("error") or [""])[0] or "")
-                ok, session_id, next_path, err = service.complete_google_login(
-                    request_host=self._request_host(),
-                    request_is_https=self._request_is_https(),
-                    state=state,
-                    code=code,
-                    error=error,
-                )
-                if not ok:
-                    target = "/?auth_error=" + quote(err or "authentication failed")
-                    self._send_redirect(target, status=303)
-                    return True
-
-                cookie_value = service.build_session_set_cookie(
-                    session_id=session_id,
-                    request_is_https=self._request_is_https(),
-                )
-                self._send_redirect(
-                    next_path,
-                    status=303,
-                    extra_headers=[("Set-Cookie", cookie_value)],
-                )
-                return True
-
             if path == "/auth/logout":
                 service.logout_from_headers(self.headers)
                 cookie_value = service.build_session_clear_cookie(request_is_https=self._request_is_https())
@@ -234,6 +189,61 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
                 )
                 return True
 
+            return False
+        
+        def _handle_auth_post(self, path: str, body: bytes) -> bool:
+            if path == "/auth/google/token":
+                if not service.auth_enabled():
+                    self._send_json({"error": "web ui auth is disabled"}, status=404)
+                    return True
+                if not service.oauth_ready():
+                    self._send_json({"error": "google oauth not configured"}, status=503)
+                    return True
+                
+                try:
+                    payload = json.loads(body.decode("utf-8"))
+                    id_token = str(payload.get("idToken", "")).strip()
+                except Exception:
+                    self._send_json({"error": "invalid request body"}, status=400)
+                    return True
+                
+                if not id_token:
+                    self._send_json({"error": "missing idToken"}, status=400)
+                    return True
+                
+                ok, session_id, info = service.verify_and_create_session_from_token(
+                    id_token=id_token,
+                    request_host=self._request_host(),
+                    request_is_https=self._request_is_https(),
+                )
+                
+                if not ok:
+                    self._send_json({"error": session_id or info}, status=401)
+                    return True
+                
+                # Return session bootstrap + set cookie
+                cookie_value = service.build_session_set_cookie(
+                    session_id=session_id,
+                    request_is_https=self._request_is_https(),
+                )
+                bootstrap = service.auth_bootstrap_from_headers({"Cookie": f"{service._auth_session_cookie_name}={session_id}"})
+                self._send_json(
+                    bootstrap,
+                    status=200,
+                    extra_headers=[("Set-Cookie", cookie_value)],
+                )
+                return True
+            
+            if path == "/auth/logout":
+                service.logout_from_headers(self.headers)
+                cookie_value = service.build_session_clear_cookie(request_is_https=self._request_is_https())
+                self._send_json(
+                    {"ok": True},
+                    status=200,
+                    extra_headers=[("Set-Cookie", cookie_value)],
+                )
+                return True
+            
             return False
 
         def do_OPTIONS(self) -> None:  # noqa: N802
@@ -304,15 +314,12 @@ def start_http_servers(service: Any, ssl_context: ssl.SSLContext | None) -> None
 
         def do_POST(self) -> None:  # noqa: N802
             path = self._parse_request_path()
-            if path == "/auth/logout":
-                service.logout_from_headers(self.headers)
-                cookie_value = service.build_session_clear_cookie(request_is_https=self._request_is_https())
-                self._send_json(
-                    {"ok": True},
-                    status=200,
-                    extra_headers=[("Set-Cookie", cookie_value)],
-                )
+            content_length = int(self.headers.get("Content-Length", 0) or 0)
+            body = self.rfile.read(content_length) if content_length > 0 else b""
+            
+            if self._handle_auth_post(path, body):
                 return
+            
             self._send_json({"error": "Not found"}, status=404)
 
     class RedirectHandler(BaseHTTPRequestHandler):

@@ -30,6 +30,7 @@ class MusicRouter:
             "stop": self._handle_stop,
             "next_track": self._handle_next_track,
             "previous_track": self._handle_previous_track,
+            "clear_queue": self._handle_clear_queue,
             
             # Volume control
             "set_volume": self._handle_set_volume,
@@ -141,6 +142,11 @@ class MusicRouter:
         """Handle previous track command."""
         result = await self.manager.previous_track()
         return result if self._is_error(result) else "Previous."
+
+    async def _handle_clear_queue(self) -> str:
+        """Handle clear queue command."""
+        result = await self.manager.clear_queue()
+        return result if self._is_error(result) else "Queue cleared."
     
     async def _handle_set_volume(self, level: int) -> str:
         """Handle set volume command."""
@@ -281,6 +287,7 @@ class MusicRouter:
             "music_stop": lambda: self._handle_stop(),
             "music_next": lambda: self._handle_next_track(),
             "music_previous": lambda: self._handle_previous_track(),
+            "music_clear_queue": lambda: self._handle_clear_queue(),
             "music_set_volume": lambda: self._handle_set_volume(arguments.get("level", 50)),
             "music_get_current": lambda: self._handle_get_current_track(),
             "music_get_status": lambda: self._handle_get_status(),

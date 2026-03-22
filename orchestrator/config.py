@@ -303,6 +303,7 @@ class VoiceConfig(BaseSettings):
     web_ui_google_client_secret: str = Field("")  # Optional explicit Google OAuth client secret override
     web_ui_google_redirect_uri: str = Field("")  # Optional explicit OAuth redirect URI
     web_ui_google_allowed_domain: str = Field("")  # Optional email domain allowlist (single domain)
+    web_ui_google_allowed_users: str = Field("")  # Optional email address allowlist (comma-separated)
     web_ui_auth_session_cookie_name: str = Field("openclaw_ui_session")
     web_ui_auth_session_ttl_hours: int = Field(24)
     web_ui_auth_cookie_secure: bool = Field(True)

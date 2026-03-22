@@ -288,10 +288,7 @@ document.addEventListener('click', e => {
             sendMusicAction('music_save_playlist', {name: loadedName});
             return;
         }
-        S.musicPlaylistModalOpen = true;
-        S.musicPlaylistModalMode = 'save';
-        S.musicPlaylistModalName = '';
-        renderMusicPage(document.getElementById('main'));
+        openMusicPlaylistModal('save');
         return;
     }
 
@@ -302,25 +299,30 @@ document.addEventListener('click', e => {
             .map(item=>Number(item.pos))
             .filter(Number.isFinite);
         if(!positions.length) return;
-        S.musicPlaylistModalOpen = true;
-        S.musicPlaylistModalMode = 'selected';
-        S.musicPlaylistModalName = '';
-        renderMusicPage(document.getElementById('main'));
+        openMusicPlaylistModal('selected');
         return;
     }
 
     const modalCancelBtn = target.closest('[data-action="music-modal-cancel"]');
     if (modalCancelBtn) {
-        S.musicPlaylistModalOpen = false;
-        S.musicPlaylistModalMode = '';
-        S.musicPlaylistModalName = '';
-        S.musicPlaylistModalOriginalName = '';
+        closeMusicPlaylistModal();
+        renderMusicPage(document.getElementById('main'));
+        return;
+    }
+
+    const modalSecondaryBtn = target.closest('[data-action="music-modal-secondary"]');
+    if (modalSecondaryBtn) {
+        const actionType = String(S.musicPlaylistModalAction||'').trim();
+        const actionName = String(S.musicPlaylistModalActionName||'').trim();
+        closeMusicPlaylistModal();
+        performQueuedMusicAction(actionType, actionName);
         renderMusicPage(document.getElementById('main'));
         return;
     }
 
     const modalConfirmBtn = target.closest('[data-action="music-modal-confirm"]');
     if (modalConfirmBtn) {
+        console.log('🎵 [modal-confirm] Button clicked, mode=%s', S.musicPlaylistModalMode);
         const mode = String(S.musicPlaylistModalMode||'').trim();
         const name = String(S.musicPlaylistModalName||'').trim();
         if(mode==='save'){
@@ -341,19 +343,21 @@ document.addEventListener('click', e => {
             const origName = String(S.musicPlaylistModalOriginalName||'').trim();
             if(!origName || origName === name) {
                 // No change, just close
-                S.musicPlaylistModalOpen = false;
-                S.musicPlaylistModalMode = '';
-                S.musicPlaylistModalName = '';
-                S.musicPlaylistModalOriginalName = '';
+                closeMusicPlaylistModal();
                 renderMusicPage(document.getElementById('main'));
                 return;
             }
             sendMusicAction('music_rename_playlist', {old_name: origName, new_name: name});
+        }else if(mode==='save-before-load'){
+            const targetName = String(S.musicPlaylistModalActionName||'').trim();
+            if(!name || !targetName) return;
+            S.music.loaded_playlist = targetName;
+            sendMusicAction('music_save_queue_then_load_playlist', {save_name: name, name: targetName});
+        }else if(mode==='save-before-clear'){
+            if(!name) return;
+            sendMusicAction('music_save_queue_then_clear_queue', {save_name: name});
         }
-        S.musicPlaylistModalOpen = false;
-        S.musicPlaylistModalMode = '';
-        S.musicPlaylistModalName = '';
-        S.musicPlaylistModalOriginalName = '';
+        closeMusicPlaylistModal();
         renderMusicPage(document.getElementById('main'));
         return;
     }
@@ -362,10 +366,11 @@ document.addEventListener('click', e => {
     if (loadPlaylistBtn) {
         const name = String(loadPlaylistBtn.dataset.playlistName || '').trim();
         if(name){
-            console.log(`🎵 Loading playlist: "${name}"`);
-            S.music.loaded_playlist = name;
-            sendMusicAction('music_load_playlist', {name});
-            console.log(`✓ Sent music_load_playlist action for "${name}"`);
+            if (hasUnsavedMusicQueue()) {
+                openUnsavedQueueConfirm('music_load_playlist', name);
+            } else {
+                performQueuedMusicAction('music_load_playlist', name);
+            }
         }
         return;
     }
@@ -374,10 +379,7 @@ document.addEventListener('click', e => {
     if (openDeletePlaylistBtn) {
         const name = String(openDeletePlaylistBtn.dataset.playlistName || '').trim();
         if(!name) return;
-        S.musicPlaylistModalOpen = true;
-        S.musicPlaylistModalMode = 'delete';
-        S.musicPlaylistModalName = name;
-        renderMusicPage(document.getElementById('main'));
+        openMusicPlaylistModal('delete', {name});
         return;
     }
 
@@ -385,21 +387,17 @@ document.addEventListener('click', e => {
     if (openEditPlaylistBtn) {
         const name = String(openEditPlaylistBtn.dataset.playlistName || '').trim();
         if(!name) return;
-        S.musicPlaylistModalOpen = true;
-        S.musicPlaylistModalMode = 'edit-title';
-        S.musicPlaylistModalOriginalName = name;
-        S.musicPlaylistModalName = name;
-        renderMusicPage(document.getElementById('main'));
-        setTimeout(() => {
-            const inp = document.getElementById('musicPlaylistModalName');
-            if (inp) { inp.focus(); inp.select(); }
-        }, 50);
+        openMusicPlaylistModal('edit-title', {name, originalName: name});
         return;
     }
 
     const clearQueueBtn = target.closest('[data-action="music-clear-queue"]');
     if (clearQueueBtn) {
-        sendMusicAction('music_clear_queue', {});
+        if (hasUnsavedMusicQueue()) {
+            openUnsavedQueueConfirm('music_clear_queue');
+        } else {
+            performQueuedMusicAction('music_clear_queue');
+        }
         return;
     }
 
@@ -532,11 +530,114 @@ document.addEventListener('submit', e => {
 
 document.addEventListener('keydown', e => {
     const t = e.target;
-    if(!t || t.id!=='musicAddSearch') return;
-    if(e.key!=='Enter') return;
-    e.preventDefault();
-    submitMusicLibrarySearch();
+    if(!t) return;
+    if(t.id==='musicAddSearch'){
+        if(e.key!=='Enter') return;
+        e.preventDefault();
+        submitMusicLibrarySearch();
+        return;
+    }
+    if(t.id==='musicPlaylistModalName'){
+        if(e.key!=='Enter') return;
+        e.preventDefault();
+        const confirmBtn = document.getElementById('musicPlaylistModalConfirmBtn');
+        if(confirmBtn) confirmBtn.click();
+    }
 });
+
+function hasMusicPlaylistNameConflict(name){
+    const modalName = String(name||'').trim().toLowerCase();
+    if(!modalName) return false;
+    const existingPlaylists = (S.musicPlaylists||[])
+        .map(x=>String(x||'').trim().toLowerCase())
+        .filter(Boolean);
+    const mode = String(S.musicPlaylistModalMode||'').trim();
+    const loadedPlaylist = String((S.music&&S.music.loaded_playlist)||'').trim().toLowerCase();
+    const origName = String(S.musicPlaylistModalOriginalName||'').trim().toLowerCase();
+    const ignoreName = mode==='edit-title' ? origName : loadedPlaylist;
+    return existingPlaylists.includes(modalName) && modalName!==ignoreName;
+}
+
+function updateMusicPlaylistModalValidationUi(){
+    const warningEl = document.getElementById('musicPlaylistModalWarning');
+    const confirmBtn = document.getElementById('musicPlaylistModalConfirmBtn');
+    const mode = String(S.musicPlaylistModalMode||'').trim();
+    const name = String(S.musicPlaylistModalName||'').trim();
+    const hasConflict = hasMusicPlaylistNameConflict(name);
+
+    if(warningEl){
+        if(hasConflict){
+            warningEl.textContent = mode==='edit-title'
+                ? '⚠ A playlist with this name already exists.'
+                : '⚠ Playlist exists. Saving will overwrite it.';
+            warningEl.classList.remove('hidden');
+        }else{
+            warningEl.textContent = '';
+            warningEl.classList.add('hidden');
+        }
+    }
+
+    if(confirmBtn){
+        if(mode==='save-before-load'){
+            confirmBtn.textContent = hasConflict ? 'Overwrite and Load' : 'Save and Load';
+        }else if(mode==='save-before-clear'){
+            confirmBtn.textContent = hasConflict ? 'Overwrite and Clear' : 'Save and Clear';
+        }else if(mode!=='delete' && mode!=='edit-title'){
+            confirmBtn.textContent = hasConflict ? 'Overwrite' : 'Save';
+        }
+    }
+}
+
+function closeMusicPlaylistModal(){
+    S.musicPlaylistModalOpen = false;
+    S.musicPlaylistModalMode = '';
+    S.musicPlaylistModalName = '';
+    S.musicPlaylistModalOriginalName = '';
+    S.musicPlaylistModalAction = '';
+    S.musicPlaylistModalActionName = '';
+}
+
+function focusMusicPlaylistModalNameInput(){
+    setTimeout(() => {
+        const inp = document.getElementById('musicPlaylistModalName');
+        if (inp) {
+            inp.focus();
+            inp.select();
+        }
+    }, 50);
+}
+
+function openMusicPlaylistModal(mode, opts={}){
+    S.musicPlaylistModalOpen = true;
+    S.musicPlaylistModalMode = String(mode||'').trim();
+    S.musicPlaylistModalName = String(opts.name||'');
+    S.musicPlaylistModalOriginalName = String(opts.originalName||'');
+    S.musicPlaylistModalAction = String(opts.action||'');
+    S.musicPlaylistModalActionName = String(opts.actionName||'');
+    renderMusicPage(document.getElementById('main'));
+    if(String(mode||'').trim() !== 'delete') focusMusicPlaylistModalNameInput();
+}
+
+function openUnsavedQueueConfirm(actionType, actionName=''){
+    const mode = String(actionType||'').trim()==='music_load_playlist' ? 'save-before-load' : 'save-before-clear';
+    openMusicPlaylistModal(mode, { action: actionType, actionName });
+}
+
+function performQueuedMusicAction(actionType, actionName=''){
+    const action = String(actionType||'').trim();
+    const name = String(actionName||'').trim();
+    if(action === 'music_load_playlist'){
+        if(!name) return;
+        console.log(`🎵 Loading playlist: "${name}"`);
+        S.music.loaded_playlist = name;
+        sendMusicAction('music_load_playlist', {name});
+        console.log(`✓ Sent music_load_playlist action for "${name}"`);
+        return;
+    }
+    if(action === 'music_clear_queue'){
+        sendMusicAction('music_clear_queue', {});
+    }
+}
 
 function handleTextInputChange(t){
     if(!t) return;
@@ -580,6 +681,7 @@ function handleTextInputChange(t){
     }
     if(t.id==='musicPlaylistModalName'){
         S.musicPlaylistModalName = String(t.value||'');
+        updateMusicPlaylistModalValidationUi();
         return;
     }
 }
@@ -658,8 +760,8 @@ function applyMusicHeader(){
     const btn=document.getElementById('musicToggleBtn');
     if(!header||!titleEl||!artistEl||!btn) return;
     const pendingCount=Object.keys(S.pendingMusicActions||{}).length;
-    const pendingLoad=pendingCount>0&&Object.values(S.pendingMusicActions||{}).some(a=>a&&String(a.type||'').indexOf('music_load_playlist')>=0);
-    const active=m.state==='play'||(m.state==='pause'&&((m.title&&String(m.title).trim())||Number(m.queue_length||0)>0))||pendingLoad;
+    const pendingLoad=pendingCount>0&&Object.values(S.pendingMusicActions||{}).some(a=>a&&isMusicLoadActionType(a&&a.type));
+    const active=m.state==='play'||(m.state==='pause'&&((m.title&&String(m.title).trim())||Number(m.queue_length||0)>0))||(m.state==='stop'&&Number(m.position||0)>=0)||pendingLoad;
     header.classList.toggle('hidden',!active);
     titleEl.textContent=(m.title&&String(m.title).trim())||'—';
     artistEl.textContent=(m.artist&&String(m.artist).trim())||'—';

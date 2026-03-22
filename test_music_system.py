@@ -88,6 +88,7 @@ async def test_parser():
         ("pause", ("pause", {})),
         ("hey minecraft, stop playing.", ("stop", {})),
         ("next", ("next_track", {})),
+        ("clear the queue", ("clear_queue", {})),
         ("volume 50", ("set_volume", {"level": 50})),
         ("what's playing", ("get_current_track", {})),
         ("play some jazz", ("play_genre", {"genre": "jazz", "shuffle": True})),

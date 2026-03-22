@@ -168,15 +168,15 @@ class _NativeMusicBackend:
             return float(self.elapsed_anchor_value)
         return max(0.0, float(self.elapsed_anchor_value) + (time.monotonic() - self.elapsed_anchor_ts))
 
-    async def _play_pos(self, pos: int) -> None:
+    async def _play_pos(self, pos: int, seek_s: int = 0) -> None:
         if not self.queue:
             self.current_pos = -1
             self.state = "stop"
             return
         pos = max(0, min(pos, len(self.queue) - 1))
         self.current_pos = pos
-        self.elapsed_anchor_value = 0.0
-        ok = await self.player.play(self.queue[pos].file, seek_s=0)
+        self.elapsed_anchor_value = float(seek_s)
+        ok = await self.player.play(self.queue[pos].file, seek_s=seek_s)
         self.browser_file_override = ""
         if self.player.output_route == "browser" and self.player.browser_stream_path:
             try:
@@ -216,7 +216,6 @@ class _NativeMusicBackend:
 
         if op == "currentsong":
             return self._current_track()
-
         if op == "stats":
             return self.library.stats()
 

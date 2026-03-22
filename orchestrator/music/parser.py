@@ -41,6 +41,12 @@ class MusicFastPathParser:
         r"^(?:go\s+)?back(?:\s+(?:a|one)\s+(?:song|track))?$",
         r"^(?:play\s+)?(?:the\s+)?(?:last|previous)\s+(?:song|track)$",
     ]
+
+    CLEAR_QUEUE_PATTERNS = [
+        r"^clear\s+(?:the\s+)?queue$",
+        r"^empty\s+(?:the\s+)?queue$",
+        r"^remove\s+all\s+(?:songs\s+)?from\s+(?:the\s+)?queue$",
+    ]
     
     # Volume control patterns
     VOLUME_SET_PATTERN = r"^(?:set\s+)?(?:volume\s+)?(?:to\s+)?(\d+)(?:\s*%)?$"
@@ -98,6 +104,7 @@ class MusicFastPathParser:
         self.stop_regexes = [re.compile(p, re.IGNORECASE) for p in self.STOP_PATTERNS]
         self.next_regexes = [re.compile(p, re.IGNORECASE) for p in self.NEXT_PATTERNS]
         self.previous_regexes = [re.compile(p, re.IGNORECASE) for p in self.PREVIOUS_PATTERNS]
+        self.clear_queue_regexes = [re.compile(p, re.IGNORECASE) for p in self.CLEAR_QUEUE_PATTERNS]
         
         self.volume_up_regexes = [re.compile(p, re.IGNORECASE) for p in self.VOLUME_UP_PATTERNS]
         self.volume_down_regexes = [re.compile(p, re.IGNORECASE) for p in self.VOLUME_DOWN_PATTERNS]
@@ -218,6 +225,9 @@ class MusicFastPathParser:
         
         if any(regex.match(text) for regex in self.previous_regexes):
             return ("previous_track", {})
+
+        if any(regex.match(text) for regex in self.clear_queue_regexes):
+            return ("clear_queue", {})
         
         # === Volume Control ===
         

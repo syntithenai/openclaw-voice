@@ -289,8 +289,8 @@ sudo usermod -a -G audio $USER
 
 - **[SETUP_COMPLETE.md](SETUP_COMPLETE.md)** - Complete setup guide
 - **[SESSION_SUMMARY.md](SESSION_SUMMARY.md)** - This session's work
-- **[README.md](README.md)** - Project overview
-- **[orchestrator/config.py](orchestrator/config.py)** - Config schema
+- **[README.md](../README.md)** - Project overview
+- **[orchestrator/config.py](../orchestrator/config.py)** - Config schema
 
 ## 🔗 Related Projects
 

@@ -288,7 +288,7 @@ class ToolRouter:
             return {"error": f"Unknown tool: {tool_name}"}
         
         try:
-            result = await self.tools[tool_name](**arguments)
+            result = await self.tools[tool_name](../**arguments)
             return {"success": True, "result": result}
         except ValueError as e:
             return {"error": str(e)}

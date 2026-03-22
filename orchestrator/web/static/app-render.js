@@ -109,7 +109,7 @@ function renderMusicPage(main){
     const active=item.pos===m.position;
     const songId=String(item.id||'').trim();
     const checked=!!S.musicQueueSelectionByIds[songId];
-    return '<tr class="hover:bg-gray-800 '+(active?'bg-gray-800 font-semibold text-green-400':'')+'">'
+    return '<tr class="hover:bg-gray-800 '+(active?'bg-gray-700 font-semibold text-green-300 border-l-4 border-green-400':'')+'">'
       +'<td class="px-3 py-3 w-12"><input type="checkbox" data-action="music-queue-select" data-position="'+item.pos+'" data-song-id="'+esc(songId)+'" class="w-5 h-5 cursor-pointer" '+(checked?'checked':'')+'></td>'
       +'<td class="px-2 py-2 w-8 text-gray-500 text-xs">'+(item.pos+1)+'</td>'
       +'<td class="px-2 py-2 text-sm truncate max-w-xs cursor-pointer hover:text-blue-400" data-action="music-play-track" data-position="'+item.pos+'">'+esc(item.title||item.file||'—')+'</td>'
@@ -139,33 +139,62 @@ function renderMusicPage(main){
     rows = filtered.map(createRowHtml).join('');
   }
 
-  const modalTitle = S.musicPlaylistModalMode==='save'
+  const modalMode=String(S.musicPlaylistModalMode||'').trim();
+    const isSaveBeforeLoadMode=modalMode==='save-before-load';
+    const isSaveBeforeClearMode=modalMode==='save-before-clear';
+    const isSaveBeforeActionMode=isSaveBeforeLoadMode || isSaveBeforeClearMode;
+    const modalTitle = modalMode==='save'
         ? 'Save Playlist'
-    : (S.musicPlaylistModalMode==='selected' ? 'Create Playlist from Selected'
-      : (S.musicPlaylistModalMode==='edit-title' ? 'Edit Playlist Title' : 'Delete Playlist'));
+    : (modalMode==='selected' ? 'Create Playlist from Selected'
+      : (modalMode==='edit-title' ? 'Edit Playlist Title'
+        : (isSaveBeforeLoadMode ? 'Save Queue Before Loading'
+          : (isSaveBeforeClearMode ? 'Save Queue Before Clearing' : 'Delete Playlist'))));
     const modalName=String(S.musicPlaylistModalName||'').trim();
     const existingPlaylists=(S.musicPlaylists||[]).map(x=>String(x||'').trim().toLowerCase()).filter(Boolean);
     const loadedPlaylistName=String((S.music&&S.music.loaded_playlist)||'').trim();
     const loadedPlaylist=loadedPlaylistName.toLowerCase();
     const queueLabel=loadedPlaylistName ? ('Playlist '+loadedPlaylistName) : 'Queue';
-    const hasNameConflict=!!modalName && existingPlaylists.includes(modalName.toLowerCase()) && modalName.toLowerCase()!==loadedPlaylist;
+    const originalPlaylistName=String(S.musicPlaylistModalOriginalName||'').trim().toLowerCase();
+    const ignoreName = modalMode==='edit-title' ? originalPlaylistName : loadedPlaylist;
+    const hasNameConflict=!!modalName && existingPlaylists.includes(modalName.toLowerCase()) && modalName.toLowerCase()!==ignoreName;
+    const pendingActionName=String(S.musicPlaylistModalActionName||'').trim();
   let modalBody;
-  if (S.musicPlaylistModalMode==='delete') {
+  if (modalMode==='delete') {
     modalBody = '<p class="text-sm text-gray-300">Delete playlist <span class="font-semibold">'+esc(S.musicPlaylistModalName||'')+'</span>?</p>';
-  } else if (S.musicPlaylistModalMode==='edit-title') {
+  } else if (modalMode==='edit-title') {
     const origName = String(S.musicPlaylistModalOriginalName||'').trim();
     modalBody = '<div class="space-y-2">'
       +'<p class="text-xs text-gray-400">Renaming: <span class="font-semibold text-gray-200">'+esc(origName)+'</span></p>'
       +'<input id="musicPlaylistModalName" value="'+esc(modalName)+'" placeholder="New playlist title" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
-      +(hasNameConflict ? '<p class="text-xs text-amber-300">⚠ A playlist with this name already exists.</p>' : '')
+      +'<p id="musicPlaylistModalWarning" class="text-xs text-amber-300'+(hasNameConflict?'':' hidden')+'">'+(hasNameConflict?'⚠ A playlist with this name already exists.':'')+'</p>'
+    +'</div>';
+  } else if (isSaveBeforeActionMode) {
+    const actionPrompt=isSaveBeforeLoadMode
+      ? ('Load playlist <span class="font-semibold text-gray-200">'+esc(pendingActionName)+'</span>')
+      : 'clear the queue';
+    modalBody = '<div class="space-y-3">'
+      +'<p class="text-sm text-gray-300">This queue is not associated with a saved playlist. Save it before you '+actionPrompt+'?</p>'
+      +'<div class="space-y-2">'
+        +'<input id="musicPlaylistModalName" value="'+esc(modalName)+'" placeholder="Playlist name" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
+        +'<p id="musicPlaylistModalWarning" class="text-xs text-amber-300'+(hasNameConflict?'':' hidden')+'">'+(hasNameConflict?'⚠ Playlist exists. Saving will overwrite it.':'')+'</p>'
+      +'</div>'
     +'</div>';
   } else {
     modalBody = '<div class="space-y-2">'
         +'<input id="musicPlaylistModalName" value="'+esc(S.musicPlaylistModalName||'')+'" placeholder="Playlist name" class="w-full rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />'
-        +(hasNameConflict ? '<p class="text-xs text-amber-300">⚠ Playlist exists. Saving will overwrite it.</p>' : '')
+        +'<p id="musicPlaylistModalWarning" class="text-xs text-amber-300'+(hasNameConflict?'':' hidden')+'">'+(hasNameConflict?'⚠ Playlist exists. Saving will overwrite it.':'')+'</p>'
     +'</div>';
   }
-    const modalConfirmLabel = S.musicPlaylistModalMode==='delete' ? 'Delete' : (S.musicPlaylistModalMode==='edit-title' ? 'Rename' : (hasNameConflict ? 'Overwrite' : 'Save'));
+    const modalConfirmLabel = modalMode==='delete'
+      ? 'Delete'
+      : (modalMode==='edit-title'
+        ? 'Rename'
+        : (isSaveBeforeLoadMode
+          ? (hasNameConflict ? 'Overwrite and Load' : 'Save and Load')
+          : (isSaveBeforeClearMode
+            ? (hasNameConflict ? 'Overwrite and Clear' : 'Save and Clear')
+            : (hasNameConflict ? 'Overwrite' : 'Save'))));
+    const modalSecondaryActionLabel = isSaveBeforeLoadMode ? 'Load Without Saving' : 'Clear Without Saving';
 
   main.innerHTML='<div class="max-w-6xl mx-auto px-2 py-4 space-y-3">'
     +'<div class="grid grid-cols-1 md:grid-cols-4 gap-3">'
@@ -218,7 +247,10 @@ function renderMusicPage(main){
               +modalBody
               +'<div class="flex justify-end gap-2">'
                 +'<button data-action="music-modal-cancel" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors">Cancel</button>'
-                +'<button data-action="music-modal-confirm" class="px-3 py-1.5 rounded-lg text-sm '+(S.musicPlaylistModalMode==='delete'?'bg-red-700 hover:bg-red-600':'bg-blue-700 hover:bg-blue-600')+' transition-colors">'+modalConfirmLabel+'</button>'
+                +(isSaveBeforeActionMode
+                  ? '<button data-action="music-modal-secondary" class="px-3 py-1.5 rounded-lg text-sm bg-amber-700 hover:bg-amber-600 transition-colors">'+modalSecondaryActionLabel+'</button>'
+                  : '')
+                +'<button id="musicPlaylistModalConfirmBtn" data-action="music-modal-confirm" class="px-3 py-1.5 rounded-lg text-sm '+(modalMode==='delete'?'bg-red-700 hover:bg-red-600':'bg-blue-700 hover:bg-blue-600')+' transition-colors">'+modalConfirmLabel+'</button>'
               +'</div>'
             +'</div>'
           +'</div>'
@@ -386,6 +418,7 @@ function sendAction(payload){
   }
 }
 function sendMusicAction(actionType, extraPayload={}){
+    console.log('🎵 [sendMusicAction] Called with actionType='+actionType, extraPayload);
     const actionId='m'+(S.nextMusicActionId++);
   const sent=sendAction(Object.assign({type:actionType, action_id:actionId}, extraPayload||{}));
   if(!sent){
@@ -395,7 +428,7 @@ function sendMusicAction(actionType, extraPayload={}){
     return null;
   }
   const pendingItem={type:actionType, ts:Date.now()};
-  if(actionType==='music_load_playlist' && extraPayload && extraPayload.name!==undefined){
+  if(isMusicLoadActionType(actionType) && extraPayload && extraPayload.name!==undefined){
     pendingItem.name=String(extraPayload.name||'');
   }
   S.pendingMusicActions[actionId]=pendingItem;

@@ -96,8 +96,8 @@ ssh pi "cd ~/openclaw-voice && ./run_orchestrator.sh"
 ## Files on Local Machine
 - [WAKEWORD_ENGINES.md](WAKEWORD_ENGINES.md) - Detailed comparison and guide
 - [WAKEWORD_IMPLEMENTATION.md](WAKEWORD_IMPLEMENTATION.md) - Technical implementation details
-- [setup_wakeword.sh](setup_wakeword.sh) - Interactive setup script
-- [test_wakeword_imports.sh](test_wakeword_imports.sh) - Test script
+- [setup_wakeword.sh](../setup_wakeword.sh) - Interactive setup script
+- [test_wakeword_imports.sh](../test_wakeword_imports.sh) - Test script
 
 ## Next Steps
 

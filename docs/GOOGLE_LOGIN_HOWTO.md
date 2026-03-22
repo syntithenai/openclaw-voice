@@ -28,12 +28,8 @@ Authentication secures:
 4. Create OAuth client credentials:
    - Console page: https://console.cloud.google.com/apis/credentials
    - Create credentials → OAuth client ID → **Web application** (not Desktop/Mobile).
-5. Configure **Authorized JavaScript origins** (required):
-  - Add the exact origin you use to open the UI (scheme + host + optional port), for example:
-  - `http://localhost:443`
-  - `https://doomsday.local`
-6. Redirect URIs are not required for this browser-token flow.
-7. Save, then download the client JSON file.
+5. **Do NOT add Redirect URIs** in the credentials (client-side flow uses the browser).
+6. Save, then download the client JSON file.
 
 ## 2) Reuse or Create google_client_secret.json
 
@@ -132,7 +128,6 @@ For **localhost-only access**, HTTPS is not strictly required. For **remote acce
 
 **"Google Sign-In button not appearing"**
 - Ensure `WEB_UI_GOOGLE_CLIENT_SECRET_FILE` points to a valid JSON file, or `WEB_UI_GOOGLE_CLIENT_ID` is set.
-- In Google Cloud Console, add your exact UI origin to **Authorized JavaScript origins** for the OAuth client.
 - Check browser console for JS errors.
 - Confirm `WEB_UI_AUTH_MODE` is not `disabled`.
 

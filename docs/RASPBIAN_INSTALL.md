@@ -435,6 +435,6 @@ rm -rf .venv_orchestrator activate.sh run.sh .env
 
 ## See Also
 
-- [README.md](README.md) - Main project documentation
+- [README.md](../README.md) - Main project documentation
 - [QUICK_REFERENCE.md](QUICK_REFERENCE.md) - Common commands and troubleshooting
 - [ENVIRONMENT_SETUP.md](ENVIRONMENT_SETUP.md) - Development setup guide

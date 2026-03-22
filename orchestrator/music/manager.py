@@ -56,6 +56,23 @@ class MusicManager:
         self._playlist_names_cache: list[str] = []
         self._playlist_names_cache_ts: float = 0.0
         self._playlist_names_cache_ttl_s: float = 30.0
+        self._resume_song_id: str | None = None
+        self._resume_elapsed_s: int | None = None
+
+    def _clear_resume_marker(self) -> None:
+        self._resume_song_id = None
+        self._resume_elapsed_s = None
+
+    @staticmethod
+    def _parse_elapsed_seconds(status: Dict[str, str]) -> int | None:
+        raw = status.get("elapsed")
+        if raw is None:
+            return None
+        try:
+            # MPD reports elapsed as a decimal string (e.g. "123.456").
+            return max(0, int(float(raw)))
+        except Exception:
+            return None
 
     async def _control_execute(self, command: str, timeout: float | None = None) -> Dict[str, str]:
         return await self.control_pool.execute(command, timeout=timeout)
@@ -161,11 +178,28 @@ class MusicManager:
         
         try:
             if position is not None:
+                self._clear_resume_marker()
                 await self.pool.execute(f"play {position}")
                 await self._normalize_pipewire_music_stream_volume()
                 return f"Playing track {position + 1}"
             else:
-                await self.pool.execute("play")
+                if self._resume_song_id is not None and self._resume_elapsed_s is not None:
+                    resume_id = self._resume_song_id
+                    resume_elapsed = self._resume_elapsed_s
+                    self._clear_resume_marker()
+                    await self.pool.execute("play")
+                    # With the native player, seekcur restarts ffplay at the target offset.
+                    # There is no async race: play() is fully synchronous, seekcur runs
+                    # immediately after in the same event loop turn.
+                    if resume_elapsed > 0:
+                        try:
+                            status = await self.pool.execute("status")
+                            if status.get("songid") == resume_id:
+                                await self.pool.execute(f"seekcur {resume_elapsed}")
+                        except Exception as seek_exc:
+                            logger.warning("Resume seek failed (will play from start): %s", seek_exc)
+                else:
+                    await self.pool.execute("play")
                 await self._normalize_pipewire_music_stream_volume()
                 return "Playback started"
         except Exception as e:
@@ -215,6 +249,19 @@ class MusicManager:
     async def stop(self) -> str:
         """Stop playback."""
         try:
+            status_before_stop = await self.pool.execute("status")
+            state_before_stop = status_before_stop.get("state", "stop") if status_before_stop else "stop"
+            elapsed_before_stop = self._parse_elapsed_seconds(status_before_stop or {})
+            # Use songid (unique, stable) rather than song (queue position) so that
+            # seekid after play targets the exact queue entry.
+            songid_before_stop = status_before_stop.get("songid") if status_before_stop else None
+
+            if state_before_stop in {"play", "pause"} and songid_before_stop and elapsed_before_stop is not None:
+                self._resume_song_id = str(songid_before_stop)
+                self._resume_elapsed_s = elapsed_before_stop
+            else:
+                self._clear_resume_marker()
+
             await self.pool.execute("stop")
             # Verify stop actually took effect; if state still reports play,
             # force a pause and issue stop again as a fallback.
@@ -1161,6 +1208,44 @@ class MusicManager:
             return f"Saved playlist: {playlist_name}"
         except Exception as e:
             logger.error(f"Failed to save playlist: {e}")
+            return f"Error: {e}"
+
+    async def rename_playlist(self, old_name: str, new_name: str) -> str:
+        """Rename a saved playlist (case-insensitive source lookup)."""
+        try:
+            src_name = str(old_name or "").strip()
+            dst_name = str(new_name or "").strip()
+            if not src_name:
+                return "Source playlist name is required"
+            if not dst_name:
+                return "Destination playlist name is required"
+
+            actual_src = await self.resolve_playlist_name(src_name, refresh_if_miss=True)
+            if not actual_src:
+                return f"Error: Playlist '{src_name}' not found"
+
+            actual_dst = await self.resolve_playlist_name(dst_name, refresh_if_miss=True)
+            if actual_dst and actual_dst.lower() != actual_src.lower():
+                return f"Error: Playlist '{dst_name}' already exists"
+
+            await self._control_execute(
+                f'rename "{self._quote(actual_src)}" "{self._quote(dst_name)}"'
+            )
+
+            self._playlist_names_cache = [
+                p for p in self._playlist_names_cache if p.lower() != actual_src.lower()
+            ]
+            if not any(p.lower() == dst_name.lower() for p in self._playlist_names_cache):
+                self._playlist_names_cache.append(dst_name)
+            self._playlist_names_cache_ts = time.monotonic()
+
+            if str(self._loaded_playlist_name or "").lower() == actual_src.lower():
+                self._loaded_playlist_name = dst_name
+
+            logger.info("📂 Renamed playlist '%s' -> '%s'", actual_src, dst_name)
+            return f"Renamed playlist: {actual_src} -> {dst_name}"
+        except Exception as e:
+            logger.error(f"Failed to rename playlist '{old_name}' -> '{new_name}': {e}")
             return f"Error: {e}"
     
     async def delete_playlist(self, name: str) -> str:

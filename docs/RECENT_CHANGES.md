@@ -17,7 +17,7 @@
 - Made executable with `chmod +x`
 
 **File Changes**:
-- [deploy_precise_engine_to_pi.sh](deploy_precise_engine_to_pi.sh): Updated step [2/4] to create Python launcher instead of bash script
+- [deploy_precise_engine_to_pi.sh](../deploy_precise_engine_to_pi.sh): Updated step [2/4] to create Python launcher instead of bash script
 
 **Impact**: 
 - ✅ Precise engine now initializes successfully when called from orchestrator
@@ -64,7 +64,7 @@ export PYTHONPATH="$BUNDLE:/usr/lib/python3.11:${PYTHONPATH:-}"
 
 **Problem**: After hotword detection, the system was capturing too much pre-roll audio (200ms), which included the spoken hotword itself ("Hey, my craft") being transcribed.
 
-**Solution**: Reduced prebuffer from 200ms to 80ms in [orchestrator/main.py](orchestrator/main.py#L999)
+**Solution**: Reduced prebuffer from 200ms to 80ms in [orchestrator/main.py](../orchestrator/main.py#L999)
 
 **Before**: 
 ```python
@@ -88,7 +88,7 @@ WAKE_WORD_PREBUFFER_MS=50  # Reduce further if needed
 
 ### Files Created:
 
-1. **[install.sh](install.sh)** (14KB, executable)
+1. **[install.sh](../install.sh)** (14KB, executable)
    - Interactive installer for Raspbian 32-bit and 64-bit
    - Detects architecture and OS version automatically
    - Installs all system dependencies
@@ -120,7 +120,7 @@ WAKE_WORD_PREBUFFER_MS=50  # Reduce further if needed
    - Uninstall instructions
    - Getting help resources
 
-3. **[QUICK_START_RASPBIAN.sh](QUICK_START_RASPBIAN.sh)** (Quick reference guide)
+3. **[QUICK_START_RASPBIAN.sh](../QUICK_START_RASPBIAN.sh)** (Quick reference guide)
    - One-command installation guide
    - Quick verification steps
    - Troubleshooting checklist

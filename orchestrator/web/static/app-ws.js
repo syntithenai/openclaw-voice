@@ -257,13 +257,13 @@ function handleMsg(msg){
             if(msg.action_id) delete S.pendingMusicActions[String(msg.action_id)];
             S.musicActionError='';
             S.musicActionErrorTs=0;
-            if(String(msg.action||'')==='music_load_playlist'){
+            if(isMusicLoadActionType(msg.action)){
                 // Poll for state updates after a playlist load. The server will push a
                 // music_queue broadcast once the queue is ready, but we also poll as
                 // belt-and-suspenders in case the broadcast is missed.
                 requestMusicStateRetry('post_load_ack', 8, 2000);
             }
-            if(['music_save_playlist','music_create_playlist','music_delete_playlist'].includes(String(msg.action||''))){
+            if(['music_save_playlist','music_create_playlist','music_delete_playlist','music_rename_playlist','music_save_queue_then_clear_queue','music_save_queue_then_load_playlist'].includes(String(msg.action||''))){
                 sendAction({type:'music_list_playlists'});
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
@@ -539,11 +539,11 @@ function syncBrowserMusicPlayback(){
 function reconcilePendingMusicLoads(){
     const pending=S.pendingMusicActions||{};
     const currentLoaded=String((S.music&&S.music.loaded_playlist)||'').trim().toLowerCase();
-    const queueLen=Math.max(0, Number((S.music&&S.music.queue_length)||0) || (Array.isArray(S.musicQueue)?S.musicQueue.length:0));
+    const queueLen=getMusicQueueLength();
     let changed=false;
     Object.keys(pending).forEach((actionId)=>{
         const item=pending[actionId];
-        if(!item || String(item.type||'')!=='music_load_playlist') return;
+        if(!item || !isMusicLoadActionType(item.type)) return;
         const requested=String(item.name||'').trim().toLowerCase();
         if(requested && currentLoaded && requested===currentLoaded){
             delete pending[actionId];
@@ -622,7 +622,7 @@ function applyTimers(t){
 }
 
 async function ensureCaptureWorkletModule(ctx){
-        if (S.captureWorkletModuleReady) return true;
+        if (S.captureWorkletModuleReady && S.captureWorkletCtx === ctx) return true;
         if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') return false;
         const source = `
 class CaptureProcessor extends AudioWorkletProcessor {
@@ -644,6 +644,7 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
         try {
                 await ctx.audioWorklet.addModule(url);
                 S.captureWorkletModuleReady = true;
+                S.captureWorkletCtx = ctx;
                 return true;
         } finally {
                 URL.revokeObjectURL(url);
@@ -652,6 +653,9 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
 
     async function startBrowserCapture(){
   if(!S.browserAudioEnabled) return;
+  if(S.captureStartInProgress) return;
+  S.captureStartInProgress = true;
+  try {
   const hasLiveTrack = !!(S.mediaStream && S.mediaStream.getAudioTracks().some(t=>t.readyState==='live'));
   if (hasLiveTrack && S.processor) {
       if (S.audioCtx && S.audioCtx.state === 'suspended') await S.audioCtx.resume();
@@ -665,7 +669,7 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
   if(S.mediaStream){
       try{ S.mediaStream.getTracks().forEach(t=>t.stop()); }catch(_ ){}
   }
-  S.processor=null; S.audioCtx=null; S.mediaStream=null; S.captureWorkletModuleReady=false;
+  S.processor=null; S.audioCtx=null; S.mediaStream=null; S.captureWorkletModuleReady=false; S.captureWorkletCtx=null;
 
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
       throw new Error('Browser mediaDevices.getUserMedia is unavailable');
@@ -734,6 +738,9 @@ registerProcessor('openclaw-capture-processor', CaptureProcessor);
     }
     S.processor=proc;
     clearCaptureRetry();
+  } finally {
+    S.captureStartInProgress = false;
+  }
 }
 
 async function ensureBrowserCapture(){
@@ -777,7 +784,11 @@ function setupServerRefreshWatcher(){
 
 loadUiPrefs();
 hydrateChatCache();
-S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); connectWs();
+renderAuthButton();
+initGoogleSignIn();
+S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity();
+if(wsAuthAllowed()) connectWs();
+refreshAuthSession({render:false, adjustWs:false}).catch(()=>{});
 setupServerRefreshWatcher();
 setInterval(()=>{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{ if(t&&t._pendingServerAck) return; if(t._clientAnchorTs===undefined||t._clientAnchorTs===null){ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; } t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }); renderTimerBar(); },500);
 startBrowserCapture().catch((err)=>{

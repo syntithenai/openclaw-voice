@@ -1450,7 +1450,7 @@ async def run_orchestrator() -> None:
                         return
 
                     asyncio.create_task(pause_system_media_if_needed("play button"))
-                    if config.wake_word_enabled and wake_state == WakeState.AWAKE:
+                    if wake_state == WakeState.AWAKE:
                         await trigger_sleep("play button")
                     else:
                         await trigger_wake("play button")
@@ -1465,7 +1465,7 @@ async def run_orchestrator() -> None:
                         return
 
                     asyncio.create_task(pause_system_media_if_needed(f"{event.key} button"))
-                    if config.wake_word_enabled and wake_state == WakeState.AWAKE:
+                    if wake_state == WakeState.AWAKE:
                         await trigger_sleep(f"{event.key} button")
                     else:
                         await trigger_wake(f"{event.key} button")
@@ -1873,6 +1873,16 @@ async def run_orchestrator() -> None:
                 media_files_root=config.web_ui_media_files_root,
                 media_files_allow_listing=config.web_ui_media_files_allow_listing,
                 openclaw_workspace_root=str(workspace_root),
+                auth_mode=config.web_ui_auth_mode,
+                google_client_id=config.web_ui_google_client_id,
+                google_client_secret=config.web_ui_google_client_secret,
+                google_client_secret_file=config.web_ui_google_client_secret_file,
+                google_redirect_uri=config.web_ui_google_redirect_uri,
+                google_allowed_domain=config.web_ui_google_allowed_domain,
+                google_allowed_users=config.web_ui_google_allowed_users,
+                auth_session_cookie_name=config.web_ui_auth_session_cookie_name,
+                auth_session_ttl_hours=config.web_ui_auth_session_ttl_hours,
+                auth_cookie_secure=config.web_ui_auth_cookie_secure,
             )
             await web_service.start()
             web_service.update_recordings_state(recordings_catalog.list_recordings())
@@ -1948,18 +1958,8 @@ async def run_orchestrator() -> None:
                         logger.debug("Failed to play sleep swoosh (web mic): %s", exc)
 
                 cur_mic = web_service._ui_control_state.get("mic_enabled", False)
-                if not cur_mic:
-                    web_service.update_ui_control_state(mic_enabled=True)
-                    wake_state = WakeState.AWAKE
-                    wake_sleep_ts = None
-                    last_wake_detected_ts = time.monotonic()
-                    last_activity_ts = time.monotonic()
-                    state = VoiceState.LISTENING
-                    web_service.note_hotword_detected()
-                    _play_wake_feedback()
-                    if config.music_enabled and music_manager:
-                        asyncio.create_task(music_manager.pause_if_playing())
-                elif config.wake_word_enabled and wake_state == WakeState.AWAKE:
+                is_awake = wake_state == WakeState.AWAKE
+                if is_awake or cur_mic:
                     web_service.update_ui_control_state(mic_enabled=False)
                     wake_state = WakeState.ASLEEP
                     wake_sleep_ts = time.monotonic()
@@ -1967,6 +1967,7 @@ async def run_orchestrator() -> None:
                     state = VoiceState.IDLE
                     _play_sleep_feedback()
                 else:
+                    web_service.update_ui_control_state(mic_enabled=True)
                     web_service.note_hotword_detected()
                     wake_state = WakeState.AWAKE
                     wake_sleep_ts = None
@@ -2166,6 +2167,53 @@ async def run_orchestrator() -> None:
                     except Exception as exc:
                         logger.warning("Web UI music_save_playlist '%s': %s", name, exc)
 
+            async def _ui_music_save_queue_then_clear_queue(save_name: str, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        save_result = await music_manager.save_playlist(save_name)
+                        if str(save_result).strip().lower().startswith("error:"):
+                            raise RuntimeError(save_result)
+                        clear_result = await music_manager.clear_queue()
+                        if str(clear_result).strip().lower().startswith("error:"):
+                            raise RuntimeError(clear_result)
+                        await _ui_refresh_music_state("music_save_queue_then_clear_queue")
+                    except Exception as exc:
+                        logger.warning("Web UI music_save_queue_then_clear_queue '%s': %s", save_name, exc)
+                        raise
+
+            async def _ui_music_save_queue_then_load_playlist(save_name: str, name: str, client_id: str) -> None:
+                if music_manager:
+                    try:
+                        save_result = await music_manager.save_playlist(save_name)
+                        if str(save_result).strip().lower().startswith("error:"):
+                            raise RuntimeError(save_result)
+                        result = await music_manager.load_playlist(name)
+                        if str(result).strip().lower().startswith("error:"):
+                            raise RuntimeError(result)
+                        if web_service:
+                            web_service.update_music_transport(loaded_playlist=name)
+                        asyncio.create_task(_ui_refresh_music_state("music_save_queue_then_load_playlist"))
+                        _post_load_queue_event.set()
+                    except Exception as exc:
+                        logger.warning("Web UI music_save_queue_then_load_playlist save='%s' load='%s': %s", save_name, name, exc)
+                        raise
+
+            async def _ui_music_rename_playlist(old_name: str, new_name: str, client_id: str) -> None:
+                logger.info("[RENAME] Callback: old_name=%s, new_name=%s, client_id=%s", old_name, new_name, client_id)
+                if music_manager:
+                    try:
+                        logger.info("[RENAME] Calling music_manager.rename_playlist()")
+                        result = await music_manager.rename_playlist(old_name, new_name)
+                        logger.info("[RENAME] Result: %s", result)
+                        if str(result).strip().lower().startswith("error:"):
+                            raise RuntimeError(result)
+                        logger.info("[RENAME] Refreshing music state")
+                        await _ui_refresh_music_state("music_rename_playlist")
+                        logger.info("[RENAME] Refresh complete")
+                    except Exception as exc:
+                        logger.warning("Web UI music_rename_playlist '%s' -> '%s': %s", old_name, new_name, exc)
+                        raise
+
             async def _ui_music_delete_playlist(name: str, client_id: str) -> None:
                 if music_manager:
                     try:
@@ -2293,6 +2341,9 @@ async def run_orchestrator() -> None:
                 on_music_create_playlist=_ui_music_create_playlist,
                 on_music_load_playlist=_ui_music_load_playlist,
                 on_music_save_playlist=_ui_music_save_playlist,
+                on_music_save_queue_then_clear_queue=_ui_music_save_queue_then_clear_queue,
+                on_music_save_queue_then_load_playlist=_ui_music_save_queue_then_load_playlist,
+                on_music_rename_playlist=_ui_music_rename_playlist,
                 on_music_delete_playlist=_ui_music_delete_playlist,
                 on_music_search_library=_ui_music_search_library,
                 on_music_list_playlists=_ui_music_list_playlists,
