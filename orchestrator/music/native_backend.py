@@ -232,6 +232,26 @@ class _NativeMusicBackend:
             return float(self.elapsed_anchor_value)
         return max(0.0, float(self.elapsed_anchor_value) + (time.monotonic() - self.elapsed_anchor_ts))
 
+    async def _maybe_advance_finished_track(self) -> None:
+        """Advance queue when local playback process has exited.
+
+        Browser-route playback is managed externally and does not expose a local
+        process lifecycle we can use for automatic progression.
+        """
+        if self.state != "play":
+            return
+        if self.player.output_route == "browser":
+            return
+        if self.player.is_active():
+            return
+        if not self.queue:
+            self.current_pos = -1
+            self._set_state("stop")
+            return
+
+        next_pos = 0 if self.current_pos < 0 else (self.current_pos + 1) % len(self.queue)
+        await self._play_pos(next_pos)
+
     async def _play_pos(self, pos: int, seek_s: int = 0) -> None:
         if not self.queue:
             self.current_pos = -1
@@ -262,6 +282,7 @@ class _NativeMusicBackend:
         op = parts[0].lower()
 
         if op == "status":
+            await self._maybe_advance_finished_track()
             current = self._current_item()
             track = self.library.get_track(current.file) if current else None
             duration = float(track.get("duration", "0") or 0.0) if track else 0.0

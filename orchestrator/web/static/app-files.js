@@ -207,6 +207,14 @@
     }).join('');
   }
 
+  function currentFolderName() {
+    const st = fmState();
+    const path = String(st.selectedFolderPath || '/');
+    if (path === '/') return 'Workspace';
+    const parts = path.split('/').filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : 'Workspace';
+  }
+
   function renderEditorPane() {
     const st = fmState();
     const file = st.currentFile;
@@ -342,7 +350,7 @@
       let parsed = {};
       try {
         parsed = JSON.parse(String(file.content || '{}'));
-      } catch (_) {
+      } catch {
         parsed = {};
       }
 
@@ -465,8 +473,14 @@
     main.dataset.page = 'files';
 
     const treeRows = renderTreeRows('/', 0);
-    const folderRows = renderFolderRows();
-    const editor = renderEditorPane();
+    const showingFile = !!st.currentFile;
+    const mainPanelBody = showingFile ? renderEditorPane() : renderFolderRows();
+    const mainPanelTitle = showingFile
+      ? fmEsc(st.currentFile ? st.currentFile.name : 'Editor / Preview')
+      : fmEsc(currentFolderName());
+    const mainPanelActions = showingFile
+      ? '<div class="flex items-center gap-2"><button type="button" class="px-2 py-1 text-xs rounded bg-gray-700 hover:bg-gray-600" data-action="fm-close-file">Back to folder</button>' + saveBadgeHtml() + '</div>'
+      : '<button type="button" class="px-2 py-1 text-xs rounded bg-blue-700 hover:bg-blue-600" data-action="fm-open-create-folder">Create Folder</button>';
 
     const modal = st.createFolderModalOpen
       ? ''
@@ -496,19 +510,10 @@
       + '</section>'
       + '<section class="fm-panel">'
       + '<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
-      + '<div class="text-sm font-semibold truncate">Folder Contents</div>'
-      + '<button type="button" class="px-2 py-1 text-xs rounded bg-blue-700 hover:bg-blue-600" data-action="fm-open-create-folder">Create Folder</button>'
+      + '<div class="text-sm font-semibold truncate">' + mainPanelTitle + '</div>'
+      + mainPanelActions
       + '</div>'
-      + '<div class="fm-scroll">' + folderRows + '</div>'
-      + '</section>'
-      + '<section class="fm-panel">'
-      + '<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
-      + '<div class="text-sm font-semibold truncate">'
-      + fmEsc(st.currentFile ? st.currentFile.name : 'Editor / Preview')
-      + '</div>'
-      + saveBadgeHtml()
-      + '</div>'
-      + '<div class="fm-scroll">' + editor + '</div>'
+      + '<div class="fm-scroll">' + mainPanelBody + '</div>'
       + '</section>'
       + '</div>'
       + (st.error ? '<div class="px-2 pt-2 text-xs text-red-300">' + fmEsc(st.error) + '</div>' : '')
@@ -552,6 +557,16 @@
       event.preventDefault();
       const path = String(selectFileBtn.dataset.path || '');
       if (path) void selectFile(path);
+      return true;
+    }
+
+    const closeFile = target.closest('[data-action="fm-close-file"]');
+    if (closeFile) {
+      event.preventDefault();
+      st.selectedFilePath = '';
+      st.currentFile = null;
+      destroyEditors();
+      renderFileManagerPage(fmMain());
       return true;
     }
 

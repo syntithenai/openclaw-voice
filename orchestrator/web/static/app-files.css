@@ -1,6 +1,6 @@
 .fm-layout {
   display: grid;
-  grid-template-columns: 280px 320px minmax(420px, 1fr);
+  grid-template-columns: 280px minmax(420px, 1fr);
   gap: 12px;
   height: 100%;
   min-height: 0;
@@ -39,6 +39,10 @@
 }
 
 .fm-file-row {
+  display: grid;
+  grid-template-columns: 40px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px;
   padding: 8px 10px;
   border-bottom: 1px solid rgb(31 41 55);
   cursor: pointer;
@@ -100,11 +104,6 @@
 @media (max-width: 1200px) {
   .fm-layout {
     grid-template-columns: 250px minmax(260px, 1fr);
-    grid-template-rows: 1fr 1fr;
-  }
-
-  .fm-layout .fm-panel:nth-child(3) {
-    grid-column: 1 / -1;
   }
 }
 

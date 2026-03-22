@@ -35,6 +35,9 @@ from orchestrator.web.workspace_fs_watcher import WorkspaceFsWatcher
 logger = logging.getLogger("orchestrator.web.realtime")
 
 
+DEFAULT_FILE_MANAGER_ROOT = Path("/home/stever/projects/openclawstuff/.openclaw/workspace-voice")
+
+
 class EmbeddedVoiceWebService:
     """Small embedded HTTP/WebSocket service for realtime UI and audio streaming."""
 
@@ -111,7 +114,19 @@ class EmbeddedVoiceWebService:
         self._file_manager_fs_rev: int = 0
         self._file_manager_watcher: WorkspaceFsWatcher | None = None
         if self.file_manager_enabled:
-            fm_root = Path(file_manager_root).expanduser() if file_manager_root else workspace_root
+            fm_root = (
+                Path(openclaw_workspace_root).expanduser()
+                if openclaw_workspace_root
+                else DEFAULT_FILE_MANAGER_ROOT
+            )
+            if file_manager_root:
+                requested_fm_root = Path(file_manager_root).expanduser().resolve()
+                if requested_fm_root != fm_root.resolve():
+                    logger.info(
+                        "Ignoring file manager root override %s; using workspace root %s",
+                        requested_fm_root,
+                        fm_root,
+                    )
             self.file_manager = WorkspaceFileManager(
                 root=str(fm_root.resolve()),
                 excluded_folders=[x.strip() for x in str(file_manager_excluded_folders or "").split(",") if x.strip()],
