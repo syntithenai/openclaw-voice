@@ -1866,15 +1866,6 @@ async def run_orchestrator() -> None:
                 http_redirect_port=config.web_ui_http_redirect_port,
                 chat_persist_path=config.web_ui_chat_persist_path,
                 static_root=config.web_ui_static_root,
-                auth_mode=config.web_ui_auth_mode,
-                google_client_secret_file=config.web_ui_google_client_secret_file,
-                google_client_id=config.web_ui_google_client_id,
-                google_client_secret=config.web_ui_google_client_secret,
-                google_redirect_uri=config.web_ui_google_redirect_uri,
-                google_allowed_domain=config.web_ui_google_allowed_domain,
-                auth_session_cookie_name=config.web_ui_auth_session_cookie_name,
-                auth_session_ttl_hours=config.web_ui_auth_session_ttl_hours,
-                auth_cookie_secure=config.web_ui_auth_cookie_secure,
                 workspace_files_enabled=config.web_ui_workspace_files_enabled,
                 workspace_files_root=config.web_ui_workspace_files_root,
                 workspace_files_allow_listing=config.web_ui_workspace_files_allow_listing,
@@ -2077,7 +2068,7 @@ async def run_orchestrator() -> None:
                 if music_manager:
                     try:
                         await music_manager.stop()
-                        await _ui_refresh_music_state("music_stop")
+                        asyncio.create_task(_ui_refresh_music_state("music_stop"))
                     except Exception as exc:
                         logger.warning("Web UI music_stop: %s", exc)
 
@@ -2182,14 +2173,6 @@ async def run_orchestrator() -> None:
                         await _ui_refresh_music_state("music_delete_playlist")
                     except Exception as exc:
                         logger.warning("Web UI music_delete_playlist '%s': %s", name, exc)
-
-            async def _ui_music_rename_playlist(old_name: str, new_name: str, client_id: str) -> None:
-                if music_manager:
-                    try:
-                        await music_manager.rename_playlist(old_name, new_name)
-                        await _ui_refresh_music_state("music_rename_playlist")
-                    except Exception as exc:
-                        logger.warning("Web UI music_rename_playlist '%s' -> '%s': %s", old_name, new_name, exc)
 
             async def _ui_music_search_library(query: str, limit: int, client_id: str) -> list[dict[str, Any]]:
                 if not music_manager:
@@ -2311,7 +2294,6 @@ async def run_orchestrator() -> None:
                 on_music_load_playlist=_ui_music_load_playlist,
                 on_music_save_playlist=_ui_music_save_playlist,
                 on_music_delete_playlist=_ui_music_delete_playlist,
-                on_music_rename_playlist=_ui_music_rename_playlist,
                 on_music_search_library=_ui_music_search_library,
                 on_music_list_playlists=_ui_music_list_playlists,
                 on_get_music_state=_ui_get_music_state_snapshot,

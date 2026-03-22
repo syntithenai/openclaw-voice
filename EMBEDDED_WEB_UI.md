@@ -27,7 +27,20 @@ Set in your env profile (`.env`, `.env.docker`, or `.env.pi`):
 - `WEB_UI_HOTWORD_ACTIVE_MS=2000`
 - `WEB_UI_STATIC_ROOT=orchestrator/web/static`
 
-Optional file mounts (no authentication at this stage):
+Optional Google login authentication:
+
+- `WEB_UI_AUTH_MODE=disabled|optional|required`
+- `WEB_UI_GOOGLE_CLIENT_SECRET_FILE=../google_client_secret.json`
+- `WEB_UI_GOOGLE_CLIENT_ID=` (optional override)
+- `WEB_UI_GOOGLE_CLIENT_SECRET=` (optional override)
+- `WEB_UI_GOOGLE_REDIRECT_URI=` (optional explicit callback URI)
+- `WEB_UI_GOOGLE_ALLOWED_DOMAIN=` (optional domain restriction)
+
+When `WEB_UI_AUTH_MODE=required`, unauthenticated users see a login warning page only, and WebSocket connections are denied until Google login succeeds.
+
+Setup details are documented in `GOOGLE_LOGIN_HOWTO.md`.
+
+Optional file mounts:
 
 - `WEB_UI_WORKSPACE_FILES_ENABLED=true`
 - `WEB_UI_WORKSPACE_FILES_ROOT=/path/to/workspace`

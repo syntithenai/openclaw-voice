@@ -7,21 +7,8 @@ function handleMsg(msg){
   if (isLargePlaylist) console.time('🎵 music_queue render');
   
   switch(msg.type){
-    case 'hello':
-        if(msg.auth){
-            S.authMode = String(msg.auth.mode || S.authMode || 'disabled').toLowerCase();
-            S.isAuthenticated = !!msg.auth.authenticated;
-            S.authUser = (msg.auth.user && typeof msg.auth.user==='object') ? msg.auth.user : null;
-            renderAuthButton();
-        }
-        break;
+    case 'hello': break;
     case 'state_snapshot':
-    if(msg.auth){
-        S.authMode = String(msg.auth.mode || S.authMode || 'disabled').toLowerCase();
-        S.isAuthenticated = !!msg.auth.authenticated;
-        S.authUser = (msg.auth.user && typeof msg.auth.user==='object') ? msg.auth.user : null;
-        renderAuthButton();
-    }
     if(msg.orchestrator){
         const rev = Number(msg.orchestrator.status_rev||0);
         if(!Number.isNaN(rev) && rev>0) S.lastStatusRev = Math.max(S.lastStatusRev, rev);
@@ -276,7 +263,7 @@ function handleMsg(msg){
                 // belt-and-suspenders in case the broadcast is missed.
                 requestMusicStateRetry('post_load_ack', 8, 2000);
             }
-            if(['music_save_playlist','music_create_playlist','music_delete_playlist','music_rename_playlist'].includes(String(msg.action||''))){
+            if(['music_save_playlist','music_create_playlist','music_delete_playlist'].includes(String(msg.action||''))){
                 sendAction({type:'music_list_playlists'});
             }
             if(S.page==='music') renderMusicPage(document.getElementById('main'));
@@ -790,8 +777,7 @@ function setupServerRefreshWatcher(){
 
 loadUiPrefs();
 hydrateChatCache();
-S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); renderAuthButton(); if(wsAuthAllowed()) connectWs();
-refreshAuthSession({render:true, adjustWs:true}).catch(()=>{});
+S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity(); connectWs();
 setupServerRefreshWatcher();
 setInterval(()=>{ expirePendingActions(); applyTopMusicProgress(); if(!S.timers.length) return; const now=Date.now()/1000; S.timers.forEach(t=>{ if(t&&t._pendingServerAck) return; if(t._clientAnchorTs===undefined||t._clientAnchorTs===null){ t._clientAnchorTs=now; t._clientAnchorRem=t.remaining_seconds; } t.remaining_seconds=Math.max(0, t._clientAnchorRem-(now-t._clientAnchorTs)); }); renderTimerBar(); },500);
 startBrowserCapture().catch((err)=>{

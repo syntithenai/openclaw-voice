@@ -1012,16 +1012,6 @@ class MusicManager:
         if self._playlist_names_cache and (now - self._playlist_names_cache_ts) <= self._playlist_names_cache_ttl_s:
             return list(self._playlist_names_cache)
 
-        direct_list = getattr(self.control_pool, "list_playlists_direct", None)
-        if callable(direct_list):
-            try:
-                playlists = [str(name).strip() for name in (direct_list() or []) if str(name).strip()]
-                self._playlist_names_cache = playlists
-                self._playlist_names_cache_ts = time.monotonic()
-                return list(self._playlist_names_cache)
-            except Exception as e:
-                logger.warning(f"Direct playlist listing failed, falling back to command path: {e}")
-
         for attempt in (1, 2):
             try:
                 emit_latency_trace("music_load.list_playlists_start", attempt=attempt)
@@ -1038,8 +1028,7 @@ class MusicManager:
                     await asyncio.sleep(0.05)
                     continue
                 logger.error(f"Failed to list playlists: {e}")
-                cached = self._playlist_names_cache if self._playlist_names_cache else []
-                return list(cached)
+                return []
         return []
 
     async def resolve_playlist_name(self, requested_name: str, refresh_if_miss: bool = True) -> str:
@@ -1209,38 +1198,6 @@ class MusicManager:
             return f"Deleted playlist: {playlist_name}"
         except Exception as e:
             logger.error(f"Failed to delete playlist '{name}': {e}")
-            return f"Error: {e}"
-
-    async def rename_playlist(self, old_name: str, new_name: str) -> str:
-        """Rename a playlist (case-insensitive match on old name)."""
-        try:
-            old = str(old_name or "").strip()
-            new = str(new_name or "").strip()
-            if not old:
-                return "Original playlist name is required"
-            if not new:
-                return "New playlist name is required"
-
-            available_playlists = await self.list_playlists()
-            actual_old = None
-            for available in available_playlists:
-                if available.lower() == old.lower():
-                    actual_old = available
-                    break
-
-            if not actual_old:
-                return f"Error: Playlist '{old}' not found"
-
-            await self._control_execute(f'rename "{self._quote(actual_old)}" "{self._quote(new)}"')
-            self._playlist_names_cache = [
-                new if p.lower() == actual_old.lower() else p
-                for p in self._playlist_names_cache
-            ]
-            self._playlist_names_cache_ts = time.monotonic()
-            logger.info(f"📂 Renamed playlist '{actual_old}' → '{new}'")
-            return f"Renamed playlist: {actual_old} → {new}"
-        except Exception as e:
-            logger.error(f"Failed to rename playlist '{old_name}' → '{new_name}': {e}")
             return f"Error: {e}"
     
     # ========== High-Level Operations ==========
