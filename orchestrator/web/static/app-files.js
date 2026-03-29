@@ -18,50 +18,8 @@
 
   function fmState() {
     if (!S.fileManager) {
-      S.fileManager = {
-        initialized: false,
-        loading: false,
-        error: '',
-        treeByPath: {},
-        expandedByPath: { '/': true },
-        selectedFolderPath: '/',
-        selectedFilePath: '',
-        folderChildren: [],
-        currentFile: null,
-        saveTimersByPath: {},
-        saveStateByPath: {},
-        activePlainEditorPath: '',
-        activeMarkdownEditorPath: '',
-        activeJsonEditorPath: '',
-        markdownEditor: null,
-        jsonEditor: null,
-        createFolderModalOpen: false,
-        createFolderName: '',
-        deleteModalOpen: false,
-        deleteTargetType: '',
-        deleteTargetPath: '',
-        deleteTargetName: '',
-        deleteBusy: false,
-        renameModalOpen: false,
-        renameTargetType: '',
-        renameTargetPath: '',
-        renameTargetName: '',
-        renameName: '',
-        renameBusy: false,
-        filterText: '',
-        filterResults: null,
-        filterTimer: null,
-        treeScrollTop: 0,
-        filePickerModalOpen: false,
-        filePickerType: '',
-        filePickerTitle: '',
-        filePickerCurrentPath: '/',
-        filePickerExpandedPaths: { '/': true },
-        filePickerTree: {},
-      };
+      return;
     }
-    return S.fileManager;
-  }
 
   function isVirtualPath(path) {
     const p = String(path || '');
@@ -85,13 +43,11 @@
     if (!file) {
       badge.classList.add('hidden');
       badge.textContent = '';
-      return;
     }
     const value = String(st.saveStateByPath[file.path] || '');
     if (!value) {
       badge.classList.add('hidden');
       badge.textContent = '';
-      return;
     }
     const label = value === 'dirty' ? 'Unsaved'
       : value === 'saving' ? 'Saving'
@@ -210,49 +166,11 @@
         ? '<button type="button" class="text-xs text-gray-300" data-action="fm-toggle-folder" data-path="' + fmEsc(nodePath) + '">' + (isExpanded ? '-' : '+') + '</button>'
         : '<span class="text-xs text-gray-500">.</span>';
 
-      const row = ''
-        + '<div class="fm-tree-row ' + (isActive ? 'active' : '') + '" style="margin-left:' + left + 'px" data-action="' + rowAction + '" data-path="' + fmEsc(nodePath) + '">'
-        + branch
-        + '<span class="text-sm">' + fmEsc(node.name) + '</span>'
-        + '</div>';
-
-      if (isFolder && isExpanded) {
-        return row + renderTreeRows(nodePath, depth + 1);
-      }
-      return row;
-    }).join('');
-  }
-
-  function renderFolderRows() {
-    const st = fmState();
-    const items = Array.isArray(st.folderChildren) ? st.folderChildren : [];
-    if (!items.length) {
-      return '<div class="px-3 py-3 text-sm text-gray-400">Folder is empty</div>';
-    }
-    return items.map((item) => {
-      const p = String(item.path || '');
-      const kind = String(item.kind || 'file');
-      const active = st.selectedFilePath === p;
-      const icon = kind === 'folder' || kind === 'virtual-folder' ? 'DIR' : 'FILE';
-      const action = kind === 'folder' || kind === 'virtual-folder' ? 'fm-select-folder' : 'fm-select-file';
       return ''
-        + '<div class="fm-file-row ' + (active ? 'active' : '') + '" data-action="' + action + '" data-path="' + fmEsc(p) + '">'
-        + '<div class="text-xs text-gray-500">' + icon + '</div>'
-        + '<div class="text-sm truncate">' + fmEsc(item.name) + '</div>'
-        + '</div>';
-    }).join('');
-  }
-
-  function highlightTokens(text, tokens) {
-    if (!tokens.length) return fmEsc(text);
-    const escaped = fmEsc(text);
-    let result = escaped;
-    for (const token of tokens) {
-      const regex = new RegExp('(' + token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + ')', 'gi');
-      result = result.replace(regex, '<mark>$1</mark>');
-    }
-    return result;
-  }
+        + '<div class="fm-tree-row ' + (isActive ? 'active' : '') + '" style="margin-left:' + left + 'px" data-action="' + rowAction + '" data-path="' + fmEsc(nodePath) + '">' 
+        + branch
+        + '<span class="text-sm">' + fmEsc(node.name) + '</span>';
+    });
 
   function renderFilterResults() {
     const st = fmState();
@@ -438,7 +356,7 @@
 
   async function mountEditors() {
     const st = fmState();
-    const file = st.currentFile;
+      const file = await fmFetchJson(FM_API + '/file?path=' + encodeURIComponent(st.selectedFilePath));
     if (!file || S.page !== 'files') return;
 
     const category = String(file.category || 'binary');
@@ -470,247 +388,10 @@
         renderFileManagerPage(fmMain());
         return;
       }
-      st.activeMarkdownEditorPath = file.path;
-      st.markdownEditor = new EasyMDE({
-        element: textarea,
-        autofocus: false,
-        spellChecker: false,
-        forceSync: true,
-        status: false,
-        toolbar: [
-          'bold', 'italic', 'heading', '|',
-          'quote', 'unordered-list', 'ordered-list', '|',
-          {
-            name: 'insertImage',
-            action: function() { openFilePicker('image'); },
-            className: 'fa fa-picture-o',
-            title: 'Insert Image',
-          },
-          {
-            name: 'insertLink',
-            action: function() { openFilePicker('link'); },
-            className: 'fa fa-link',
-            title: 'Insert Link',
-          },
-          '|', 'preview', 'side-by-side', 'fullscreen', '|', 'guide'
-        ],
-      });
-      st.markdownEditor.value(String(file.content || ''));
-      st.markdownEditor.codemirror.on('change', () => {
-        const next = st.markdownEditor.value();
-        queueSave(file.path, next);
-      });
-      return;
     }
+  };
 
-    if (category === 'json') {
-      const mount = document.getElementById('fmJsonEditor');
-      if (!mount) return;
-      if (hasLiveJsonEditor(file.path, mount)) return;
-      if (st.jsonEditor && typeof st.jsonEditor.destroy === 'function') {
-        st.jsonEditor.destroy();
-        st.jsonEditor = null;
-      }
-
-      st.activeJsonEditorPath = file.path;
-      let createJSONEditor = null;
-      try {
-        const mod = await import(JSON_EDITOR_MODULE_URL);
-        createJSONEditor = mod.createJSONEditor;
-      } catch (err) {
-        st.error = 'Failed to load vanilla-jsoneditor: ' + String(err && err.message ? err.message : err);
-        renderFileManagerPage(fmMain());
-        return;
-      }
-
-      let parsed = {};
-      try {
-        parsed = JSON.parse(String(file.content || '{}'));
-      } catch {
-        parsed = {};
-      }
-
-      st.jsonEditor = createJSONEditor({
-        target: mount,
-        props: {
-          content: { json: parsed },
-          mode: 'tree',
-          onChange: (updatedContent) => {
-            let nextText = '{}';
-            if (updatedContent && updatedContent.text !== undefined) {
-              nextText = String(updatedContent.text || '{}');
-            } else if (updatedContent && updatedContent.json !== undefined) {
-              nextText = JSON.stringify(updatedContent.json, null, 2);
-            }
-            queueSave(file.path, nextText);
-          },
-        },
-      });
-    }
-  }
-
-  async function ensureInitialized(forceReload) {
-    const st = fmState();
-    if (!forceReload && st.initialized) return;
-    st.loading = true;
-    st.error = '';
-    renderFileManagerPage(fmMain());
-    try {
-      await loadTree('/');
-      await loadFolder(st.selectedFolderPath || '/');
-      st.initialized = true;
-    } catch (err) {
-      st.error = String(err && err.message ? err.message : err);
-    } finally {
-      st.loading = false;
-      renderFileManagerPage(fmMain());
-      void mountEditors();
-    }
-  }
-
-  async function selectFolder(path) {
-    const st = fmState();
-    st.error = '';
-    st.selectedFolderPath = path;
-    st.selectedFilePath = '';
-    st.currentFile = null;
-    st.filterText = '';
-    st.filterResults = null;
-    if (st.filterTimer) { clearTimeout(st.filterTimer); st.filterTimer = null; }
-    destroyEditors();
-    renderFileManagerPage(fmMain());
-    try {
-      await loadFolder(path);
-      if (!st.treeByPath[path]) {
-        await loadTree(path);
-      }
-    } catch (err) {
-      st.error = String(err && err.message ? err.message : err);
-    }
-    renderFileManagerPage(fmMain());
-  }
-
-  async function selectFile(path) {
-    const st = fmState();
-    st.error = '';
-    st.selectedFilePath = path;
-    destroyEditors();
-    renderFileManagerPage(fmMain());
-    try {
-      await loadFile(path);
-    } catch (err) {
-      st.error = String(err && err.message ? err.message : err);
-    }
-    renderFileManagerPage(fmMain());
-    void mountEditors();
-  }
-
-  async function toggleTreeFolder(path) {
-    const st = fmState();
-    st.expandedByPath[path] = !st.expandedByPath[path];
-    if (st.expandedByPath[path] && !st.treeByPath[path]) {
-      try {
-        await loadTree(path);
-      } catch (err) {
-        st.error = String(err && err.message ? err.message : err);
-      }
-    }
-    renderFileManagerPage(fmMain());
-  }
-
-  async function createFolder() {
-    const st = fmState();
-    const name = String(st.createFolderName || '').trim();
-    if (!name) {
-      st.error = 'Folder name is required';
-      renderFileManagerPage(fmMain());
-      return;
-    }
-
-    try {
-      await fmFetchJson(FM_API + '/folder?path=' + encodeURIComponent(st.selectedFolderPath || '/'), {
-        method: 'POST',
-        body: JSON.stringify({ name }),
-      });
-      st.createFolderModalOpen = false;
-      st.createFolderName = '';
-      delete st.treeByPath[st.selectedFolderPath || '/'];
-      await selectFolder(st.selectedFolderPath || '/');
-    } catch (err) {
-      st.error = String(err && err.message ? err.message : err);
-      renderFileManagerPage(fmMain());
-    }
-  }
-
-  function openDeleteModal(type, path, name) {
-    const st = fmState();
-    st.deleteModalOpen = true;
-    st.deleteTargetType = String(type || '');
-    st.deleteTargetPath = String(path || '');
-    st.deleteTargetName = String(name || '');
-    st.deleteBusy = false;
-    renderFileManagerPage(fmMain());
-  }
-
-  function closeDeleteModal() {
-    const st = fmState();
-    st.deleteModalOpen = false;
-    st.deleteTargetType = '';
-    st.deleteTargetPath = '';
-    st.deleteTargetName = '';
-    st.deleteBusy = false;
-    renderFileManagerPage(fmMain());
-  }
-
-  async function confirmDelete() {
-    const st = fmState();
-    if (st.deleteBusy) return;
-
-    const targetType = String(st.deleteTargetType || '');
-    const targetPath = String(st.deleteTargetPath || '');
-    if (!targetType || !targetPath) {
-      closeDeleteModal();
-      return;
-    }
-
-    st.deleteBusy = true;
-    st.error = '';
-    renderFileManagerPage(fmMain());
-
-    try {
-      if (targetType === 'file') {
-        await fmFetchJson(FM_API + '/file?path=' + encodeURIComponent(targetPath), { method: 'DELETE' });
-        if (st.saveTimersByPath[targetPath]) {
-          clearTimeout(st.saveTimersByPath[targetPath]);
-          delete st.saveTimersByPath[targetPath];
-        }
-        delete st.saveStateByPath[targetPath];
-        st.selectedFilePath = '';
-        st.currentFile = null;
-        destroyEditors();
-        st.treeByPath = {};
-        await loadTree('/');
-        await selectFolder(parentPath(targetPath));
-      } else if (targetType === 'folder') {
-        await fmFetchJson(FM_API + '/folder?path=' + encodeURIComponent(targetPath), { method: 'DELETE' });
-        st.treeByPath = {};
-        await loadTree('/');
-        await selectFolder(parentPath(targetPath));
-      }
-      st.deleteModalOpen = false;
-      st.deleteTargetType = '';
-      st.deleteTargetPath = '';
-      st.deleteTargetName = '';
-      st.deleteBusy = false;
-      renderFileManagerPage(fmMain());
-    } catch (err) {
-      st.deleteBusy = false;
-      st.deleteModalOpen = false;
-      st.error = String(err && err.message ? err.message : err);
-      renderFileManagerPage(fmMain());
-    }
-  }
-
+  // ...existing code...
 
   function openRenameModal(type, path, currentName) {
     const st = fmState();
@@ -821,7 +502,13 @@
 
   function renderFilePickerChildren() {
     const st = fmState();
-    const items = Array.isArray(st.filePickerChildren) ? st.filePickerChildren : [];
+    let items = Array.isArray(st.filePickerChildren) ? st.filePickerChildren : [];
+    if (st.filePickerType === 'image') {
+      items = items.filter(item => {
+        const kind = String(item.kind || 'file');
+        return kind === 'folder' || kind === 'virtual-folder' || isImageFile(item.path);
+      });
+    }
     if (!items.length) {
       return '<div class="px-3 py-3 text-sm text-gray-400">Folder is empty</div>';
     }
@@ -830,12 +517,8 @@
       const kind = String(item.kind || 'file');
       const icon = kind === 'folder' || kind === 'virtual-folder' ? 'DIR' : 'FILE';
       const selectAction = kind === 'folder' || kind === 'virtual-folder' ? 'fp-enter-folder' : 'fp-select-file';
-      const style = st.filePickerType === 'image'
-        ? (kind === 'folder' || kind === 'virtual-folder' ? '' : (isImageFile(p) ? '' : ' opacity-50'))
-        : '';
-      const disabled = st.filePickerType === 'image' && !(kind === 'folder' || kind === 'virtual-folder') && !isImageFile(p) ? ' data-disabled="true"' : '';
       return ''
-        + '<div class="fm-file-row' + style + '" data-action="' + selectAction + '" data-path="' + fmEsc(p) + '"' + disabled + '>'
+        + '<div class="fm-file-row" data-action="' + selectAction + '" data-path="' + fmEsc(p) + '">' 
         + '<div class="text-xs text-gray-500">' + icon + '</div>'
         + '<div class="text-sm truncate">' + fmEsc(item.name) + '</div>'
         + '</div>';
@@ -849,6 +532,13 @@
 
   function openFilePicker(type) {
     const st = fmState();
+    // Save current selection before opening picker
+    if (st.markdownEditor && st.markdownEditor.codemirror) {
+      const doc = st.markdownEditor.codemirror.getDoc();
+      st.markdownEditorSelection = doc.listSelections();
+    } else {
+      st.markdownEditorSelection = null;
+    }
     st.filePickerModalOpen = true;
     st.filePickerType = type;
     st.filePickerTitle = type === 'image' ? 'Select an Image' : 'Select a File';
@@ -878,28 +568,36 @@
 
     const path = String(filePath || '');
     const fileName = path.split('/').pop() || 'file';
+    let decodedFileName = fileName;
+    try {
+      decodedFileName = decodeURIComponent(fileName);
+    } catch (_) {
+      decodedFileName = fileName;
+    }
+    const linkLabel = decodedFileName
+      .replace(/\.[^./]+$/, '')
+      .replace(/[_-]+/g, ' ')
+      .trim() || decodedFileName;
 
+    const routePath = '/#/files?path=' + encodeURIComponent(path);
     let markdownSyntax = '';
     if (st.filePickerType === 'image') {
-      markdownSyntax = '![' + fileName + '](' + path + ')';
+      const previewPath = FM_API + '/preview?path=' + encodeURIComponent(path);
+      markdownSyntax = '[![' + decodedFileName + '](' + previewPath + ')](' + routePath + ')';
     } else {
-      markdownSyntax = '[link](' + path + ')';
+      markdownSyntax = '[' + linkLabel + '](' + routePath + ')';
     }
 
     const cm = editor.codemirror;
     const doc = cm.getDoc();
-    const selections = doc.listSelections();
-
-    if (selections && selections.length > 0) {
-      const selection = selections[0];
-      doc.replaceRange(markdownSyntax, selection.anchor, selection.head);
-    } else {
-      const lastLine = doc.lastLine();
-      const lastChar = doc.getLine(lastLine).length;
-      doc.replaceRange(markdownSyntax, { line: lastLine, ch: lastChar });
+    // Use the saved selection from state if present
+    const selection = st.markdownEditorSelection;
+    if (selection && selection.length > 0) {
+      doc.setSelections(selection);
     }
-
-    editor.codemirror.focus();
+    doc.replaceSelection(markdownSyntax, 'around');
+    cm.focus();
+    st.markdownEditorSelection = null;
   }
 
 
@@ -908,10 +606,10 @@
     const url = FM_API + '/tree?path=' + encodeURIComponent(path);
     try {
       const data = await fmFetchJson(url, {});
-      if (Array.isArray(data)) {
-        st.filePickerTree[path] = data;
-      }
+      st.filePickerTree[path] = Array.isArray(data && data.children) ? data.children : [];
     } catch (err) {
+      st.filePickerTree[path] = [];
+      st.error = String(err && err.message ? err.message : err);
       console.error('Failed to load file picker tree:', err);
     }
   }
@@ -919,13 +617,13 @@
   async function loadFilePickerFolder(path) {
     const st = fmState();
     st.filePickerCurrentPath = path;
-    const url = FM_API + '/children?path=' + encodeURIComponent(path) + '&recursive=false';
+    const url = FM_API + '/folder?path=' + encodeURIComponent(path);
     try {
       const data = await fmFetchJson(url, {});
-      if (Array.isArray(data)) {
-        st.filePickerChildren = data;
-      }
+      st.filePickerChildren = Array.isArray(data && data.children) ? data.children : [];
     } catch (err) {
+      st.filePickerChildren = [];
+      st.error = String(err && err.message ? err.message : err);
       console.error('Failed to load file picker folder:', err);
     }
   }
@@ -1325,9 +1023,12 @@
     void ensureInitialized(false);
   };
 
-  window.fmOpenFile = function fmOpenFile(path) {
+  window.fmOpenFile = function fmOpenFile(path, options) {
     if (!path) return;
-    navigate('files');
+    const keepHash = !!(options && options.keepHash);
+    if (!keepHash) {
+      navigate('files');
+    }
     setTimeout(() => { void selectFile(path); }, 0);
   };
 
@@ -1340,32 +1041,55 @@
       st.initialized = false;
       st.treeByPath = {};
       st.folderChildren = [];
-      if (S.page === 'files') {
-        void ensureInitialized(true);
-      }
-      return;
-    }
-
-    for (const key of Object.keys(st.treeByPath || {})) {
-      if (key === '/' || changedPaths.some((p) => String(p || '').startsWith(String(key || '') + '/'))) {
-        delete st.treeByPath[key];
-      }
-    }
-
-    if (S.page === 'files') {
-      const folder = String(st.selectedFolderPath || '/');
-      void loadTree('/').then(() => loadFolder(folder)).then(() => {
-        if (st.selectedFilePath) {
-          return loadFile(st.selectedFilePath).catch(() => {
-            st.selectedFilePath = '';
-            st.currentFile = null;
-            return null;
-          });
+      if (category === 'markdown') {
+        const textarea = document.getElementById('fmMarkdownEditor');
+        if (!textarea) return;
+        if (hasLiveMarkdownEditor(file.path)) return;
+        if (st.markdownEditor && typeof st.markdownEditor.toTextArea === 'function') {
+          st.markdownEditor.toTextArea();
+          st.markdownEditor = null;
         }
-        return null;
-      }).finally(() => {
-        renderFileManagerPage(fmMain());
-      });
+        if (typeof EasyMDE !== 'function') {
+          st.error = 'EasyMDE is not loaded';
+          renderFileManagerPage(fmMain());
+          return;
+        }
+        st.activeMarkdownEditorPath = file.path;
+        st.markdownEditor = new EasyMDE({
+          element: textarea,
+          autofocus: false,
+          spellChecker: false,
+          forceSync: true,
+          status: false,
+          toolbar: [
+            'bold', 'italic', 'heading', '|',
+            'quote', 'unordered-list', 'ordered-list', '|',
+            {
+              name: 'insertImage',
+              action: function() { openFilePicker('image'); },
+              className: 'fa fa-picture-o',
+              title: 'Insert Image',
+            },
+            {
+              name: 'insertLink',
+              action: function() { openFilePicker('link'); },
+              className: 'fa fa-link',
+              title: 'Insert Link',
+            },
+            '|', 'preview', 'side-by-side', 'fullscreen', '|', 'guide'
+          ]
+        });
+        st.markdownEditor.value(String(file.content || ''));
+
+
+  } // <-- Close if (resync)
+} // <-- Close handleFileManagerFsChanged
+
+
+
+// Properly close all open blocks and the IIFE
     }
-  };
+  }
+}
+
 })();

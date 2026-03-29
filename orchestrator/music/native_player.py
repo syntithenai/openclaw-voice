@@ -40,6 +40,10 @@ class NativePlayer:
                 await asyncio.wait_for(self._proc.wait(), timeout=1.5)
             except Exception:
                 self._proc.kill()
+                try:
+                    await asyncio.wait_for(self._proc.wait(), timeout=1.0)
+                except Exception:
+                    pass
         self._proc = None
         self._paused = False
         self.browser_stream_path = ""

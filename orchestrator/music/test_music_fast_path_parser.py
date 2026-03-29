@@ -62,3 +62,16 @@ def test_next_track_variant_go_to_next_track_matches_next_track() -> None:
 def test_next_track_variant_can_you_skip_this_song_matches_next_track() -> None:
     parser = MusicFastPathParser()
     assert parser.parse("can you skip this song") == ("next_track", {})
+
+
+def test_play_song_by_artist_phrase_matches_play_song() -> None:
+    parser = MusicFastPathParser()
+    assert parser.parse("play big gun by acdc") == ("play_song", {"title": "big gun"})
+
+
+def test_play_music_by_artist_phrase_matches_play_artist() -> None:
+    parser = MusicFastPathParser()
+    assert parser.parse("play music by acdc") == (
+        "play_artist",
+        {"artist": "acdc", "shuffle": True},
+    )

@@ -62,6 +62,18 @@ class MusicRouter:
         return str(result).lower().startswith("error")
 
     @staticmethod
+    def _is_failed_result(result: str) -> bool:
+        text = str(result or "").strip().lower()
+        if not text:
+            return False
+        return (
+            text.startswith("error")
+            or text.startswith("no ")
+            or "not found" in text
+            or text.startswith("failed")
+        )
+
+    @staticmethod
     def _extract_numeric_volume(result: str) -> Optional[int]:
         import re
         match = re.search(r"(\d{1,3})%", result or "")
@@ -206,31 +218,31 @@ class MusicRouter:
     async def _handle_play_artist(self, artist: str, shuffle: bool = True) -> str:
         """Handle play artist command."""
         result = await self.manager.play_artist(artist, shuffle)
-        return result if self._is_error(result) else f"Playing artist: {artist}."
+        return result if self._is_failed_result(result) else f"Playing artist: {artist}."
     
     async def _handle_play_album(self, album: str) -> str:
         """Handle play album command."""
         result = await self.manager.play_album(album)
-        return result if self._is_error(result) else f"Playing album: {album}."
+        return result if self._is_failed_result(result) else f"Playing album: {album}."
     
     async def _handle_play_genre(self, genre: str, shuffle: bool = True) -> str:
         """Handle play genre command."""
         result = await self.manager.play_genre(genre, shuffle)
-        return result if self._is_error(result) else f"Playing genre: {genre}."
+        return result if self._is_failed_result(result) else f"Playing genre: {genre}."
     
     async def _handle_play_song(self, title: str) -> str:
         """Handle play song command."""
         result = await self.manager.play_song(title)
-        return result if self._is_error(result) else f"Playing: {title}."
+        return result if self._is_failed_result(result) else f"Playing: {title}."
     
     async def _handle_play_playlist(self, name: str) -> str:
         """Play a saved playlist (load and start playback)."""
         result = await self.manager.load_playlist(name)
-        if self._is_error(result):
+        if self._is_failed_result(result):
             return result
         # Auto-play after loading
         play_result = await self.manager.play(0)
-        return play_result if self._is_error(play_result) else f"Now playing: {name}"
+        return play_result if self._is_failed_result(play_result) else f"Now playing: {name}"
 
     async def _handle_add_songs(self, query: str, count: int = 5) -> str:
         """Add songs to existing queue without clearing it."""

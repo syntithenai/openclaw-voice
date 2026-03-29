@@ -20,6 +20,20 @@ document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',
     }
     navigate(nav);
 }));
+
+function normalizeFilesPath(value){
+    const raw = String(value||'').trim();
+    if(!raw) return '';
+    if(raw.startsWith('/')) return raw;
+    return '/' + raw.replace(/^\/+/, '');
+}
+
+function buildFilesRouteHref(filePath){
+    const normalized = normalizeFilesPath(filePath);
+    if(!normalized) return '';
+    return '/#/files?path=' + encodeURIComponent(normalized);
+}
+
 document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
@@ -32,9 +46,16 @@ document.addEventListener('click', e => {
 
     const openInFilesBtn = target.closest('[data-action="open-in-files"]');
     if (openInFilesBtn) {
-        const fp = String(openInFilesBtn.dataset.filePath || '').trim();
-        if (fp && typeof window.fmOpenFile === 'function') {
-            window.fmOpenFile(fp);
+        e.preventDefault();
+        const fp = normalizeFilesPath(openInFilesBtn.dataset.filePath || '');
+        const href = buildFilesRouteHref(fp);
+        if (href) {
+            const nextHash = href.slice(2);
+            if (location.hash !== '#' + nextHash) {
+                location.hash = '#' + nextHash;
+            } else if (typeof window.fmOpenFile === 'function') {
+                window.fmOpenFile(fp, { keepHash: true });
+            }
         }
         return;
     }
@@ -1430,7 +1451,9 @@ function collateChatMessages(msgs){
         }
         const validStreams=activeBucket.streams.filter(s=>String(s.text||'').length>0);
         const combinedStreamText=validStreams.map(s=>String(s.text||'')).join('');
+        const referencedFiles=extractReferencedPathsFromEvents(activeBucket.events);
         if(validStreams.length>0 && activeBucket.finals.length===0){
+            const extra=referencedFiles.length?{referenced_files:referencedFiles, written_files:referencedFiles}:{};
             out.push({
                 role:'assistant_stream_group',
                 request_id:activeBucket.reqId,
@@ -1439,9 +1462,9 @@ function collateChatMessages(msgs){
                 segments:validStreams,
                 latest:validStreams[validStreams.length-1],
                 hasFinal:false,
+                ...extra,
             });
         }
-        const referencedFiles=extractReferencedPathsFromEvents(activeBucket.events);
         activeBucket.finals.forEach((f, index)=>{
             const extra=referencedFiles.length?{referenced_files:referencedFiles, written_files:referencedFiles}:{};
             if(validStreams.length>0 && index===activeBucket.finals.length-1){
@@ -2501,15 +2524,18 @@ function mkBubble(m){
             const filesDiv=document.createElement('div');
             filesDiv.className='mt-2 flex flex-wrap gap-1';
             for(const fp of referencedFiles){
-                const fname=String(fp).split('/').filter(Boolean).pop()||String(fp);
-                const btn=document.createElement('button');
-                btn.type='button';
-                btn.className='inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-800 border border-gray-600 hover:bg-gray-700 text-blue-300 hover:text-blue-200 transition-colors';
-                btn.setAttribute('data-action','open-in-files');
-                btn.setAttribute('data-file-path',fp);
-                btn.title=fp;
-                btn.textContent='\uD83D\uDCC4 '+fname;
-                filesDiv.appendChild(btn);
+                const normalizedFp = normalizeFilesPath(fp);
+                if(!normalizedFp) continue;
+                const href = buildFilesRouteHref(normalizedFp);
+                const fname=normalizedFp.split('/').filter(Boolean).pop()||normalizedFp;
+                const link=document.createElement('a');
+                link.className='inline-flex items-center gap-1 px-2 py-0.5 rounded text-xs bg-gray-800 border border-gray-600 hover:bg-gray-700 text-blue-300 hover:text-blue-200 transition-colors';
+                link.setAttribute('data-action','open-in-files');
+                link.setAttribute('data-file-path',normalizedFp);
+                link.href=href;
+                link.title=normalizedFp;
+                link.textContent='\uD83D\uDCC4 '+fname;
+                filesDiv.appendChild(link);
             }
             b.appendChild(filesDiv);
         }

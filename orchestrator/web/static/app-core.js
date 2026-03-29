@@ -1108,13 +1108,58 @@ function requestScrollToBottomBurst(){
     S.autoScrollUntilTs=Date.now()+12000;
 }
 
+function getHashRouteInfo(){
+    const raw = String(location.hash || '').replace(/^#/, '');
+    const qIdx = raw.indexOf('?');
+    const route = qIdx >= 0 ? raw.slice(0, qIdx) : raw;
+    const query = qIdx >= 0 ? raw.slice(qIdx + 1) : '';
+        return {
+            route,
+            query,
+        };
+    }
+        route: route || '/',
+        params: new URLSearchParams(query),
+    };
+}
+
+function getFilesRoutePathFromHash(){
+    const info = getHashRouteInfo();
+    if(info.route !== '/files') return '';
+    const rawPath = String(info.params.get('path') || '').trim();
+    if(!rawPath) return '';
+    let decoded = rawPath;
+    try {
+        decoded = decodeURIComponent(rawPath);
+    } catch (_) {
+        decoded = rawPath;
+    }
+    if(!decoded.startsWith('/')){
+        decoded = '/' + decoded.replace(/^\/+/, '');
+    }
+    return decoded;
+}
+
 function getPage(){
-    const h=location.hash.replace('#','');
-    if(h==='/music') return 'music';
-    if(h==='/recordings') return 'recordings';
-    if(h==='/files') return 'files';
+    const route = getHashRouteInfo().route;
+    if(route === '/music') return 'music';
+    if(route === '/recordings') return 'recordings';
+    if(route === '/files') return 'files';
     return 'home';
 }
+
+function applyFilesRouteFromHash(){
+    if(S.page !== 'files') return;
+    const path = getFilesRoutePathFromHash();
+    if(!path) return;
+    if(typeof window.fmOpenFile === 'function'){
+        window.fmOpenFile(path, { keepHash: true });
+    }
+}
+
+window.getFilesRoutePathFromHash = getFilesRoutePathFromHash;
+window.applyFilesRouteFromHash = applyFilesRouteFromHash;
+
 function navigate(p){ location.hash='#/'+p; }
 function updateNavActiveState(){
     document.querySelectorAll('[data-nav]').forEach(el=>{
@@ -1127,6 +1172,7 @@ function updateNavActiveState(){
 window.addEventListener('hashchange',()=>{
     S.page=getPage();
     renderPage();
+    applyFilesRouteFromHash();
     updateNavActiveState();
     closeMenu();
     if(S.page==='music' && typeof sendAction==='function'){

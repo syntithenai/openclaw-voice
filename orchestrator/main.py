@@ -1025,9 +1025,11 @@ async def run_orchestrator() -> None:
             logger.info("🎙️ Recorder started: enforcing quiet mode")
             if music_manager:
                 try:
-                    if await music_manager.is_playing():
-                        await music_manager.stop()
-                        logger.info("🎵 Recorder started: stopped active music playback")
+                    stop_result = await music_manager.stop()
+                    if isinstance(stop_result, str) and stop_result.lower().startswith("error"):
+                        logger.debug("Recorder start music stop returned: %s", stop_result)
+                    else:
+                        logger.info("🎵 Recorder started: stopped music playback")
                 except Exception as exc:
                     logger.debug("Recorder start music stop failed: %s", exc)
 

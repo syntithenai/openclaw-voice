@@ -77,6 +77,7 @@ class MusicFastPathParser:
     
     # Search patterns (with capture groups)
     PLAY_ARTIST_PATTERN = r"^play\s+(?:some\s+)?(?:music\s+by\s+)?(.+)$"
+    PLAY_SONG_BY_ARTIST_PATTERN = r"^play\s+(?:the\s+)?(?:song\s+)?['\"]?(.+?)['\"]?\s+by\s+['\"]?(.+?)['\"]?$"
     PLAY_GENRE_PATTERN = r"^play\s+(?:some\s+)?(?:music\s+)?(?:genre\s+)?(?:of\s+)?(\w+)$"
     PLAY_SONG_PATTERN = r"^play\s+(?:the\s+)?(?:song\s+)?['\"]?(.+?)['\"]?$"
     PLAY_ALBUM_PATTERN = r"^play\s+(?:the\s+)?album\s+['\"]?(.+?)['\"]?$"
@@ -120,6 +121,7 @@ class MusicFastPathParser:
         self.status_regexes = [re.compile(p, re.IGNORECASE) for p in self.STATUS_PATTERNS]
         
         self.play_artist_regex = re.compile(self.PLAY_ARTIST_PATTERN, re.IGNORECASE)
+        self.play_song_by_artist_regex = re.compile(self.PLAY_SONG_BY_ARTIST_PATTERN, re.IGNORECASE)
         self.play_genre_regex = re.compile(self.PLAY_GENRE_PATTERN, re.IGNORECASE)
         self.play_song_regex = re.compile(self.PLAY_SONG_PATTERN, re.IGNORECASE)
         self.play_album_regex = re.compile(self.PLAY_ALBUM_PATTERN, re.IGNORECASE)
@@ -280,8 +282,17 @@ class MusicFastPathParser:
                 album = match.group(1).strip()
                 return ("play_album", {"album": album})
         
-        # Play artist (has "by" or common artist indicators)
-        if " by " in text or "music by" in text:
+        # Play song by artist (e.g., "play big gun by acdc").
+        # Keep "play music by X" mapped to play_artist.
+        if " by " in text and not re.match(r"^play\s+(?:some\s+)?music\s+by\s+", text, re.IGNORECASE):
+            match = self.play_song_by_artist_regex.match(text)
+            if match:
+                title = match.group(1).strip()
+                if title:
+                    return ("play_song", {"title": title})
+
+        # Play artist (explicit artist phrasing)
+        if "music by" in text or re.match(r"^play\s+(?:some\s+)?music\s+by\s+", text, re.IGNORECASE):
             match = self.play_artist_regex.match(text)
             if match:
                 artist = match.group(1).strip()
