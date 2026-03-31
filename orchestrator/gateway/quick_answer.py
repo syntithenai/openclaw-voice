@@ -158,7 +158,7 @@ Strict Response Protocol:
 NO FREE-FORM PROSE: Never respond with explanatory text, apologies, or conversational replies. Your only valid text responses are USE_UPSTREAM_AGENT or the model_recommendation JSON. For tool requests, call the tool.
 
 Content Rules:
-- Questions about the current date or time, plus simple calculations based only on the provided current date and time, are allowed. Respond with model_recommendation for these.
+- Questions about the current date or time, plus simple calculations based only on the provided current date and time, are allowed. Answer these directly in one short sentence.
 - If the user is asking about personal data, account-specific state, email, inbox contents, notifications, messages, calendar items, or anything that depends on prior conversation context or external state, respond with: USE_UPSTREAM_AGENT.
 - If the user references earlier dialogue with phrases like "you never told me", "what about", "did I get", "any new ones", "check my", or "do I have", respond with: USE_UPSTREAM_AGENT unless a timer/alarm/music/session tool directly answers it.
 
@@ -1517,16 +1517,13 @@ class QuickAnswerClient:
                 openclaw_models_available=self.openclaw_models_available,
             )
             music_like_query = bool(self.music_enabled and self.music_router and self.music_router.is_music_related(user_query))
-            # Force tool use when any tool family is available and the query reached this point
-            # having already passed classify_upstream_decision(). For music-like queries this was
-            # always "required"; extend to timers and recorder for the same reason: the routing
-            # decision already confirmed a local tool should handle it, so we must not let the
-            # LLM skip the tool and produce prose.
-            tool_eligible = bool(
-                music_like_query
-                or (self.timers_enabled and self.tool_router)
-                or (self.recorder_enabled and self.recorder_tool)
-                or (self.new_session_enabled and self.new_session_handler)
+            # Force tool use only when the classified local intent is actually tool-eligible.
+            # Date/time local queries should stay local but do not require a tool invocation.
+            tool_eligible = (
+                (reason == "music_local" and music_like_query)
+                or (reason == "timer_alarm_local" and self.timers_enabled and self.tool_router)
+                or (reason == "recorder_local" and self.recorder_enabled and self.recorder_tool)
+                or (reason == "new_session_local" and self.new_session_enabled and self.new_session_handler)
             )
             tool_choice_value = "required" if tool_eligible else "auto"
 
@@ -1745,6 +1742,10 @@ class QuickAnswerClient:
             if content == "USE_UPSTREAM_AGENT" or content.startswith("USE_UPSTREAM_AGENT"):
                 logger.info("← QUICK ANSWER: LLM escalated to upstream agent")
                 return True, ""
+
+            if reason == "date_time_local":
+                logger.info("← QUICK ANSWER: Returning local date/time response from tool-enabled path")
+                return False, sanitize_quick_answer_text(content)
             
             # Strict two-outcome contract enforcement: response must be either
             # (1) tool calls (already handled above)
@@ -1765,17 +1766,17 @@ class QuickAnswerClient:
                         return True, ""
                     
                     tier = parsed.get("tier")
-                    reason = parsed.get("reason", "quick-answer model recommendation")
+                    recommendation_reason = parsed.get("reason", "quick-answer model recommendation")
                     if isinstance(tier, str) and tier in ("fast", "basic", "capable", "smart", "genius"):
                         logger.info(
                             "← QUICK ANSWER: Model recommendation returned (tier=%s, reason=%s)",
                             tier,
-                            reason,
+                            recommendation_reason,
                         )
                         self._last_model_recommendation = {
                             "type": "model_recommendation",
                             "tier": tier,
-                            "reason": str(reason),
+                            "reason": str(recommendation_reason),
                         }
                         return True, ""
                     else:

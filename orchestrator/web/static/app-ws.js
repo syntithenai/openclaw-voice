@@ -866,6 +866,7 @@ hydrateChatCache();
 renderAuthButton();
 initGoogleSignIn();
 S.page=getPage(); renderPage(); updateNavActiveState(); applyMicState(); applyMicControlToggles(); updateWsDebugBanner(); updateMicInteractivity();
+window.addEventListener('resize', ()=>{ updateScrollUpButton(); updateScrollDownButton(); }, {passive:true});
 if(typeof applyFilesRouteFromHash === 'function') applyFilesRouteFromHash();
 if(wsAuthAllowed()) connectWs();
 refreshAuthSession({render:false, adjustWs:false}).catch(()=>{});

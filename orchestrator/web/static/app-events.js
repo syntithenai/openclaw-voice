@@ -207,6 +207,7 @@ document.addEventListener('click', e => {
     const toggleSidebarBtn = target.closest('[data-action="chat-sidebar-toggle"]');
     if (toggleSidebarBtn) {
         S.chatSidebarOpen = !S.chatSidebarOpen;
+        S.chatSidebarTouched = true;
         renderPage();
         return;
     }
@@ -284,6 +285,7 @@ document.addEventListener('click', e => {
         clearChatReloadTarget();
         clearChatReloadInFlight();
         S.selectedChatId = tid;
+        if(isMobileChatViewport()) S.chatSidebarOpen=false;
         persistChatCache();
         renderPage();
         return;
@@ -1136,9 +1138,10 @@ function renderPage(){
 }
 
 function renderHomePage(main){
+    if(!S.chatSidebarTouched && isMobileChatViewport()) S.chatSidebarOpen=false;
     const sidebarClass = S.chatSidebarOpen ? 'w-72 border-r border-gray-800' : 'w-0 border-r-0';
     const sidebarInnerClass = S.chatSidebarOpen ? 'opacity-100' : 'opacity-0 pointer-events-none';
-    const sidebarToggleText = S.chatSidebarOpen ? '&lt;&lt;' : '&gt;&gt;';
+    const sidebarToggleIcon = '<svg aria-hidden="true" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v5h5"/><path d="M3 8a9 9 0 1 1-2 5"/><path d="M12 8v4l3 2"/></svg>';
     const sidebarToggleTitle = S.chatSidebarOpen ? 'Hide chats' : 'Show chats';
     const selected = S.selectedChatId || 'active';
     const hasChatThreads = Array.isArray(S.chatThreads) && S.chatThreads.length > 0;
@@ -1186,7 +1189,7 @@ function renderHomePage(main){
         +'<div class="flex-1 min-w-0 flex flex-col h-full">'
             +'<div class="px-3 py-2 border-b border-gray-800 flex items-center justify-between gap-2">'
                 +'<div class="flex items-center gap-2">'
-                    +'<button data-action="chat-sidebar-toggle" title="'+sidebarToggleTitle+'" aria-label="'+sidebarToggleTitle+'" class="px-2.5 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleText+'</button>'
+                    +'<button data-action="chat-sidebar-toggle" title="'+sidebarToggleTitle+'" aria-label="'+sidebarToggleTitle+'" class="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleIcon+'</button>'
                 +'</div>'
                 +'<button data-action="chat-new" class="px-3 py-1.5 rounded-lg text-xs bg-blue-700 hover:bg-blue-600 transition-colors">New</button>'
             +'</div>'
@@ -1461,6 +1464,42 @@ function mergeRawGatewayFrames(rawMessages){
             return {index:idx, rawText};
         }
     });
+}
+
+function extractLifecyclePhaseFlagsFromRawFrames(rawFrames){
+    let hasStart=false;
+    let hasEnd=false;
+    let lastPhase='';
+
+    const ingestPhase=(phaseValue)=>{
+        const phase=String(phaseValue||'').toLowerCase();
+        if(phase==='start' || phase==='end' || phase==='result') lastPhase=phase;
+        if(phase==='start') hasStart=true;
+        if(phase==='end' || phase==='result') hasEnd=true;
+    };
+
+    for(const frame of (Array.isArray(rawFrames)?rawFrames:[])){
+        if(!frame || typeof frame!=='object') continue;
+
+        const frameType=String(frame.type||'').toLowerCase();
+        const frameEvent=String(frame.event||'').toLowerCase();
+        if(frameType==='event' && frameEvent==='agent'){
+            const payload=(frame.payload&&typeof frame.payload==='object') ? frame.payload : {};
+            const stream=String(payload.stream||'').toLowerCase();
+            if(stream==='lifecycle'){
+                const data=(payload.data&&typeof payload.data==='object') ? payload.data : {};
+                ingestPhase(data.phase!==undefined ? data.phase : payload.phase);
+            }
+            continue;
+        }
+
+        const name=String(frame.name||'').toLowerCase();
+        if(name==='lifecycle'){
+            ingestPhase(frame.phase);
+        }
+    }
+
+    return {hasStart, hasEnd, lastPhase};
 }
 
 function collectRawGatewayMessagesForRequest(selectedId, requestId){
@@ -2126,6 +2165,33 @@ function makeResponseCopyButton(getText){
     return btn;
 }
 
+function makeUserMessageCopyButton(text){
+    const btn=document.createElement('button');
+    btn.type='button';
+    btn.className='px-2 py-1 rounded text-[11px] bg-gray-700 hover:bg-gray-600 text-gray-100 border border-gray-500 transition-colors';
+    btn.textContent='Copy';
+    btn.title='Copy this message to clipboard';
+    btn.setAttribute('data-action','copy-user-message');
+    btn.addEventListener('click', async(e) => {
+        e.stopPropagation();
+        try {
+            await navigator.clipboard.writeText(text);
+            const originalText=btn.textContent;
+            btn.textContent='Copied!';
+            btn.disabled=true;
+            setTimeout(() => {
+                btn.textContent=originalText;
+                btn.disabled=false;
+            }, 2000);
+        } catch(err) {
+            console.error('Failed to copy:', err);
+            btn.textContent='Error';
+            setTimeout(() => { btn.textContent='Copy'; }, 1500);
+        }
+    });
+    return btn;
+}
+
 function makeResponseReloadButton(messageId, threadId){
     const btn=document.createElement('button');
     btn.type='button';
@@ -2388,6 +2454,7 @@ function mkBubble(m){
             let hasLifecycleStart=false;
             let hasLifecycleEnd=false;
             let hasLifecycleHardError=false;
+            let lastLifecyclePhase='';
             let anonIdx=0;
 
             for(const ev of events){
@@ -2526,6 +2593,9 @@ function mkBubble(m){
 
                 const name=String(payload.text||payload.name||payload.phase||'lifecycle').toLowerCase();
                 const phase=String(payload.phase||'').toLowerCase();
+                if(name==='lifecycle' && (phase==='start' || phase==='end' || phase==='result')){
+                    lastLifecyclePhase=phase;
+                }
                 if(name==='lifecycle' && phase==='start'){ hasLifecycleStart=true; continue; }
                 if(name==='lifecycle' && phase==='end'){ hasLifecycleEnd=true; continue; }
                 if(name==='lifecycle' && (phase==='error' || phase==='timeout')){
@@ -2554,23 +2624,43 @@ function mkBubble(m){
             }
 
             const toolGroupList=[...toolGroups.values()];
+            const rawLifecycleFlags=extractLifecyclePhaseFlagsFromRawFrames(mergeRawGatewayFrames(rawMessages));
+            if(!hasLifecycleStart && rawLifecycleFlags.hasStart) hasLifecycleStart=true;
+            if(!hasLifecycleEnd && rawLifecycleFlags.hasEnd) hasLifecycleEnd=true;
+            if(rawLifecycleFlags.lastPhase) lastLifecyclePhase=rawLifecycleFlags.lastPhase;
 
             const allToolsTerminal=(toolGroupList.length>0) && toolGroupList.every((g)=>
                 g.phases.includes('result') || g.phases.includes('end') || g.phases.includes('error') || g.isError!==null
             );
-            const hasToolError=toolGroupList.some((g)=>g.isError===true || g.phases.includes('error') || g.timeout || /\btimeout|timed out\b/i.test(String(g.errorText||'')));
+            const failedGroups=toolGroupList.filter((g)=>
+                g.isError===true
+                || g.phases.includes('error')
+                || g.timeout
+                || /\btimeout|timed out\b/i.test(String(g.errorText||''))
+            );
+            const hasToolError=failedGroups.length>0;
             const hasLifecycleError=hasLifecycleHardError;
-            const waiting=(hasLifecycleStart && !hasLifecycleEnd && !hasLifecycleError && !allToolsTerminal && !m.hasFinal);
+            // Keep waiting active until a real completion signal arrives.
+            const waiting=(hasLifecycleStart && !hasLifecycleError && !m.hasFinal && (lastLifecyclePhase ? lastLifecyclePhase==='start' : !hasLifecycleEnd));
             const waitingRow=waiting
                 ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-yellow-300 flex items-center gap-2">'
                     +'<span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span>'
                     +'<span>waiting…</span>'
                   +'</div>'
                 : '';
+            const failedToolNames=failedGroups.map((g)=>String(g.name||'tool')).filter(Boolean);
+            const uniqueFailedToolNames=[...new Set(failedToolNames)];
+            const failedToolPreview=uniqueFailedToolNames.slice(0, 3).join(', ');
+            const failedToolExtra=uniqueFailedToolNames.length>3 ? ' +' + String(uniqueFailedToolNames.length-3) + ' more' : '';
+            const failureRow=hasToolError
+                ? '<div class="px-2 py-1 border-b border-red-700/50 bg-red-950/30 text-[11px] text-red-200 flex items-center gap-2">'
+                    +'<span>!</span><span>failed actions: '+String(failedGroups.length)+(failedToolPreview?(' ('+esc(failedToolPreview)+failedToolExtra+')'):'')+'</span>'
+                  +'</div>'
+                : '';
             const statusRow=(!waiting)
                 ? ((hasToolError || hasLifecycleError)
                     ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-red-300 flex items-center gap-2"><span>✕</span><span>completed with errors</span></div>'
-                    : ((hasLifecycleStart || hasLifecycleEnd || toolGroupList.length>0 || lifecycleItems.length>0)
+                    : ((hasLifecycleStart || hasLifecycleEnd || toolGroupList.length>0 || lifecycleItems.length>0 || allToolsTerminal)
                         ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-emerald-300 flex items-center gap-2"><span>✓</span><span>finished</span></div>'
                         : ''))
                 : '';
@@ -2669,8 +2759,12 @@ function mkBubble(m){
                         +errorInline;
                 }
 
+                const rowTone=failed
+                    ? 'text-red-300'
+                    : (success ? 'text-emerald-300' : 'text-amber-300');
+
                 return '<div class="px-2 py-1 border-b border-gray-800/60 last:border-b-0">'
-                    +'<div class="text-[11px] text-amber-300 flex items-center gap-1"><span class="w-3 text-center">'+icon+'</span><span class="font-mono">'+esc(g.name)+'</span><span class="text-[10px] text-gray-500">'+esc(phaseLabel)+'</span></div>'
+                    +'<div class="text-[11px] '+rowTone+' flex items-center gap-1"><span class="w-3 text-center">'+icon+'</span><span class="font-mono">'+esc(g.name)+'</span><span class="text-[10px] text-gray-500">'+esc(phaseLabel)+'</span></div>'
                     +bodyHtml
                     +payloadBlock
                     +'</div>';
@@ -2699,10 +2793,10 @@ function mkBubble(m){
                   +'</details>'
                 : '';
 
-            const executionSequenceContent=statusRow+waitingRow+toolRows+lifecycleRows+debugBlock;
+            const executionSequenceContent=failureRow+statusRow+waitingRow+toolRows+lifecycleRows+debugBlock;
             if(executionSequenceContent){
                 const thinkingSummary=waiting
-                    ? '<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span><span>Thinking</span></summary>'
+                    ? '<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none flex items-center gap-2"><span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span><span>'+(hasToolError?'Thinking (with errors)':'Thinking')+'</span></summary>'
                     : '<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Thinking</summary>';
                 const timeline=document.createElement('div');
                 timeline.innerHTML='<details data-detail-key="'+esc('req:'+reqKey+':thinking')+'" class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden">'
@@ -2800,7 +2894,8 @@ const referencedFiles=(Array.isArray(m.referenced_files)?m.referenced_files:m.wr
         b.appendChild(textWrap);
         if(isReloadSource){
             const actions=document.createElement('div');
-            actions.className='mt-2 flex justify-end';
+            actions.className='mt-2 flex justify-end gap-2';
+            actions.appendChild(makeUserMessageCopyButton(m.text||''));
             actions.appendChild(makeResponseReloadButton(msgId, reloadThreadId));
             b.appendChild(actions);
         }

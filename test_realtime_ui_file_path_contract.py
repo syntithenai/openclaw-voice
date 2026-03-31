@@ -19,6 +19,8 @@ def test_tool_request_extracts_snake_case_file_path() -> None:
 def test_thinking_block_shows_waiting_icon_in_summary() -> None:
     assert "const thinkingSummary=waiting" in UI_SOURCE
     assert "animate-spin" in UI_SOURCE
+    assert "let lastPhase=''" in UI_SOURCE
+    assert "lastLifecyclePhase ? lastLifecyclePhase==='start' : !hasLifecycleEnd" in UI_SOURCE
 
 
 def test_exec_preview_clamped_to_two_lines() -> None:

@@ -19,6 +19,13 @@ const PENDING_ACTION_TIMEOUT_MS = 8000;
 const INLINE_ERROR_TTL_MS = 7000;
 const MUSIC_LIBRARY_SEARCH_MIN_LEN = 3;
 const WS_RECONNECT_MS = 1500;
+const MOBILE_CHAT_BREAKPOINT_QUERY = '(max-width: 639px)';
+
+function isMobileChatViewport(){
+    return typeof window !== 'undefined'
+        && typeof window.matchMedia === 'function'
+        && window.matchMedia(MOBILE_CHAT_BREAKPOINT_QUERY).matches;
+}
 
 const TAB_ID = (() => {
     const fallback = 'tab-' + Math.random().toString(16).slice(2) + Date.now().toString(16);
@@ -41,7 +48,7 @@ const S = {
   micEnabled:!MIC_STARTS_DISABLED,
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
     chat:[], music:{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''},
-    chatThreads:[], activeChatId:'active', activeChatThreadId:'', selectedChatId:'active', chatSidebarOpen:true,
+    chatThreads:[], activeChatId:'active', activeChatThreadId:'', selectedChatId:'active', chatSidebarOpen:!isMobileChatViewport(), chatSidebarTouched:false,
                 chatThreadFilter:'',
     chatReloadTargetId:'', chatReloadTargetThreadId:'',
     chatReloadInFlight:null,
@@ -1059,6 +1066,19 @@ function isChatAtBottom(){
     return (area.scrollTop + area.clientHeight) >= (area.scrollHeight - 8);
 }
 
+function positionScrollDownWrap(wrap, area){
+    const container = wrap.parentElement;
+    if(!container) return;
+
+    const areaRect = area.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const left = Math.max(0, Math.round(areaRect.left - containerRect.left));
+    const width = Math.max(0, Math.round(areaRect.width));
+
+    wrap.style.marginLeft = left + 'px';
+    wrap.style.width = width + 'px';
+}
+
 function updateScrollDownButton(){
     const wrap=document.getElementById('scrollDownWrap');
     if(!wrap) return;
@@ -1066,11 +1086,14 @@ function updateScrollDownButton(){
     if(!area || S.page!=='home'){
         wrap.classList.add('hidden');
         wrap.classList.remove('flex');
+        wrap.style.marginLeft='';
+        wrap.style.width='';
         return;
     }
     const overflow=area.scrollHeight > (area.clientHeight + 1);
     const atBottom=isChatAtBottom();
     const shouldShow=overflow && !atBottom;
+    positionScrollDownWrap(wrap, area);
     wrap.classList.toggle('hidden', !shouldShow);
     wrap.classList.toggle('flex', shouldShow);
 }
@@ -1082,6 +1105,22 @@ function getScrollUpArea(){
     return null;
 }
 
+function positionScrollUpWrap(wrap, area){
+    const container = wrap.parentElement;
+    if(!container) return;
+
+    const areaRect = area.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const top = Math.max(8, Math.round(areaRect.top - containerRect.top + 8));
+    const left = Math.max(0, Math.round(areaRect.left - containerRect.left));
+    const width = Math.max(0, Math.round(areaRect.width));
+
+    wrap.style.top = top + 'px';
+    wrap.style.left = left + 'px';
+    wrap.style.right = 'auto';
+    wrap.style.width = width + 'px';
+}
+
 function updateScrollUpButton(){
     const wrap=document.getElementById('scrollUpWrap');
     if(!wrap) return;
@@ -1089,11 +1128,15 @@ function updateScrollUpButton(){
     if(!area){
         wrap.classList.add('hidden');
         wrap.classList.remove('flex');
+        wrap.style.left='';
+        wrap.style.right='';
+        wrap.style.width='';
         return;
     }
     const overflow=area.scrollHeight > (area.clientHeight + 1);
     const partiallyScrolled=area.scrollTop > 8;
     const shouldShow=overflow && partiallyScrolled;
+    positionScrollUpWrap(wrap, area);
     wrap.classList.toggle('hidden', !shouldShow);
     wrap.classList.toggle('flex', shouldShow);
 }

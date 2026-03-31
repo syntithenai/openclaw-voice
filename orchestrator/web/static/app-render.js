@@ -647,6 +647,24 @@ function formatCaptureError(err){
     return msg;
 }
 
+  function clearCaptureRetry(){
+    if(S.captureRetryTimer){
+      clearTimeout(S.captureRetryTimer);
+      S.captureRetryTimer=null;
+    }
+  }
+
+  function scheduleCaptureRetry(delayMs){
+    clearCaptureRetry();
+    if(S.wsManualDisconnect || !S.browserAudioEnabled) return;
+    const retryMs=Math.max(500, Number(delayMs)||2500);
+    S.captureRetryTimer=setTimeout(()=>{
+      S.captureRetryTimer=null;
+      if(S.wsManualDisconnect || !S.browserAudioEnabled) return;
+      ensureBrowserCapture().catch((err)=>reportCaptureFailure(err,'retry'));
+    }, retryMs);
+  }
+
 function reportCaptureFailure(err, phase='capture'){
   S.wsDebug.status='capture_error';
   S.wsDebug.lastError=formatCaptureError(err);

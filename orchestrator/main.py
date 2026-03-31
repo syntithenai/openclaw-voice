@@ -136,10 +136,31 @@ GHOST_ARTIFACT_TOKENS = {
     "im sorry",
     "i don't know",
     "i dont know",
+    # TV / broadcast background noise phrases
+    "we'll be right back",
+    "we will be right back",
+    "i'll be right back",
+    "i will be right back",
+    "be right back",
+    "brb",
+    "we're back",
+    "we are back",
+    "and we're back",
+    "and we are back",
+    "stay tuned",
+    "don't go anywhere",
+    "don't touch that dial",
+    "after the break",
+    "after these messages",
+    "right after this",
+    "right back after this",
 }
 
 GHOST_ARTIFACT_PATTERNS = (
     re.compile(r"\bi(?:'m|\s+am)?\s+going\s+to\s+go\s+ahead\s+and\s+stop\s+(?:the\s+)?record(?:ing)?\b"),
+    re.compile(r"\b(?:we(?:'ll|'re| will| are)?|i(?:'ll| will)?)\s+(?:be\s+)?right\s+back\b"),
+    re.compile(r"\bwe(?:'re| are)\s+(?:back|coming\s+back)\b"),
+    re.compile(r"\bstay\s+tuned\b"),
 )
 
 GHOST_SHORT_COMMAND_PARSER = MusicFastPathParser()

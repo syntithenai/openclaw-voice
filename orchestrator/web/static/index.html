@@ -87,15 +87,15 @@
   <span id="wsDebugText" class="relative z-10 block px-3 py-1 text-left">0:00 / 0:00</span>
 </div>
 <div class="relative flex-1 min-h-0">
-  <div id="scrollUpWrap" class="hidden absolute inset-x-0 top-2 z-20 justify-center pointer-events-none">
-    <button id="scrollUpBtn" data-action="page-scroll-up" type="button" class="pointer-events-auto px-3 py-1.5 rounded-lg text-xs bg-gray-800/95 hover:bg-gray-700 transition-colors shadow-lg shadow-black/30">Scroll up</button>
+  <div id="scrollUpWrap" class="hidden absolute top-2 justify-center pointer-events-none" style="z-index:5;">
+    <button id="scrollUpBtn" data-action="page-scroll-up" type="button" class="pointer-events-auto px-3 py-1.5 rounded-lg text-xs bg-gray-800/95 hover:bg-gray-700 transition-colors shadow-lg shadow-black/30" title="Jump to top" aria-label="Jump to top">Top</button>
   </div>
 
   <main id="main" class="h-full overflow-y-auto min-h-0"></main>
 </div>
 <div id="chatComposerDock" class="hidden flex-none border-t border-gray-800 bg-gray-900 px-3 py-2 z-10">
   <div id="scrollDownWrap" class="hidden justify-center pb-2">
-    <button id="scrollDownBtn" data-action="chat-scroll-down" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors">Scroll down</button>
+    <button id="scrollDownBtn" data-action="chat-scroll-down" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors" title="Jump to latest" aria-label="Jump to latest">Latest</button>
   </div>
   <div id="timerBar" class="hidden mb-2 px-3 py-2 bg-amber-950/60 border border-amber-800/50 rounded-lg flex gap-2 flex-wrap items-center text-sm"></div>
   <form id="chatComposer" class="flex items-center gap-2">
