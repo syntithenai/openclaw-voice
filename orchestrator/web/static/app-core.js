@@ -11,6 +11,11 @@ const PREF_BROWSER_AUDIO = 'openclaw.ui.browserAudioEnabled';
 const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
 const PREF_MUSIC_QUEUE_FILTER = 'openclaw.ui.musicQueueFilter';
 const PREF_MUSIC_PLAYLIST_FILTER = 'openclaw.ui.musicPlaylistFilter';
+const PREF_CHAT_SEND_MODE = 'openclaw.ui.chatSendMode';
+const PREF_CHAT_VERBOSE_LEVEL = 'openclaw.ui.chatVerboseLevel';
+const PREF_CHAT_REASONING_LEVEL = 'openclaw.ui.chatReasoningLevel';
+const PREF_CHAT_LIFECYCLE_POLICY = 'openclaw.ui.chatLifecyclePolicy';
+const PREF_CHAT_INTERIM_ENABLED = 'openclaw.ui.chatInterimEnabled';
 const BROWSER_AUDIO_LOCK_KEY = 'openclaw.ui.browserAudioOwner';
 const BROWSER_AUDIO_LOCK_LEASE_MS = 4000;
 const BROWSER_AUDIO_LOCK_HEARTBEAT_MS = 1500;
@@ -25,6 +30,15 @@ function isMobileChatViewport(){
     return typeof window !== 'undefined'
         && typeof window.matchMedia === 'function'
         && window.matchMedia(MOBILE_CHAT_BREAKPOINT_QUERY).matches;
+}
+
+function escHtml(value){
+    return String(value||'')
+        .replace(/&/g,'&amp;')
+        .replace(/</g,'&lt;')
+        .replace(/>/g,'&gt;')
+        .replace(/"/g,'&quot;')
+        .replace(/'/g,'&#39;');
 }
 
 const TAB_ID = (() => {
@@ -97,6 +111,23 @@ const S = {
     lastAudioInputCount:null,
     scrollToBottomPending:false,
     autoScrollUntilTs:0,
+    chatSendMode:'queue',
+    chatRunState:'idle',
+    chatActiveRequestId:'',
+    chatQueuedItems:[],
+    chatQueueSeq:1,
+    chatStopPending:false,
+    chatStopTimer:null,
+    chatStatusText:'No active request',
+    chatLastActivityTs:0,
+    chatLastTerminal:{reason:'', ts:0},
+    chatStreamCursorByRequest:{},
+    chatReconcilePendingByRequest:{},
+    pendingChatSteerNowByAction:{},
+    chatVerboseLevel:'off',
+    chatReasoningLevel:'off',
+    chatLifecyclePolicy:'both',
+    chatInterimLifecycleEnabled:true,
     authMode: AUTH_MODE_BOOTSTRAP,
     isAuthenticated: AUTHENTICATED_BOOTSTRAP,
     authUser: AUTH_USER_BOOTSTRAP,
@@ -114,6 +145,108 @@ function hasLoadedMusicPlaylist(){
 
 function hasUnsavedMusicQueue(){
     return !hasLoadedMusicPlaylist() && getMusicQueueLength() > 0;
+}
+
+function normalizeChatSendMode(mode){
+    const value = String(mode||'').trim().toLowerCase();
+    return value === 'steer' ? 'steer' : 'queue';
+}
+
+function normalizeChatVerboseLevel(level){
+    const value = String(level||'').trim().toLowerCase();
+    if(value==='on' || value==='full') return value;
+    return 'off';
+}
+
+function normalizeChatReasoningLevel(level){
+    const value = String(level||'').trim().toLowerCase();
+    if(value==='on' || value==='stream') return value;
+    return 'off';
+}
+
+function normalizeChatLifecyclePolicy(policy){
+    const value = String(policy||'').trim().toLowerCase();
+    if(value==='chat_only' || value==='debug_log_only' || value==='both') return value;
+    return 'both';
+}
+
+function persistChatSendMode(){
+    writeStringPref(PREF_CHAT_SEND_MODE, normalizeChatSendMode(S.chatSendMode));
+}
+
+function restoreChatSendModePref(){
+    S.chatSendMode = normalizeChatSendMode(readStringPref(PREF_CHAT_SEND_MODE, S.chatSendMode));
+}
+
+function inferChatRunState(){
+    const msgs = Array.isArray(S.chat) ? S.chat : [];
+    let latestReqId = '';
+    for(let i=msgs.length-1;i>=0;i--){
+        const rid = String((msgs[i]&&msgs[i].request_id)||'').trim();
+        if(rid){
+            latestReqId = rid;
+            break;
+        }
+    }
+    if(!latestReqId){
+        return {state:'idle', requestId:'', statusText:'No active request', running:false};
+    }
+
+    let hasStream = false;
+    let hasFinal = false;
+    let hasLifecycleStart = false;
+    let hasLifecycleTerminal = false;
+    let hasLifecycleError = false;
+    let hasToolWaiting = false;
+    for(let i=0;i<msgs.length;i++){
+        const msg = msgs[i]||{};
+        const rid = String(msg.request_id||'').trim();
+        if(rid !== latestReqId) continue;
+        const role = String(msg.role||'').toLowerCase();
+        const phase = String(msg.phase||'').toLowerCase();
+        const name = String(msg.name||msg.text||'').toLowerCase();
+        if(role==='assistant'){
+            const seg = String(msg.segment_kind||'final').toLowerCase();
+            if(seg==='stream') hasStream = true;
+            else hasFinal = true;
+            continue;
+        }
+        if(role==='step' || role==='interim'){
+            if(name==='lifecycle' && phase==='start') hasLifecycleStart = true;
+            if(name==='lifecycle' && (phase==='end' || phase==='result')) hasLifecycleTerminal = true;
+            if(name==='lifecycle' && (phase==='error' || phase==='timeout' || phase==='failed')){
+                hasLifecycleTerminal = true;
+                hasLifecycleError = true;
+            }
+            if(role==='step' && name!=='lifecycle'){
+                const terminal = phase==='result' || phase==='end' || phase==='done' || phase==='ok' || phase==='completed' || phase==='error' || phase==='failed' || phase==='cancelled';
+                if(!terminal) hasToolWaiting = true;
+            }
+        }
+    }
+
+    const running = !hasFinal && !hasLifecycleTerminal && (hasStream || hasLifecycleStart || hasToolWaiting);
+    if(running){
+        return {
+            state: hasToolWaiting ? 'waiting_tool' : 'streaming',
+            requestId: latestReqId,
+            statusText: hasToolWaiting ? 'Waiting for tool execution' : 'Streaming response',
+            running: true,
+        };
+    }
+    if(hasLifecycleError){
+        return {state:'failed', requestId:latestReqId, statusText:'Request failed', running:false};
+    }
+    return {state:'completed', requestId:latestReqId, statusText:'Request completed', running:false};
+}
+
+function isChatRunActive(){
+    const inferred = inferChatRunState();
+    return inferred.running;
+}
+
+function canDispatchQueuedChatNow(){
+    return !S.chatStopPending && S.pendingChatSends.size===0 && !isChatRunActive();
 }
 
 function isMusicLoadActionType(actionType){
@@ -882,6 +1015,10 @@ function loadUiPrefs(){
     S.continuousMode = readBoolPref(PREF_CONTINUOUS, false);
     S.musicQueueFilter = readStringPref(PREF_MUSIC_QUEUE_FILTER, '');
     S.musicPlaylistFilter = readStringPref(PREF_MUSIC_PLAYLIST_FILTER, '');
+    S.chatVerboseLevel = normalizeChatVerboseLevel(readStringPref(PREF_CHAT_VERBOSE_LEVEL, S.chatVerboseLevel));
+    S.chatReasoningLevel = normalizeChatReasoningLevel(readStringPref(PREF_CHAT_REASONING_LEVEL, S.chatReasoningLevel));
+    S.chatLifecyclePolicy = normalizeChatLifecyclePolicy(readStringPref(PREF_CHAT_LIFECYCLE_POLICY, S.chatLifecyclePolicy));
+    S.chatInterimLifecycleEnabled = readBoolPref(PREF_CHAT_INTERIM_ENABLED, S.chatInterimLifecycleEnabled);
     syncBrowserAudioLeaseState();
 }
 
@@ -890,30 +1027,61 @@ function pushUiPrefsToServer(){
     if(!S.pendingSettingActions['tts_mute_set']) sendSettingAction('tts_mute_set', !!S.ttsMuted);
     if(!S.pendingSettingActions['browser_audio_set']) sendSettingAction('browser_audio_set', !!S.browserAudioEnabled);
     if(!S.pendingSettingActions['continuous_mode_set']) sendSettingAction('continuous_mode_set', !!S.continuousMode);
+    if(!S.pendingSettingActions['chat_verbose_set']) sendSettingValueAction('chat_verbose_set', normalizeChatVerboseLevel(S.chatVerboseLevel));
+    if(!S.pendingSettingActions['chat_reasoning_set']) sendSettingValueAction('chat_reasoning_set', normalizeChatReasoningLevel(S.chatReasoningLevel));
+    if(!S.pendingSettingActions['chat_lifecycle_policy_set']) sendSettingValueAction('chat_lifecycle_policy_set', normalizeChatLifecyclePolicy(S.chatLifecyclePolicy));
+    if(!S.pendingSettingActions['chat_interim_set']) sendSettingAction('chat_interim_set', !!S.chatInterimLifecycleEnabled);
 }
 
 function applyMicControlToggles(){
         applyToggle(document.getElementById('ttsMuteToggle'), !!S.ttsMuted);
         applyToggle(document.getElementById('browserAudioToggle'), !!S.browserAudioEnabled);
         applyToggle(document.getElementById('continuousModeToggle'), !!S.continuousMode);
+        applyToggle(document.getElementById('chatInterimToggle'), !!S.chatInterimLifecycleEnabled);
     const ttsBtn=document.getElementById('ttsMuteToggle');
     const browserBtn=document.getElementById('browserAudioToggle');
     const contBtn=document.getElementById('continuousModeToggle');
+    const interimBtn=document.getElementById('chatInterimToggle');
+    const verboseBtn=document.getElementById('chatVerboseBtn');
+    const reasoningBtn=document.getElementById('chatReasoningBtn');
+    const lifecycleBtn=document.getElementById('chatLifecyclePolicyBtn');
     const pend=S.pendingSettingActions||{};
     const ttsPending=!!pend['tts_mute_set'];
     const browserPending=!!pend['browser_audio_set'];
     const contPending=!!pend['continuous_mode_set'];
-    [[ttsBtn,ttsPending],[browserBtn,browserPending],[contBtn,contPending]].forEach(([btn,pending])=>{ if(!btn) return; btn.disabled=!!pending; btn.classList.toggle('opacity-60',!!pending); btn.classList.toggle('cursor-not-allowed',!!pending); });
+    const interimPending=!!pend['chat_interim_set'];
+    const verbosePending=!!pend['chat_verbose_set'];
+    const reasoningPending=!!pend['chat_reasoning_set'];
+    const lifecyclePending=!!pend['chat_lifecycle_policy_set'];
+    [[ttsBtn,ttsPending],[browserBtn,browserPending],[contBtn,contPending],[interimBtn,interimPending],[verboseBtn,verbosePending],[reasoningBtn,reasoningPending],[lifecycleBtn,lifecyclePending]].forEach(([btn,pending])=>{ if(!btn) return; btn.disabled=!!pending; btn.classList.toggle('opacity-60',!!pending); btn.classList.toggle('cursor-not-allowed',!!pending); });
     const ttsErr=(S.settingActionErrors&&S.settingActionErrors['tts_mute_set'])?S.settingActionErrors['tts_mute_set'].msg:'';
     const browserErr=(S.settingActionErrors&&S.settingActionErrors['browser_audio_set'])?S.settingActionErrors['browser_audio_set'].msg:'';
     const contErr=(S.settingActionErrors&&S.settingActionErrors['continuous_mode_set'])?S.settingActionErrors['continuous_mode_set'].msg:'';
+    const verboseErr=(S.settingActionErrors&&S.settingActionErrors['chat_verbose_set'])?S.settingActionErrors['chat_verbose_set'].msg:'';
+    const reasoningErr=(S.settingActionErrors&&S.settingActionErrors['chat_reasoning_set'])?S.settingActionErrors['chat_reasoning_set'].msg:'';
+    const lifecycleErr=(S.settingActionErrors&&S.settingActionErrors['chat_lifecycle_policy_set'])?S.settingActionErrors['chat_lifecycle_policy_set'].msg:'';
+    const interimErr=(S.settingActionErrors&&S.settingActionErrors['chat_interim_set'])?S.settingActionErrors['chat_interim_set'].msg:'';
     const browserLockMsg=S.browserAudioBlockedByOtherTab?'Another tab is using browser audio':'';
     const ttsLabel=document.getElementById('ttsMuteLabel');
     const browserLabel=document.getElementById('browserAudioLabel');
     const contLabel=document.getElementById('continuousModeLabel');
+    const verboseLabel=document.getElementById('chatVerboseLabel');
+    const reasoningLabel=document.getElementById('chatReasoningLabel');
+    const lifecycleLabel=document.getElementById('chatLifecyclePolicyLabel');
+    const interimLabel=document.getElementById('chatInterimLabel');
     if(ttsLabel) ttsLabel.textContent='Mute TTS output'+(ttsErr?' ⚠ '+ttsErr:'');
     if(browserLabel) browserLabel.textContent='Browser audio streaming'+(browserErr?' ⚠ '+browserErr:(browserLockMsg?' - '+browserLockMsg:''));
     if(contLabel) contLabel.textContent='Continuous mode'+(contErr?' ⚠ '+contErr:'');
+    if(verboseLabel) verboseLabel.textContent='Verbose'+(verboseErr?' ⚠ '+verboseErr:'');
+    if(reasoningLabel) reasoningLabel.textContent='Reasoning'+(reasoningErr?' ⚠ '+reasoningErr:'');
+    if(lifecycleLabel) lifecycleLabel.textContent='Lifecycle detail'+(lifecycleErr?' ⚠ '+lifecycleErr:'');
+    if(interimLabel) interimLabel.textContent='Interim lifecycle rows'+(interimErr?' ⚠ '+interimErr:'');
+    if(verboseBtn) verboseBtn.textContent = normalizeChatVerboseLevel(S.chatVerboseLevel);
+    if(reasoningBtn) reasoningBtn.textContent = normalizeChatReasoningLevel(S.chatReasoningLevel);
+    if(lifecycleBtn){
+        const policy = normalizeChatLifecyclePolicy(S.chatLifecyclePolicy);
+        lifecycleBtn.textContent = policy==='chat_only' ? 'chat' : (policy==='debug_log_only' ? 'debug' : 'both');
+    }
 }
 
 function formatMusicTime(seconds){
@@ -1025,16 +1193,78 @@ function stopWsPingTimer(){
 function updateChatComposerState(){
     const input=document.getElementById('chatInput');
     const sendBtn=document.getElementById('chatSendBtn');
+    const stopBtn=document.getElementById('chatStopBtn');
+    const modeQueueBtn=document.getElementById('chatModeQueueBtn');
+    const modeSteerBtn=document.getElementById('chatModeSteerBtn');
+    const statusRow=document.getElementById('chatRunStatusRow');
+    const statusChip=document.getElementById('chatRunStatusChip');
+    const statusText=document.getElementById('chatRunStatusText');
+    const statusElapsed=document.getElementById('chatRunElapsed');
+    const queuePanel=document.getElementById('chatQueuePanel');
+    const queueList=document.getElementById('chatQueueList');
+    const queueEmpty=document.getElementById('chatQueueEmpty');
+
+    const inferred = inferChatRunState();
+    S.chatRunState = inferred.state;
+    S.chatActiveRequestId = inferred.requestId;
+    S.chatStatusText = inferred.statusText;
+    const isRunning = inferred.running;
     const isPending=S.pendingChatSends.size>0;
     if(input){
-        input.disabled=isPending;
-        input.placeholder=isPending?'Sending...':'Type a message';
+        input.disabled=isPending || S.chatStopPending;
+        input.placeholder=isPending?'Sending...':(S.chatStopPending?'Stopping...':'Type a message');
     }
     if(sendBtn){
-        sendBtn.disabled=isPending;
+        sendBtn.disabled=isPending || S.chatStopPending;
         sendBtn.classList.toggle('opacity-60',isPending);
         sendBtn.classList.toggle('cursor-not-allowed',isPending);
         sendBtn.textContent=isPending?'Sending...':'Send';
+    }
+    if(stopBtn){
+        const showStop = isRunning || S.chatStopPending;
+        stopBtn.classList.toggle('hidden', !showStop);
+        stopBtn.disabled = S.chatStopPending;
+        stopBtn.textContent = S.chatStopPending ? 'Stopping...' : 'Stop';
+        stopBtn.classList.toggle('opacity-60', S.chatStopPending);
+    }
+    if(modeQueueBtn && modeSteerBtn){
+        const mode = normalizeChatSendMode(S.chatSendMode);
+        modeQueueBtn.className = 'px-2 py-1 rounded text-xs ' + (mode==='queue' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700');
+        modeSteerBtn.className = 'px-2 py-1 rounded text-xs ' + (mode==='steer' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700');
+    }
+    if(statusRow && statusChip && statusText){
+        const hasState = isRunning || S.chatStopPending || S.chatRunState==='failed' || S.chatRunState==='completed';
+        statusRow.classList.toggle('hidden', !hasState);
+        const stateLabel = S.chatStopPending ? 'Stopping' : String(S.chatRunState||'idle').replace('_',' ');
+        const stateKey = S.chatStopPending ? 'stopping' : S.chatRunState;
+        const tone = stateKey==='failed' ? 'bg-red-700' : (stateKey==='completed' ? 'bg-emerald-700' : (stateKey==='waiting_tool' ? 'bg-amber-700' : 'bg-blue-700'));
+        statusChip.className = 'inline-flex items-center px-2 py-0.5 rounded-full text-gray-100 ' + tone;
+        statusChip.textContent = stateLabel.charAt(0).toUpperCase() + stateLabel.slice(1);
+        statusText.textContent = S.chatStatusText || 'No active request';
+        if(statusElapsed){
+            const baseTs = Number(S.chatLastActivityTs||0);
+            const elapsedSec = baseTs>0 ? Math.max(0, Math.floor((Date.now()-baseTs)/1000)) : 0;
+            const mm = Math.floor(elapsedSec/60);
+            const ss = elapsedSec % 60;
+            statusElapsed.textContent = (isRunning || S.chatStopPending) ? (String(mm)+':' + String(ss).padStart(2,'0')) : '';
+            statusElapsed.classList.toggle('hidden', !(isRunning || S.chatStopPending));
+        }
+    }
+    if(queuePanel && queueList && queueEmpty){
+        const items = Array.isArray(S.chatQueuedItems) ? S.chatQueuedItems : [];
+        queuePanel.classList.toggle('hidden', items.length===0);
+        queueEmpty.classList.toggle('hidden', items.length!==0);
+        queueList.innerHTML = items.map((item)=>{
+            const id = String(item && item.id || '');
+            const mode = normalizeChatSendMode(item && item.mode || 'queue');
+            const text = String(item && item.text || '');
+            return '<div class="flex items-center gap-2 text-xs bg-gray-900/60 border border-gray-700 rounded px-2 py-1">'
+                +'<span class="px-1.5 py-0.5 rounded bg-gray-700 text-gray-200 uppercase">'+escHtml(mode)+'</span>'
+                +'<span class="flex-1 text-gray-200 truncate" title="'+escHtml(text)+'">'+escHtml(text)+'</span>'
+                +'<button type="button" data-action="chat-queue-steer-now" data-queue-id="'+escHtml(id)+'" class="px-1.5 py-0.5 rounded bg-sky-800 hover:bg-sky-700">Up</button>'
+                +'<button type="button" data-action="chat-queue-remove" data-queue-id="'+escHtml(id)+'" class="px-1.5 py-0.5 rounded bg-gray-700 hover:bg-gray-600">Remove</button>'
+            +'</div>';
+        }).join('');
     }
 }
 

@@ -18,7 +18,16 @@ function appendSandboxTaskLog(msg){
         stream:String(msg.stream||'stdout'),
         lines:Array.isArray(msg.lines)?msg.lines:[String(msg.lines||'')],
     };
-    S.sandboxTaskLogEntriesById[taskId].push(entry);
+    const bucket=S.sandboxTaskLogEntriesById[taskId];
+    const seqKey=Number(entry.seq||0);
+    if(seqKey>0){
+        const dupIdx=bucket.findIndex((item)=>Number((item&&item.seq)||0)===seqKey && String((item&&item.stream)||'')===entry.stream);
+        if(dupIdx>=0) bucket[dupIdx]=entry;
+        else bucket.push(entry);
+        bucket.sort((a,b)=>Number((a&&a.seq)||0)-Number((b&&b.seq)||0));
+    }else{
+        bucket.push(entry);
+    }
     if(S.sandboxTaskLogEntriesById[taskId].length>400) S.sandboxTaskLogEntriesById[taskId]=S.sandboxTaskLogEntriesById[taskId].slice(-400);
 }
 
@@ -27,8 +36,64 @@ function appendSubagentThinking(msg){
     if(!runId) return;
     if(!S.subagentThinkingEntriesById[runId]) S.subagentThinkingEntriesById[runId]=[];
     const entry={seq:Number(msg.seq||0), text_delta:String(msg.text_delta||'')};
-    S.subagentThinkingEntriesById[runId].push(entry);
+    const bucket=S.subagentThinkingEntriesById[runId];
+    const seqKey=Number(entry.seq||0);
+    if(seqKey>0){
+        const dupIdx=bucket.findIndex((item)=>Number((item&&item.seq)||0)===seqKey);
+        if(dupIdx>=0) bucket[dupIdx]=entry;
+        else bucket.push(entry);
+        bucket.sort((a,b)=>Number((a&&a.seq)||0)-Number((b&&b.seq)||0));
+    }else{
+        bucket.push(entry);
+    }
     if(S.subagentThinkingEntriesById[runId].length>400) S.subagentThinkingEntriesById[runId]=S.subagentThinkingEntriesById[runId].slice(-400);
+}
+
+function acceptChatFrame(msg){
+    if(!msg || typeof msg!=='object') return true;
+    const rid = String(msg.request_id||'').trim();
+    if(!rid) return true;
+    const seq = Number(msg.stream_seq||0);
+    const generation = Number(msg.request_generation||0);
+    if(!S.chatStreamCursorByRequest || typeof S.chatStreamCursorByRequest!=='object') S.chatStreamCursorByRequest = {};
+    const prev = S.chatStreamCursorByRequest[rid] || {generation:0, seq:0};
+    const next = {generation:Number(prev.generation||0), seq:Number(prev.seq||0)};
+
+    if(Number.isFinite(generation) && generation > 0){
+        if(next.generation > 0 && generation < next.generation) return false;
+        if(generation > next.generation){
+            next.generation = generation;
+            next.seq = 0;
+        }
+    }
+
+    if(Number.isFinite(seq) && seq > 0){
+        if(next.seq > 0 && seq > (next.seq + 1)){
+            const pending = !!(S.chatReconcilePendingByRequest && S.chatReconcilePendingByRequest[rid]);
+            if(!pending && typeof sendAction==='function'){
+                S.chatReconcilePendingByRequest[rid] = true;
+                sendAction({type:'chat_request_reconcile', request_id:rid, last_seq:next.seq});
+            }
+            return false;
+        }
+        if(seq <= next.seq) return false;
+        next.seq = seq;
+    }
+    S.chatStreamCursorByRequest[rid] = next;
+    return true;
+}
+
+function applyRecoveredChatMessages(messages){
+    if(!Array.isArray(messages)) return;
+    messages.forEach((raw)=>{
+        const msg = normalizeChatMessage(raw);
+        if(!msg || !acceptChatFrame(msg)) return;
+        const idx = S.chat.findIndex((m)=>String((m&&m.id)||'')===String(msg.id||''));
+        if(idx>=0) S.chat[idx]=msg;
+        else S.chat.push(msg);
+    });
+    persistChatCache();
+    if(S.page==='home') renderChatMessages('active');
 }
 
 function handleMsg(msg){
@@ -120,6 +185,7 @@ function handleMsg(msg){
             if(msg.message){
                 applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
                 const nextMsg = normalizeChatMessage(msg.message);
+                if(nextMsg && !acceptChatFrame(nextMsg)) break;
                 let suppressReloadUserEcho=false;
                 const reloadRun=S.chatReloadInFlight;
                 if(nextMsg && nextMsg.role==='user' && reloadRun && !reloadRun.userEchoSuppressed){
@@ -172,6 +238,7 @@ function handleMsg(msg){
                     }
                 }
             }
+            if(typeof processQueuedChatDispatch==='function') processQueuedChatDispatch();
             break;
         case 'sandbox_exec_update':
             if(msg.task){
@@ -218,6 +285,7 @@ function handleMsg(msg){
             if(msg.message){
                 applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
                 const updatedMsg = normalizeChatMessage(msg.message);
+                if(updatedMsg && !acceptChatFrame(updatedMsg)) break;
                 if(updatedMsg && updatedMsg.id){
                     // Find and replace message with same ID
                     const idx = S.chat.findIndex(m => m.id === updatedMsg.id);
@@ -254,6 +322,7 @@ function handleMsg(msg){
                 }
                 persistChatCache();
             }
+            if(typeof processQueuedChatDispatch==='function') processQueuedChatDispatch();
             break;
 
         case 'chat_threads_update':
@@ -269,7 +338,78 @@ function handleMsg(msg){
         case 'chat_text_ack':
             if(msg.client_msg_id) S.pendingChatSends.delete(String(msg.client_msg_id));
             if(msg.ok===false) S.chatReloadInFlight=null;
+            if(msg.ok===false) S.chatStopPending=false;
             if(S.page==='home') updateChatComposerState();
+            if(typeof processQueuedChatDispatch==='function') processQueuedChatDispatch();
+            break;
+        case 'chat_stop_ack':
+            if(S.chatStopTimer){
+                clearTimeout(S.chatStopTimer);
+                S.chatStopTimer = null;
+            }
+            S.chatStopPending = false;
+            S.chatQueuedItems = [];
+            updateChatComposerState();
+            break;
+        case 'chat_stop_error':
+            if(S.chatStopTimer){
+                clearTimeout(S.chatStopTimer);
+                S.chatStopTimer = null;
+            }
+            S.chatStopPending = false;
+            recordInlineError('setting', 'chat_stop', String(msg.error||'Failed to stop chat'));
+            updateChatComposerState();
+            break;
+        case 'chat_queue_update':
+            if(Array.isArray(msg.items)) S.chatQueuedItems = msg.items.slice();
+            updateChatComposerState();
+            break;
+        case 'chat_steer_ack':
+            if(msg.action_id && S.pendingChatSteerNowByAction) delete S.pendingChatSteerNowByAction[String(msg.action_id)];
+            updateChatComposerState();
+            break;
+        case 'chat_steer_error': {
+            const actionId = String(msg.action_id||'').trim();
+            const pending = actionId && S.pendingChatSteerNowByAction ? S.pendingChatSteerNowByAction[actionId] : null;
+            if(actionId && S.pendingChatSteerNowByAction) delete S.pendingChatSteerNowByAction[actionId];
+            if(pending && String(pending.text||'').trim()){
+                if(!Array.isArray(S.chatQueuedItems)) S.chatQueuedItems=[];
+                S.chatQueuedItems.unshift({
+                    id: String(pending.queueId||('q' + (S.chatQueueSeq++))),
+                    text: String(pending.text||'').trim(),
+                    mode: 'steer',
+                    createdTs: Number(pending.ts||Date.now()),
+                });
+            }
+            recordInlineError('setting', 'chat_steer_now', String(msg.error||'Failed to steer now'));
+            updateChatComposerState();
+            break;
+        }
+        case 'chat_run_state': {
+            const state = String(msg.state||'').trim().toLowerCase();
+            const rid = String(msg.request_id||'').trim();
+            const reason = String(msg.reason||'').trim();
+            if(rid) S.chatActiveRequestId = rid;
+            if(state){
+                if(state==='in_progress') S.chatRunState='streaming';
+                else S.chatRunState=state;
+            }
+            if(state==='streaming' || state==='in_progress' || state==='waiting_tool'){
+                if(!Number(S.chatLastActivityTs||0)) S.chatLastActivityTs = Date.now();
+            }
+            if(reason) S.chatStatusText = reason;
+            if(state==='completed' || state==='failed' || state==='superseded' || state==='cancelled'){
+                S.chatStopPending = false;
+            }
+            if(S.page==='home') updateChatComposerState();
+            break;
+        }
+        case 'chat_reconcile_snapshot':
+            if(msg.request_id && S.chatReconcilePendingByRequest) delete S.chatReconcilePendingByRequest[String(msg.request_id)];
+            applyRecoveredChatMessages(msg.messages);
+            break;
+        case 'chat_stream_replay':
+            applyRecoveredChatMessages(msg.messages);
             break;
         case 'navigate':
             if(msg.page==='music' || msg.page==='home' || msg.page==='recordings'){

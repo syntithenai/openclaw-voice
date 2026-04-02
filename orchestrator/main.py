@@ -677,9 +677,15 @@ async def run_orchestrator() -> None:
     suppress_gateway_messages_for_new_session = False
     gateway_collation_open = False
     gateway_collation_active_request_id = 0
+    gateway_collation_active_generation = 0
     gateway_collation_last_frame_ts: float | None = None
     gateway_collation_close_task: asyncio.Task | None = None
     dropped_out_of_window_gateway_frames = 0
+    request_generation_counter = 0
+    request_generation_by_id: dict[int, int] = {}
+    ui_stream_seq_by_request_id: dict[int, int] = {}
+    terminal_winner_by_request_gen: dict[str, str] = {}
+    stale_frame_dropped_count = 0
     last_user_text = ""
     last_user_accepted_ts: float | None = None
     last_user_went_upstream = False
@@ -2020,6 +2026,29 @@ async def run_orchestrator() -> None:
                 flush=True,
             )
 
+            web_chat_verbose_level = "off"
+            web_chat_reasoning_level = "off"
+            web_chat_lifecycle_policy = "both"
+            web_chat_interim_enabled = True
+
+            def _normalize_chat_verbose_level(value: str) -> str:
+                v = str(value or "").strip().lower()
+                return v if v in {"off", "on", "full"} else "off"
+
+            def _normalize_chat_reasoning_level(value: str) -> str:
+                v = str(value or "").strip().lower()
+                return v if v in {"off", "on", "stream"} else "off"
+
+            def _normalize_lifecycle_policy(value: str) -> str:
+                v = str(value or "").strip().lower()
+                return v if v in {"chat_only", "debug_log_only", "both"} else "both"
+
+            def _chat_detail_enabled() -> bool:
+                return web_chat_lifecycle_policy in {"chat_only", "both"}
+
+            def _debug_log_enabled() -> bool:
+                return web_chat_lifecycle_policy in {"debug_log_only", "both"}
+
             # Register web UI action handlers
             async def _ui_mic_toggle(client_id: str) -> None:
                 nonlocal wake_state, state, wake_sleep_ts, last_wake_detected_ts, last_activity_ts
@@ -2490,6 +2519,92 @@ async def run_orchestrator() -> None:
                     debounce_task.cancel()
                 debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=True))
 
+            async def _ui_chat_steer_now(text: str, queue_item_id: str, client_id: str) -> None:
+                nonlocal pending_transcripts, debounce_task, processing_request
+                normalized = normalize_transcript(text)
+                if not normalized:
+                    return
+                logger.info(
+                    "💬 Web UI steer-now from %s (queue_item_id=%s): '%s'",
+                    client_id,
+                    queue_item_id,
+                    normalized[:120],
+                )
+                pending_transcripts.clear()
+                if debounce_task and not debounce_task.done():
+                    debounce_task.cancel()
+                debounce_task = None
+
+                active_req = int(gateway_collation_active_request_id or 0)
+                if active_req > 0:
+                    supersede_gen = _next_request_generation()
+                    request_generation_by_id[active_req] = supersede_gen
+                    terminal_winner_by_request_gen[_terminal_key(active_req, supersede_gen)] = "superseded"
+                    _emit_chat_run_state(
+                        active_req,
+                        supersede_gen,
+                        "superseded",
+                        reason="chat_steer_now",
+                        winning_signal="chat_steer_now",
+                    )
+                _force_close_gateway_collation_window("chat_steer_now")
+                processing_request = False
+
+                if not enqueue_pending_transcript(normalized, ""):
+                    return
+                debounce_task = asyncio.create_task(send_debounced_transcripts(immediate=True))
+
+            async def _ui_chat_stop(client_id: str) -> None:
+                nonlocal pending_transcripts, debounce_task, processing_request
+                logger.info("💬 Web UI chat stop requested by %s", client_id)
+                pending_count = len(pending_transcripts)
+                pending_transcripts.clear()
+                if debounce_task and not debounce_task.done():
+                    debounce_task.cancel()
+                debounce_task = None
+                active_req = int(gateway_collation_active_request_id or 0)
+                if active_req > 0:
+                    supersede_gen = _next_request_generation()
+                    request_generation_by_id[active_req] = supersede_gen
+                    terminal_winner_by_request_gen[_terminal_key(active_req, supersede_gen)] = "superseded"
+                    _emit_chat_run_state(
+                        active_req,
+                        supersede_gen,
+                        "superseded",
+                        reason="chat_stop",
+                        winning_signal="chat_stop",
+                    )
+                    logger.info(
+                        "💬 Superseded active run [req#%d -> gen#%d] from chat_stop",
+                        active_req,
+                        supersede_gen,
+                    )
+                _force_close_gateway_collation_window("chat_stop")
+                # Best-effort local stop: clears queued transcripts and prevents immediate dispatch.
+                # In-flight gateway work may still complete if provider-side abort is unavailable.
+                processing_request = False
+                logger.info("💬 Chat stop applied (cleared_pending=%d)", pending_count)
+
+            async def _ui_chat_verbose_set(value: str, client_id: str) -> None:
+                nonlocal web_chat_verbose_level
+                web_chat_verbose_level = _normalize_chat_verbose_level(value)
+
+            async def _ui_chat_reasoning_set(value: str, client_id: str) -> None:
+                nonlocal web_chat_reasoning_level
+                web_chat_reasoning_level = _normalize_chat_reasoning_level(value)
+                session_key = f"agent:{agent_id}:{session_id}"
+                if hasattr(gateway, "patch_session"):
+                    patch_value = None if web_chat_reasoning_level == "off" else web_chat_reasoning_level
+                    await gateway.patch_session(session_key, reasoningLevel=patch_value)
+
+            async def _ui_chat_lifecycle_policy_set(value: str, client_id: str) -> None:
+                nonlocal web_chat_lifecycle_policy
+                web_chat_lifecycle_policy = _normalize_lifecycle_policy(value)
+
+            async def _ui_chat_interim_set(enabled: bool, client_id: str) -> None:
+                nonlocal web_chat_interim_enabled
+                web_chat_interim_enabled = bool(enabled)
+
             async def _ui_recordings_list(client_id: str) -> list[dict[str, Any]]:
                 if not recordings_catalog:
                     return []
@@ -2546,6 +2661,12 @@ async def run_orchestrator() -> None:
                 on_alarm_cancel=_ui_alarm_cancel,
                 on_chat_new=_ui_chat_new,
                 on_chat_text=_ui_chat_text,
+                on_chat_steer_now=_ui_chat_steer_now,
+                on_chat_stop=_ui_chat_stop,
+                on_chat_verbose_set=_ui_chat_verbose_set,
+                on_chat_reasoning_set=_ui_chat_reasoning_set,
+                on_chat_lifecycle_policy_set=_ui_chat_lifecycle_policy_set,
+                on_chat_interim_set=_ui_chat_interim_set,
                 on_tts_mute_set=_ui_tts_mute_set,
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,
@@ -3003,13 +3124,87 @@ async def run_orchestrator() -> None:
             )
         )
 
-    def _active_gateway_collation_request_id() -> int:
+    def _next_request_generation() -> int:
+        nonlocal request_generation_counter
+        request_generation_counter += 1
+        return request_generation_counter
+
+    def _bind_request_generation(request_id: int) -> int:
+        if request_id <= 0:
+            return 0
+        gen = _next_request_generation()
+        request_generation_by_id[int(request_id)] = gen
+        return gen
+
+    def _active_gateway_collation_context() -> tuple[int, int]:
         if gateway_collation_open and gateway_collation_active_request_id > 0:
-            return gateway_collation_active_request_id
-        return 0
+            return gateway_collation_active_request_id, gateway_collation_active_generation
+        return 0, 0
+
+    def _next_stream_seq(request_id: int) -> int:
+        if request_id <= 0:
+            return 0
+        seq = int(ui_stream_seq_by_request_id.get(int(request_id), 0)) + 1
+        ui_stream_seq_by_request_id[int(request_id)] = seq
+        return seq
+
+    def _terminal_key(request_id: int, generation: int) -> str:
+        return f"{int(request_id)}:{int(generation)}"
+
+    def _emit_chat_run_state(
+        request_id: int,
+        generation: int,
+        state: str,
+        *,
+        reason: str = "",
+        winning_signal: str = "",
+    ) -> None:
+        if not web_service or request_id <= 0:
+            return
+        payload: dict[str, Any] = {
+            "type": "chat_run_state",
+            "request_id": int(request_id),
+            "request_generation": int(generation),
+            "state": str(state or "").strip().lower() or "in_progress",
+            "event_ts": time.time(),
+        }
+        if reason:
+            payload["reason"] = reason
+        if winning_signal:
+            payload["winning_signal_type"] = winning_signal
+        asyncio.create_task(web_service.broadcast(payload))
+
+    def _register_terminal_winner(request_id: int, generation: int, classification: str) -> bool:
+        key = _terminal_key(request_id, generation)
+        if key in terminal_winner_by_request_gen:
+            return False
+        terminal_winner_by_request_gen[key] = classification
+        if len(terminal_winner_by_request_gen) > 128:
+            stale_keys = sorted(terminal_winner_by_request_gen.keys())[:-64]
+            for stale_key in stale_keys:
+                terminal_winner_by_request_gen.pop(stale_key, None)
+        return True
+
+    def _frame_generation(payload: dict[str, Any], request_id: int, fallback_generation: int) -> int:
+        raw = payload.get("request_generation") if isinstance(payload, dict) else None
+        if raw is None and isinstance(payload, dict):
+            raw = payload.get("generation")
+        if raw is None and isinstance(payload, dict):
+            raw = payload.get("requestGeneration")
+        try:
+            if raw is not None:
+                parsed = int(raw)
+                if parsed > 0:
+                    return parsed
+        except Exception:
+            pass
+        bound = int(request_generation_by_id.get(int(request_id), 0)) if request_id > 0 else 0
+        if bound > 0:
+            return bound
+        return int(fallback_generation)
 
     def _force_close_gateway_collation_window(reason: str) -> None:
-        nonlocal gateway_collation_open, gateway_collation_active_request_id
+        nonlocal gateway_collation_open, gateway_collation_active_request_id, gateway_collation_active_generation
         nonlocal gateway_collation_last_frame_ts, gateway_collation_close_task
         if gateway_collation_close_task and not gateway_collation_close_task.done():
             gateway_collation_close_task.cancel()
@@ -3021,10 +3216,11 @@ async def run_orchestrator() -> None:
             )
         gateway_collation_open = False
         gateway_collation_active_request_id = 0
+        gateway_collation_active_generation = 0
         gateway_collation_last_frame_ts = None
 
-    def _open_gateway_collation_window(request_id: int) -> None:
-        nonlocal gateway_collation_open, gateway_collation_active_request_id
+    def _open_gateway_collation_window(request_id: int, generation: int) -> None:
+        nonlocal gateway_collation_open, gateway_collation_active_request_id, gateway_collation_active_generation
         nonlocal gateway_collation_last_frame_ts, gateway_collation_close_task
         if request_id <= 0:
             return
@@ -3032,10 +3228,11 @@ async def run_orchestrator() -> None:
             gateway_collation_close_task.cancel()
         gateway_collation_open = True
         gateway_collation_active_request_id = int(request_id)
+        gateway_collation_active_generation = int(max(0, generation))
         gateway_collation_last_frame_ts = time.monotonic()
-        logger.info("🧩 Opened gateway collation window [req#%d]", request_id)
+        logger.info("🧩 Opened gateway collation window [req#%d gen#%d]", request_id, gateway_collation_active_generation)
 
-    def _touch_gateway_collation_window(request_id: int) -> bool:
+    def _touch_gateway_collation_window(request_id: int, generation: int) -> bool:
         nonlocal gateway_collation_last_frame_ts
         if request_id <= 0:
             return False
@@ -3043,10 +3240,12 @@ async def run_orchestrator() -> None:
             return False
         if gateway_collation_active_request_id != int(request_id):
             return False
+        if generation > 0 and gateway_collation_active_generation > 0 and gateway_collation_active_generation != int(generation):
+            return False
         gateway_collation_last_frame_ts = time.monotonic()
         return True
 
-    def _schedule_gateway_collation_close(request_id: int, reason: str, delay_s: float = 1.5) -> None:
+    def _schedule_gateway_collation_close(request_id: int, generation: int, reason: str, delay_s: float = 1.5) -> None:
         nonlocal gateway_collation_close_task
         if request_id <= 0:
             return
@@ -3054,16 +3253,21 @@ async def run_orchestrator() -> None:
             gateway_collation_close_task.cancel()
 
         async def _close_later() -> None:
-            nonlocal gateway_collation_open, gateway_collation_active_request_id, gateway_collation_last_frame_ts
+            nonlocal gateway_collation_open, gateway_collation_active_request_id, gateway_collation_active_generation, gateway_collation_last_frame_ts
             try:
                 await asyncio.sleep(max(0.0, float(delay_s)))
             except asyncio.CancelledError:
                 return
-            if gateway_collation_open and gateway_collation_active_request_id == int(request_id):
+            if (
+                gateway_collation_open
+                and gateway_collation_active_request_id == int(request_id)
+                and (generation <= 0 or gateway_collation_active_generation == int(generation))
+            ):
                 gateway_collation_open = False
                 gateway_collation_active_request_id = 0
+                gateway_collation_active_generation = 0
                 gateway_collation_last_frame_ts = None
-                logger.info("🧩 Closed gateway collation window [req#%d] (%s)", request_id, reason)
+                logger.info("🧩 Closed gateway collation window [req#%d gen#%d] (%s)", request_id, generation, reason)
 
         gateway_collation_close_task = asyncio.create_task(_close_later())
 
@@ -3330,7 +3534,8 @@ async def run_orchestrator() -> None:
             nonlocal current_request_id, startup_phase_active
             current_request_id += 1
             _force_close_gateway_collation_window("new user message")
-            logger.info("📍 New user message [req#%d]", current_request_id)
+            req_generation = _bind_request_generation(current_request_id)
+            logger.info("📍 New user message [req#%d gen#%d]", current_request_id, req_generation)
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
             is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
             _safe_update_or_append_chat_message(
@@ -3740,7 +3945,15 @@ async def run_orchestrator() -> None:
                 last_user_went_upstream = True
                 gw_start = time.monotonic()
                 req_for_gateway = current_request_id
-                _open_gateway_collation_window(req_for_gateway)
+                req_generation = int(request_generation_by_id.get(req_for_gateway, 0) or _bind_request_generation(req_for_gateway))
+                _open_gateway_collation_window(req_for_gateway, req_generation)
+                _emit_chat_run_state(
+                    req_for_gateway,
+                    req_generation,
+                    "streaming",
+                    reason="gateway_dispatch",
+                    winning_signal="gateway_dispatch",
+                )
                 response_text: str | None = None
                 response_error_text = ""
                 try:
@@ -3858,6 +4071,9 @@ async def run_orchestrator() -> None:
                         "tts_text": spoken_text,
                         "source": "gateway",
                         "request_id": req_for_gateway,
+                        "request_generation": int(req_generation),
+                        "stream_seq": _next_stream_seq(req_for_gateway),
+                        "event_ts": time.time(),
                         "segment_kind": "final",
                     }
                     if response_error_text:
@@ -3886,10 +4102,27 @@ async def run_orchestrator() -> None:
                     last_activity_ts = time.monotonic()
                 _schedule_gateway_collation_close(
                     req_for_gateway,
+                    req_generation,
                     reason="gateway_send_complete",
                     # Keep this longer than gateway listener flush delay (5s).
                     delay_s=6.5,
                 )
+                if response_error_text:
+                    _emit_chat_run_state(
+                        req_for_gateway,
+                        req_generation,
+                        "failed",
+                        reason=response_error_text[:160],
+                        winning_signal="gateway_send_error",
+                    )
+                else:
+                    _emit_chat_run_state(
+                        req_for_gateway,
+                        req_generation,
+                        "completed",
+                        reason="gateway_send_complete",
+                        winning_signal="assistant_final",
+                    )
         finally:
             _push_schedule_state_now("request_complete")
             # Always clear processing flag
@@ -4512,7 +4745,7 @@ async def run_orchestrator() -> None:
                 current_tts_duration_s = 0.0
 
     async def gateway_listener() -> None:
-        nonlocal dropped_out_of_window_gateway_frames
+        nonlocal dropped_out_of_window_gateway_frames, stale_frame_dropped_count
         buffer = ""
         flush_task: asyncio.Task | None = None
         flush_delay_s = 5.0
@@ -4529,7 +4762,7 @@ async def run_orchestrator() -> None:
             "streaming sentence chunks" if tts_streaming_enabled else "single final response with summarization",
         )
 
-        def _push_ui_stream_chunk(request_id: int, chunk_text: str) -> None:
+        def _push_ui_stream_chunk(request_id: int, request_generation: int, chunk_text: str) -> None:
             if not web_service or request_id <= 0:
                 return
             if not chunk_text:
@@ -4554,6 +4787,9 @@ async def run_orchestrator() -> None:
                 "text": stream_state["text"],
                 "source": "gateway_stream",
                 "request_id": request_id,
+                "request_generation": int(request_generation),
+                "stream_seq": _next_stream_seq(request_id),
+                "event_ts": time.time(),
                 "segment_kind": "stream",
             }
             if hasattr(web_service, "upsert_chat_message"):
@@ -4600,13 +4836,37 @@ async def run_orchestrator() -> None:
             if hasattr(web_service, "append_subagent_thinking"):
                 web_service.append_subagent_thinking(f"req-{int(request_id)}", text_delta)
 
+        def _payload_get(payload: dict[str, Any], *keys: str) -> Any:
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else None
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else None
+            for key in keys:
+                if key in payload:
+                    value = payload.get(key)
+                    if value not in (None, ""):
+                        return value
+            if isinstance(details, dict):
+                for key in keys:
+                    if key in details:
+                        value = details.get(key)
+                        if value not in (None, ""):
+                            return value
+            if isinstance(result, dict):
+                for key in keys:
+                    if key in result:
+                        value = result.get(key)
+                        if value not in (None, ""):
+                            return value
+            return None
+
         def _looks_like_sandbox_exec(name: str, payload: dict[str, Any]) -> bool:
             lname = str(name or "").strip().lower()
             if lname in {"bash", "exec", "run_in_terminal", "terminal", "command"}:
                 return True
             if "exec" in lname or "terminal" in lname or "bash" in lname:
                 return True
-            host = str(payload.get("host") or payload.get("execHost") or payload.get("execution_host") or "").strip().lower()
+            host = str(
+                _payload_get(payload, "exec_host", "execHost", "host", "execution_host") or ""
+            ).strip().lower()
             return host in {"sandbox", "docker"}
 
         def _publish_sandbox_exec_event(request_id: int, name: str, phase: str, payload: dict[str, Any]) -> None:
@@ -4614,16 +4874,30 @@ async def run_orchestrator() -> None:
                 return
             if not _looks_like_sandbox_exec(name, payload):
                 return
+            exec_id = str(
+                _payload_get(payload, "exec_id", "execId", "sessionId", "tool_call_id", "toolCallId")
+                or ""
+            ).strip()
+            tool_call_id = str(_payload_get(payload, "tool_call_id", "toolCallId") or "").strip()
+            exec_host = str(
+                _payload_get(payload, "exec_host", "execHost", "host", "execution_host") or ""
+            ).strip().lower()
             task_id = str(
-                payload.get("task_id")
-                or payload.get("exec_id")
-                or payload.get("tool_call_id")
-                or payload.get("toolCallId")
+                _payload_get(payload, "task_id", "exec_id", "execId", "sessionId", "tool_call_id", "toolCallId")
                 or f"exec-{int(request_id)}"
             ).strip()
-            container_id = str(payload.get("container_id") or payload.get("containerId") or "").strip()
-            container_name = str(payload.get("container_name") or payload.get("containerName") or "").strip()
-            cmd_preview = _payload_short_text(payload.get("command") or payload.get("cmd") or payload.get("args") or name, limit=140)
+            container_id = str(_payload_get(payload, "container_id", "containerId") or "").strip()
+            container_name = str(_payload_get(payload, "container_name", "containerName") or "").strip()
+            container_workdir = str(
+                _payload_get(payload, "container_workdir", "containerWorkdir") or ""
+            ).strip()
+            metadata_quality = str(_payload_get(payload, "metadata_quality", "metadataQuality") or "").strip().lower()
+            if metadata_quality not in {"native", "synthetic"}:
+                metadata_quality = "native" if (container_id or container_name or exec_host in {"sandbox", "docker"}) else "synthetic"
+            cmd_preview = _payload_short_text(
+                _payload_get(payload, "command", "cmd", "args") or name,
+                limit=140,
+            )
             status = str(phase or "running").strip().lower()
             if status in {"result", "end", "done", "ok", "complete", "completed"}:
                 status = "completed"
@@ -4641,22 +4915,31 @@ async def run_orchestrator() -> None:
                         "request_id": int(request_id),
                         "container_id": container_id,
                         "container_name": container_name,
-                        "exec_id": str(payload.get("exec_id") or payload.get("tool_call_id") or payload.get("toolCallId") or "").strip(),
+                        "container_workdir": container_workdir,
+                        "exec_host": exec_host,
+                        "exec_id": exec_id,
+                        "tool_call_id": tool_call_id,
                         "command": cmd_preview,
                         "status": status,
-                        "exit_code": payload.get("exit_code") or payload.get("exitCode"),
-                        "metadata_quality": "native" if (container_id or container_name) else "synthetic",
+                        "exit_code": _payload_get(payload, "exit_code", "exitCode"),
+                        "metadata_quality": metadata_quality,
                     }
                 )
             if hasattr(web_service, "append_sandbox_exec_log"):
-                stdout_text = _payload_short_text(payload.get("stdout") or payload.get("output"), limit=1200)
-                stderr_text = _payload_short_text(payload.get("stderr") or payload.get("error"), limit=1200)
+                stdout_text = _payload_short_text(
+                    _payload_get(payload, "stdout", "output"),
+                    limit=1200,
+                )
+                stderr_text = _payload_short_text(
+                    _payload_get(payload, "stderr", "error"),
+                    limit=1200,
+                )
                 if stdout_text:
-                    web_service.append_sandbox_exec_log(task_id, stdout_text, exec_id=str(payload.get("exec_id") or ""), stream="stdout")
+                    web_service.append_sandbox_exec_log(task_id, stdout_text, exec_id=exec_id, stream="stdout")
                 if stderr_text:
-                    web_service.append_sandbox_exec_log(task_id, stderr_text, exec_id=str(payload.get("exec_id") or ""), stream="stderr")
+                    web_service.append_sandbox_exec_log(task_id, stderr_text, exec_id=exec_id, stream="stderr")
 
-        def _extract_structured_event(payload: dict[str, Any], request_id: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
+        def _extract_structured_event(payload: dict[str, Any], request_id: int, request_generation: int) -> tuple[dict[str, Any] | None, dict[str, Any] | None, bool]:
             event_type = str(payload.get("event") or payload.get("type") or "").strip().lower()
             phase = str(payload.get("phase") or payload.get("status") or payload.get("event") or payload.get("type") or "update")
             tool_call_id = payload.get("tool_call_id") or payload.get("toolCallId") or payload.get("call_id") or payload.get("callId")
@@ -4672,6 +4955,12 @@ async def run_orchestrator() -> None:
                 return None, None, False
 
             details_json = json.dumps(payload, ensure_ascii=False)
+            if web_chat_verbose_level == "full":
+                details_for_chat = details_json
+            elif web_chat_verbose_level == "on":
+                details_for_chat = _payload_short_text(payload, limit=1600)
+            else:
+                details_for_chat = ""
             req_id = int(request_id)
 
             if is_tool_event:
@@ -4684,8 +4973,11 @@ async def run_orchestrator() -> None:
                     "name": name,
                     "phase": phase,
                     "request_id": req_id,
+                    "request_generation": int(request_generation),
+                    "stream_seq": _next_stream_seq(req_id),
+                    "event_ts": time.time(),
                     "tool_call_id": str(tool_call_id or ""),
-                    "details": details_json,
+                    "details": details_for_chat,
                     "source": "gateway_stream",
                 }
                 summary_raw = (
@@ -4705,6 +4997,9 @@ async def run_orchestrator() -> None:
                         "text": name,
                         "phase": phase,
                         "request_id": req_id,
+                        "request_generation": int(request_generation),
+                        "stream_seq": _next_stream_seq(req_id),
+                        "event_ts": time.time(),
                         "details": json.dumps({"text": summary}, ensure_ascii=False),
                         "source": "gateway_stream",
                     }
@@ -4715,15 +5010,34 @@ async def run_orchestrator() -> None:
             if str(event_type).lower() == "reasoning":
                 _publish_subagent_thinking(request_id, _payload_short_text(payload.get("text") or payload.get("content") or payload.get("details") or payload, limit=1200) + "\n")
             if str(label).lower() == "lifecycle" and str(phase).lower() in {"end", "result"}:
-                _publish_subagent_update(request_id, status="completed", step="done", summary="Lifecycle completed")
+                if _register_terminal_winner(request_id, request_generation, "terminal_success"):
+                    _publish_subagent_update(request_id, status="completed", step="done", summary="Lifecycle completed")
+                    _emit_chat_run_state(
+                        request_id,
+                        request_generation,
+                        "completed",
+                        reason="lifecycle_terminal",
+                        winning_signal="lifecycle_end",
+                    )
             if str(label).lower() == "lifecycle" and str(phase).lower() in {"error", "timeout", "failed"}:
-                _publish_subagent_update(request_id, status="failed", step="error", error=_payload_short_text(payload.get("error") or payload.get("details") or payload, limit=300))
+                if _register_terminal_winner(request_id, request_generation, "terminal_error"):
+                    _publish_subagent_update(request_id, status="failed", step="error", error=_payload_short_text(payload.get("error") or payload.get("details") or payload, limit=300))
+                    _emit_chat_run_state(
+                        request_id,
+                        request_generation,
+                        "failed",
+                        reason=_payload_short_text(payload.get("error") or payload.get("details") or payload, limit=160),
+                        winning_signal="lifecycle_error",
+                    )
             interim_msg = {
                 "role": "interim",
                 "text": label,
                 "phase": phase,
                 "request_id": req_id,
-                "details": details_json,
+                "request_generation": int(request_generation),
+                "stream_seq": _next_stream_seq(req_id),
+                "event_ts": time.time(),
+                "details": details_for_chat,
                 "source": "gateway_stream",
             }
             return None, interim_msg, True
@@ -4775,7 +5089,8 @@ async def run_orchestrator() -> None:
                 buffer = ""
                 return
 
-            if not _touch_gateway_collation_window(request_id):
+            req_generation = int(request_generation_by_id.get(int(request_id), 0))
+            if not _touch_gateway_collation_window(request_id, req_generation):
                 logger.info("🧩 Dropped buffered gateway text outside active window [req#%d]", request_id)
                 buffer = ""
                 return
@@ -4810,7 +5125,7 @@ async def run_orchestrator() -> None:
                     # If we receive any frame, connection is healthy again.
                     reconnect_delay_s = 1.0
 
-                    request_id = _active_gateway_collation_request_id()
+                    request_id, request_generation = _active_gateway_collation_context()
                     if request_id <= 0:
                         dropped_out_of_window_gateway_frames += 1
                         if dropped_out_of_window_gateway_frames <= 3 or dropped_out_of_window_gateway_frames % 50 == 0:
@@ -4820,7 +5135,7 @@ async def run_orchestrator() -> None:
                             )
                         continue
 
-                    _touch_gateway_collation_window(request_id)
+                    _touch_gateway_collation_window(request_id, request_generation)
 
                     if request_id != active_buffer_request_id:
                         # New user request boundary: reset sentence buffer state.
@@ -4847,19 +5162,26 @@ async def run_orchestrator() -> None:
                                 logger.info("🔇 Suppressed startup welcome pattern from gateway JSON [req#%d]: '%s'...", request_id, str(payload_text)[:60])
                                 continue
                         # Fallback debug feed for providers that do not expose listen_raw().
-                        if not hasattr(gateway, "listen_raw"):
+                        if not hasattr(gateway, "listen_raw") and _debug_log_enabled():
                             web_service.append_chat_message(
                                 {
                                     "role": "raw_gateway",
                                     "text": json.dumps(payload_obj, ensure_ascii=False),
                                     "request_id": request_id,
+                                    "request_generation": int(request_generation),
+                                    "stream_seq": _next_stream_seq(request_id),
+                                    "event_ts": time.time(),
                                     "source": "gateway_stream",
                                 }
                             )
-                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, request_id)
-                        if step_msg:
+                        payload_generation = _frame_generation(payload_obj, request_id, request_generation)
+                        if payload_generation < request_generation:
+                            stale_frame_dropped_count += 1
+                            continue
+                        step_msg, interim_msg, consumed = _extract_structured_event(payload_obj, request_id, payload_generation)
+                        if step_msg and _chat_detail_enabled():
                             web_service.append_chat_message(step_msg)
-                        if interim_msg:
+                        if interim_msg and _chat_detail_enabled() and web_chat_interim_enabled:
                             web_service.append_chat_message(interim_msg)
                         if consumed:
                             continue
@@ -4881,7 +5203,7 @@ async def run_orchestrator() -> None:
                     if text.strip().startswith('```'):
                         logger.debug("⚠️ Text starts with triple backticks: %s", text[:60])
 
-                    _push_ui_stream_chunk(request_id, text)
+                    _push_ui_stream_chunk(request_id, request_generation, text)
 
                     logger.info("🔤 Received: '%s'", text)
 
@@ -4997,13 +5319,15 @@ async def run_orchestrator() -> None:
                     reconnect_delay_s = 1.0
                     if not web_service:
                         continue
-                    request_id = _active_gateway_collation_request_id()
+                    request_id, request_generation = _active_gateway_collation_context()
                     if request_id <= 0:
                         continue
-                    _touch_gateway_collation_window(request_id)
+                    _touch_gateway_collation_window(request_id, request_generation)
                     if suppress_gateway_messages_for_new_session:
                         continue
                     if not _should_emit_raw_debug_frame(raw_message):
+                        continue
+                    if not _debug_log_enabled():
                         continue
 
                     web_service.append_chat_message(
@@ -5011,6 +5335,9 @@ async def run_orchestrator() -> None:
                             "role": "raw_gateway",
                             "text": str(raw_message),
                             "request_id": request_id,
+                            "request_generation": int(request_generation),
+                            "stream_seq": _next_stream_seq(request_id),
+                            "event_ts": time.time(),
                             "source": "gateway_stream",
                         }
                     )
@@ -5031,23 +5358,27 @@ async def run_orchestrator() -> None:
                     reconnect_delay_s = 1.0
                     if not isinstance(step, dict) or not web_service:
                         continue
-                    request_id = _active_gateway_collation_request_id()
+                    request_id, request_generation = _active_gateway_collation_context()
                     if request_id <= 0:
                         continue
-                    _touch_gateway_collation_window(request_id)
+                    _touch_gateway_collation_window(request_id, request_generation)
                     if suppress_gateway_messages_for_new_session:
                         continue
 
                     # Step events are always available when the Thinking tool timeline is visible.
                     # Emit a raw debug frame from each step so Debug JSON appears consistently.
-                    web_service.append_chat_message(
-                        {
-                            "role": "raw_gateway",
-                            "text": json.dumps(step, ensure_ascii=False),
-                            "request_id": request_id,
-                            "source": "gateway_steps",
-                        }
-                    )
+                    if _debug_log_enabled():
+                        web_service.append_chat_message(
+                            {
+                                "role": "raw_gateway",
+                                "text": json.dumps(step, ensure_ascii=False),
+                                "request_id": request_id,
+                                "request_generation": int(request_generation),
+                                "stream_seq": _next_stream_seq(request_id),
+                                "event_ts": time.time(),
+                                "source": "gateway_steps",
+                            }
+                        )
 
                     name = str(step.get("name") or "event").strip() or "event"
                     phase = str(step.get("phase") or "update").strip() or "update"
@@ -5072,42 +5403,58 @@ async def run_orchestrator() -> None:
                             details_preview + "\n",
                         )
                     if name.lower() == "lifecycle" and phase.lower() in {"end", "result"} and hasattr(web_service, "mark_subagent_terminal"):
-                        web_service.mark_subagent_terminal(f"req-{int(request_id)}", "completed", "Lifecycle completed", "")
+                        if _register_terminal_winner(request_id, request_generation, "terminal_success"):
+                            web_service.mark_subagent_terminal(f"req-{int(request_id)}", "completed", "Lifecycle completed", "")
+                            _emit_chat_run_state(
+                                request_id,
+                                request_generation,
+                                "completed",
+                                reason="lifecycle_terminal",
+                                winning_signal="lifecycle_end",
+                            )
                     if name.lower() == "lifecycle" and phase.lower() in {"error", "timeout", "failed"} and hasattr(web_service, "mark_subagent_terminal"):
-                        web_service.mark_subagent_terminal(
-                            f"req-{int(request_id)}",
-                            "failed",
-                            "",
-                            details_preview[:300],
-                        )
-                    if (
-                        hasattr(web_service, "update_sandbox_exec_task")
-                        and any(token in name.lower() for token in ("exec", "terminal", "bash", "command"))
-                    ):
-                        web_service.update_sandbox_exec_task(
-                            {
-                                "task_id": str(tool_call_id or f"exec-{int(request_id)}").strip(),
-                                "label": name,
-                                "request_id": int(request_id),
-                                "status": "completed" if phase.lower() in {"end", "result", "done", "ok"} else ("failed" if phase.lower() in {"error", "failed"} else "running"),
-                                "command": details_preview[:140],
-                                "metadata_quality": "synthetic",
-                            }
-                        )
+                        if _register_terminal_winner(request_id, request_generation, "terminal_error"):
+                            web_service.mark_subagent_terminal(
+                                f"req-{int(request_id)}",
+                                "failed",
+                                "",
+                                details_preview[:300],
+                            )
+                            _emit_chat_run_state(
+                                request_id,
+                                request_generation,
+                                "failed",
+                                reason=details_preview[:160],
+                                winning_signal="lifecycle_error",
+                            )
+                    if hasattr(web_service, "update_sandbox_exec_task"):
+                        step_payload: dict[str, Any] = {
+                            "tool_call_id": tool_call_id,
+                            "details": details if isinstance(details, dict) else None,
+                            "output": details_preview if isinstance(details, str) else "",
+                        }
+                        _publish_sandbox_exec_event(request_id, name, phase, step_payload)
 
                     details_text = details if isinstance(details, str) else json.dumps(details, ensure_ascii=False)
                     if name.lower() in {"lifecycle", "compaction", "reasoning"}:
+                        if not (_chat_detail_enabled() and web_chat_interim_enabled):
+                            continue
                         web_service.append_chat_message(
                             {
                                 "role": "interim",
                                 "text": name,
                                 "phase": phase,
                                 "request_id": request_id,
+                                "request_generation": int(request_generation),
+                                "stream_seq": _next_stream_seq(request_id),
+                                "event_ts": time.time(),
                                 "details": details_text,
                                 "source": "gateway_stream",
                             }
                         )
                     else:
+                        if not _chat_detail_enabled():
+                            continue
                         web_service.append_chat_message(
                             {
                                 "role": "step",
@@ -5115,6 +5462,9 @@ async def run_orchestrator() -> None:
                                 "name": name,
                                 "phase": phase,
                                 "request_id": request_id,
+                                "request_generation": int(request_generation),
+                                "stream_seq": _next_stream_seq(request_id),
+                                "event_ts": time.time(),
                                 "tool_call_id": tool_call_id,
                                 "details": details_text,
                                 "source": "gateway_stream",

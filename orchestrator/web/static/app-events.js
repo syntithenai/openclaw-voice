@@ -112,6 +112,160 @@ function truncateChatLocallyAfterMessage(selectedId, messageId){
     return targetMessage;
 }
 
+function autoResizeChatInput(el){
+    if(!el) return;
+    const minHeight = 40;
+    const maxHeight = 160;
+    el.style.height = 'auto';
+    const nextHeight = Math.min(maxHeight, Math.max(minHeight, el.scrollHeight));
+    el.style.height = nextHeight + 'px';
+    el.style.overflowY = el.scrollHeight > maxHeight ? 'auto' : 'hidden';
+}
+
+function setChatSendMode(mode){
+    S.chatSendMode = normalizeChatSendMode(mode);
+    persistChatSendMode();
+    updateChatComposerState();
+}
+
+function cycleChatVerboseLevel(){
+    const order=['off','on','full'];
+    const cur=normalizeChatVerboseLevel(S.chatVerboseLevel);
+    const idx=order.indexOf(cur);
+    const next=order[(idx+1)%order.length];
+    S.chatVerboseLevel=next;
+    writeStringPref(PREF_CHAT_VERBOSE_LEVEL, next);
+    sendSettingValueAction('chat_verbose_set', next);
+    applyMicControlToggles();
+}
+
+function cycleChatReasoningLevel(){
+    const order=['off','on','stream'];
+    const cur=normalizeChatReasoningLevel(S.chatReasoningLevel);
+    const idx=order.indexOf(cur);
+    const next=order[(idx+1)%order.length];
+    S.chatReasoningLevel=next;
+    writeStringPref(PREF_CHAT_REASONING_LEVEL, next);
+    sendSettingValueAction('chat_reasoning_set', next);
+    applyMicControlToggles();
+}
+
+function cycleChatLifecyclePolicy(){
+    const order=['chat_only','debug_log_only','both'];
+    const cur=normalizeChatLifecyclePolicy(S.chatLifecyclePolicy);
+    const idx=order.indexOf(cur);
+    const next=order[(idx+1)%order.length];
+    S.chatLifecyclePolicy=next;
+    writeStringPref(PREF_CHAT_LIFECYCLE_POLICY, next);
+    sendSettingValueAction('chat_lifecycle_policy_set', next);
+    applyMicControlToggles();
+}
+
+function createQueuedChatItem(text, mode){
+    return {
+        id: 'q' + (S.chatQueueSeq++),
+        text: String(text||'').trim(),
+        mode: normalizeChatSendMode(mode),
+        createdTs: Date.now(),
+    };
+}
+
+function dispatchChatTextNow(text, mode, source){
+    const body = String(text||'').trim();
+    if(!body) return false;
+    const clientMsgId='c'+(S.nextClientMsgId++);
+    S.pendingChatSends.add(clientMsgId);
+    S.chatLastActivityTs = Date.now();
+    requestScrollToBottomBurst();
+    updateChatComposerState();
+    if(queueOptimisticTimerFromText(body, 'chat_submit')) renderTimerBar();
+    const sent = sendAction({
+        type:'chat_text',
+        text: body,
+        client_msg_id: clientMsgId,
+        send_mode: normalizeChatSendMode(mode),
+        source: String(source||'direct'),
+    });
+    if(!sent){
+        S.pendingChatSends.delete(clientMsgId);
+        updateChatComposerState();
+        return false;
+    }
+    return true;
+}
+
+function removeQueuedChatItem(queueId){
+    const qid = String(queueId||'').trim();
+    if(!qid) return;
+    S.chatQueuedItems = (S.chatQueuedItems||[]).filter((item)=>String((item&&item.id)||'')!==qid);
+    updateChatComposerState();
+}
+
+function enqueueChatText(text, mode){
+    const body = String(text||'').trim();
+    if(!body) return;
+    const normalizedMode = normalizeChatSendMode(mode);
+    if(normalizedMode==='steer'){
+        const list = Array.isArray(S.chatQueuedItems) ? S.chatQueuedItems : [];
+        const tail = list.length ? list[list.length-1] : null;
+        if(tail && normalizeChatSendMode(tail.mode)==='steer'){
+            const merged = String(tail.text||'').trim();
+            tail.text = merged ? (merged + '\n' + body) : body;
+            tail.updatedTs = Date.now();
+            updateChatComposerState();
+            return;
+        }
+    }
+    S.chatQueuedItems.push(createQueuedChatItem(body, normalizedMode));
+    updateChatComposerState();
+}
+
+function processQueuedChatDispatch(){
+    if(!Array.isArray(S.chatQueuedItems) || S.chatQueuedItems.length===0) return;
+    if(!canDispatchQueuedChatNow()) return;
+    const next = S.chatQueuedItems.shift();
+    if(!next || !String(next.text||'').trim()){
+        updateChatComposerState();
+        return;
+    }
+    dispatchChatTextNow(next.text, next.mode, 'queue_dequeue');
+    updateChatComposerState();
+}
+
+function handleChatComposerSubmitText(rawText){
+    const text = String(rawText||'').trim();
+    if(!text) return;
+    clearChatReloadTarget();
+    clearChatReloadInFlight();
+    const mode = normalizeChatSendMode(S.chatSendMode);
+    if(mode==='queue'){
+        if(canDispatchQueuedChatNow()) dispatchChatTextNow(text, mode, 'submit');
+        else enqueueChatText(text, mode);
+        return;
+    }
+    // steer mode
+    if(canDispatchQueuedChatNow()) dispatchChatTextNow(text, 'steer', 'submit');
+    else enqueueChatText(text, 'steer');
+}
+
+function requestChatStop(){
+    if(S.chatStopPending) return;
+    S.chatStopPending = true;
+    if(S.chatStopTimer){
+        clearTimeout(S.chatStopTimer);
+        S.chatStopTimer = null;
+    }
+    S.chatStopTimer = setTimeout(()=>{
+        S.chatStopPending = false;
+        S.chatStopTimer = null;
+        updateChatComposerState();
+    }, 5000);
+    updateChatComposerState();
+    sendAction({type:'chat_stop'});
+}
+
+window.processQueuedChatDispatch = processQueuedChatDispatch;
+
 document.addEventListener('click', e => {
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target) return;
@@ -161,6 +315,94 @@ document.addEventListener('click', e => {
     const authLoginBtn = target.closest('[data-action="auth-login"]');
     if (authLoginBtn) {
         triggerGoogleLogin();
+        return;
+    }
+
+    const chatVerboseBtn = target.closest('[data-action="chat-verbose-cycle"]');
+    if (chatVerboseBtn) {
+        e.stopPropagation();
+        if(S.pendingSettingActions['chat_verbose_set']) return;
+        cycleChatVerboseLevel();
+        return;
+    }
+
+    const chatReasoningBtn = target.closest('[data-action="chat-reasoning-cycle"]');
+    if (chatReasoningBtn) {
+        e.stopPropagation();
+        if(S.pendingSettingActions['chat_reasoning_set']) return;
+        cycleChatReasoningLevel();
+        return;
+    }
+
+    const chatLifecycleBtn = target.closest('[data-action="chat-lifecycle-policy-cycle"]');
+    if (chatLifecycleBtn) {
+        e.stopPropagation();
+        if(S.pendingSettingActions['chat_lifecycle_policy_set']) return;
+        cycleChatLifecyclePolicy();
+        return;
+    }
+
+    const modeQueueBtn = target.closest('[data-action="chat-mode-queue"]');
+    if(modeQueueBtn){
+        e.preventDefault();
+        setChatSendMode('queue');
+        return;
+    }
+
+    const modeSteerBtn = target.closest('[data-action="chat-mode-steer"]');
+    if(modeSteerBtn){
+        e.preventDefault();
+        setChatSendMode('steer');
+        return;
+    }
+
+    const chatStopBtn = target.closest('[data-action="chat-stop"]');
+    if(chatStopBtn){
+        e.preventDefault();
+        requestChatStop();
+        return;
+    }
+
+    const queueRemoveBtn = target.closest('[data-action="chat-queue-remove"]');
+    if(queueRemoveBtn){
+        e.preventDefault();
+        removeQueuedChatItem(queueRemoveBtn.dataset.queueId || '');
+        return;
+    }
+
+    const queueSteerNowBtn = target.closest('[data-action="chat-queue-steer-now"]');
+    if(queueSteerNowBtn){
+        e.preventDefault();
+        const qid = String(queueSteerNowBtn.dataset.queueId||'').trim();
+        const list = Array.isArray(S.chatQueuedItems) ? S.chatQueuedItems : [];
+        const idx = list.findIndex((item)=>String((item&&item.id)||'')===qid);
+        if(idx<0) return;
+        const [item] = list.splice(idx, 1);
+        if(item && String(item.text||'').trim()){
+            const steerText = String(item.text||'').trim();
+            if(canDispatchQueuedChatNow()){
+                dispatchChatTextNow(steerText, 'steer', 'queue_steer_now');
+            }else{
+                const actionId = 'qsteer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 7);
+                const sent = sendAction({
+                    type:'chat_steer_now',
+                    action_id: actionId,
+                    queue_item_id: qid,
+                    text: steerText,
+                });
+                if(sent){
+                    if(!S.pendingChatSteerNowByAction || typeof S.pendingChatSteerNowByAction!=='object') S.pendingChatSteerNowByAction={};
+                    S.pendingChatSteerNowByAction[actionId] = {
+                        queueId: qid,
+                        text: steerText,
+                        ts: Date.now(),
+                    };
+                }else{
+                    list.unshift(createQueuedChatItem(steerText, 'steer'));
+                }
+            }
+        }
+        updateChatComposerState();
         return;
     }
 
@@ -420,6 +662,18 @@ document.addEventListener('click', e => {
         e.stopPropagation();
         if(S.pendingSettingActions['continuous_mode_set']) return;
         sendSettingAction('continuous_mode_set', !S.continuousMode);
+        return;
+    }
+
+    const chatInterimToggle = target.closest('[data-action="toggle-chat-interim"]');
+    if (chatInterimToggle) {
+        e.stopPropagation();
+        if(S.pendingSettingActions['chat_interim_set']) return;
+        const next = !S.chatInterimLifecycleEnabled;
+        S.chatInterimLifecycleEnabled = next;
+        writeBoolPref(PREF_CHAT_INTERIM_ENABLED, next);
+        sendSettingAction('chat_interim_set', next);
+        applyMicControlToggles();
         return;
     }
 
@@ -814,15 +1068,9 @@ document.addEventListener('submit', e => {
     if (!input) return;
     const text = String(input.value || '').trim();
     if (!text) return;
-    clearChatReloadTarget();
-    clearChatReloadInFlight();
-    const clientMsgId='c'+(S.nextClientMsgId++);
-    S.pendingChatSends.add(clientMsgId);
-    requestScrollToBottomBurst();
-    updateChatComposerState();
-    if(queueOptimisticTimerFromText(text, 'chat_submit')) renderTimerBar();
-    sendAction({type:'chat_text', text, client_msg_id:clientMsgId});
+    handleChatComposerSubmitText(text);
     input.value = '';
+    autoResizeChatInput(input);
     if (S.selectedChatId !== 'active') {
         S.selectedChatId = 'active';
         persistChatCache();
@@ -833,6 +1081,19 @@ document.addEventListener('submit', e => {
 document.addEventListener('keydown', e => {
     const t = e.target;
     if(!t) return;
+    if(t.id==='chatInput'){
+        if(e.key!=='Enter') return;
+        if(e.shiftKey) return;
+        if(e.isComposing || e.keyCode===229) return;
+        e.preventDefault();
+        const form = document.getElementById('chatComposer');
+        if(form && typeof form.requestSubmit==='function'){
+            form.requestSubmit();
+        }else if(form){
+            form.dispatchEvent(new Event('submit', {bubbles:true, cancelable:true}));
+        }
+        return;
+    }
     if (S.page === 'files' && typeof handleFileManagerKeydown === 'function') {
         if (handleFileManagerKeydown(e)) return;
     }
@@ -849,6 +1110,9 @@ document.addEventListener('keydown', e => {
         if(confirmBtn) confirmBtn.click();
     }
 });
+
+autoResizeChatInput(document.getElementById('chatInput'));
+restoreChatSendModePref();
 
 function hasMusicPlaylistNameConflict(name){
     const modalName = String(name||'').trim().toLowerCase();
@@ -963,6 +1227,10 @@ function renderMusicPagePreservingInput(inputId){
 
 function handleTextInputChange(t){
     if(!t) return;
+    if(t.id==='chatInput'){
+        autoResizeChatInput(t);
+        return;
+    }
     if(t.id==='musicQueueSearch'){
         S.musicQueueFilter = String(t.value||'');
         writeStringPref(PREF_MUSIC_QUEUE_FILTER, S.musicQueueFilter);

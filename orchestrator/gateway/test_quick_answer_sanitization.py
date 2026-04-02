@@ -93,6 +93,16 @@ def test_classify_shopping_list_reason() -> None:
     assert reason == "action_intent"
 
 
+def test_should_force_upstream_for_slash_model_command() -> None:
+    assert should_force_upstream("/model localfast what time is it") is True
+
+
+def test_classify_slash_command_reason() -> None:
+    decision, reason = classify_upstream_decision("/help")
+    assert decision is True
+    assert reason == "slash_command_upstream"
+
+
 def test_should_force_upstream_for_research_and_document_request() -> None:
     query = "research information about the best way to learn old time fiddle bowing rhythms and write it all to a document"
     assert should_force_upstream(query) is True

@@ -395,6 +395,11 @@ def classify_upstream_decision(
     if not query:
         return True, "empty_query"
 
+    # Slash commands (for example /model, /help, /status) should be handled
+    # by the upstream command parser, not by the quick-answer lane.
+    if query.startswith("/"):
+        return True, "slash_command_upstream"
+
     if any(re.search(pattern, query) for pattern in UPSTREAM_ONLY_PATTERNS):
         return True, "context_or_account_specific"
 

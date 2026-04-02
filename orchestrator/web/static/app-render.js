@@ -561,6 +561,20 @@ function sendSettingAction(actionType, enabled){
     return actionId;
 }
 
+function sendSettingValueAction(actionType, value){
+    const actionId='s'+(S.nextSettingActionId++);
+    const key=String(actionType);
+    const sent=sendAction({type:key, action_id:actionId, value:value});
+    if(!sent){
+      recordInlineError('setting', key, 'Not connected - retry');
+      applyMicControlToggles();
+      return null;
+    }
+    S.pendingSettingActions[key]={action_id:actionId, value:value, ts:Date.now()};
+    applyMicControlToggles();
+    return actionId;
+}
+
 function recordInlineError(kind, key, message){
     const msg=String(message||'Action failed');
     const now=Date.now();

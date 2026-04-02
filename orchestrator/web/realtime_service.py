@@ -219,6 +219,12 @@ class EmbeddedVoiceWebService:
         self._on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None
         self._on_chat_new: Callable[[str], Awaitable[None]] | None = None
         self._on_chat_text: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_chat_steer_now: Callable[[str, str, str], Awaitable[None]] | None = None
+        self._on_chat_stop: Callable[[str], Awaitable[None]] | None = None
+        self._on_chat_verbose_set: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_chat_reasoning_set: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_chat_lifecycle_policy_set: Callable[[str, str], Awaitable[None]] | None = None
+        self._on_chat_interim_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_chat_load_thread_messages: Callable[[str, str], Awaitable[list[dict[str, Any]] | None]] | None = None
         self._on_chat_delete: Callable[[str, str], Awaitable[None]] | None = None
         self._on_chat_clear_all: Callable[[list[str], str], Awaitable[None]] | None = None
@@ -226,6 +232,7 @@ class EmbeddedVoiceWebService:
         self._on_tts_mute_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_browser_audio_set: Callable[[bool, str], Awaitable[None]] | None = None
         self._on_continuous_mode_set: Callable[[bool, str], Awaitable[None]] | None = None
+        self._chat_stream_ack_by_request: dict[str, int] = {}
 
         # Auth
         self._auth_mode = str(auth_mode or "disabled").strip().lower()
@@ -1536,6 +1543,12 @@ class EmbeddedVoiceWebService:
         on_alarm_cancel: Callable[[str, str], Awaitable[None]] | None = None,
         on_chat_new: Callable[[str], Awaitable[None]] | None = None,
         on_chat_text: Callable[[str, str], Awaitable[None]] | None = None,
+        on_chat_steer_now: Callable[[str, str, str], Awaitable[None]] | None = None,
+        on_chat_stop: Callable[[str], Awaitable[None]] | None = None,
+        on_chat_verbose_set: Callable[[str, str], Awaitable[None]] | None = None,
+        on_chat_reasoning_set: Callable[[str, str], Awaitable[None]] | None = None,
+        on_chat_lifecycle_policy_set: Callable[[str, str], Awaitable[None]] | None = None,
+        on_chat_interim_set: Callable[[bool, str], Awaitable[None]] | None = None,
         on_chat_load_thread_messages: Callable[[str, str], Awaitable[list[dict[str, Any]] | None]] | None = None,
         on_chat_delete: Callable[[str, str], Awaitable[None]] | None = None,
         on_chat_clear_all: Callable[[list[str], str], Awaitable[None]] | None = None,
@@ -1602,6 +1615,18 @@ class EmbeddedVoiceWebService:
             self._on_chat_new = on_chat_new
         if on_chat_text is not None:
             self._on_chat_text = on_chat_text
+        if on_chat_steer_now is not None:
+            self._on_chat_steer_now = on_chat_steer_now
+        if on_chat_stop is not None:
+            self._on_chat_stop = on_chat_stop
+        if on_chat_verbose_set is not None:
+            self._on_chat_verbose_set = on_chat_verbose_set
+        if on_chat_reasoning_set is not None:
+            self._on_chat_reasoning_set = on_chat_reasoning_set
+        if on_chat_lifecycle_policy_set is not None:
+            self._on_chat_lifecycle_policy_set = on_chat_lifecycle_policy_set
+        if on_chat_interim_set is not None:
+            self._on_chat_interim_set = on_chat_interim_set
         if on_chat_load_thread_messages is not None:
             self._on_chat_load_thread_messages = on_chat_load_thread_messages
         if on_chat_delete is not None:
@@ -2477,6 +2502,165 @@ class EmbeddedVoiceWebService:
                     })
             return
 
+        if msg_type == "chat_verbose_set" and self._on_chat_verbose_set:
+            action_id = payload.get("action_id")
+            value = str(payload.get("value", "off")).strip().lower()
+            try:
+                await self._on_chat_verbose_set(value, client_id)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_ack",
+                        "action": "chat_verbose_set",
+                        "action_id": str(action_id),
+                    })
+            except Exception as exc:
+                logger.warning("chat_verbose_set handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_error",
+                        "action": "chat_verbose_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    })
+            return
+
+        if msg_type == "chat_reasoning_set" and self._on_chat_reasoning_set:
+            action_id = payload.get("action_id")
+            value = str(payload.get("value", "off")).strip().lower()
+            try:
+                await self._on_chat_reasoning_set(value, client_id)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_ack",
+                        "action": "chat_reasoning_set",
+                        "action_id": str(action_id),
+                    })
+            except Exception as exc:
+                logger.warning("chat_reasoning_set handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_error",
+                        "action": "chat_reasoning_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    })
+            return
+
+        if msg_type == "chat_lifecycle_policy_set" and self._on_chat_lifecycle_policy_set:
+            action_id = payload.get("action_id")
+            value = str(payload.get("value", "both")).strip().lower()
+            try:
+                await self._on_chat_lifecycle_policy_set(value, client_id)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_ack",
+                        "action": "chat_lifecycle_policy_set",
+                        "action_id": str(action_id),
+                    })
+            except Exception as exc:
+                logger.warning("chat_lifecycle_policy_set handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_error",
+                        "action": "chat_lifecycle_policy_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    })
+            return
+
+        if msg_type == "chat_interim_set" and self._on_chat_interim_set:
+            action_id = payload.get("action_id")
+            enabled = bool(payload.get("enabled", False))
+            try:
+                await self._on_chat_interim_set(enabled, client_id)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_ack",
+                        "action": "chat_interim_set",
+                        "action_id": str(action_id),
+                    })
+            except Exception as exc:
+                logger.warning("chat_interim_set handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json({
+                        "type": "setting_action_error",
+                        "action": "chat_interim_set",
+                        "action_id": str(action_id),
+                        "error": str(exc),
+                    })
+            return
+
+        if msg_type == "chat_stream_ack":
+            request_id = str(payload.get("request_id", "")).strip()
+            try:
+                last_seq = int(payload.get("last_seq", 0) or 0)
+            except Exception:
+                last_seq = 0
+            if request_id:
+                self._chat_stream_ack_by_request[request_id] = max(last_seq, int(self._chat_stream_ack_by_request.get(request_id, 0) or 0))
+            return
+
+        if msg_type == "chat_request_reconcile":
+            request_id = str(payload.get("request_id", "")).strip()
+            try:
+                last_seq = int(payload.get("last_seq", 0) or 0)
+            except Exception:
+                last_seq = 0
+            if not request_id:
+                return
+            rows: list[dict[str, Any]] = []
+            max_seq = 0
+            for item in list(self._chat_messages):
+                if str(item.get("request_id", "")).strip() != request_id:
+                    continue
+                try:
+                    seq = int(item.get("stream_seq", 0) or 0)
+                except Exception:
+                    seq = 0
+                max_seq = max(max_seq, seq)
+                if seq > last_seq:
+                    rows.append(dict(item))
+            rows.sort(key=lambda m: int(m.get("stream_seq", 0) or 0))
+            await _send_ws_json(
+                {
+                    "type": "chat_reconcile_snapshot",
+                    "request_id": request_id,
+                    "from_seq": int(last_seq),
+                    "max_seq": int(max_seq),
+                    "messages": rows,
+                }
+            )
+            return
+
+        if msg_type == "chat_stream_replay":
+            request_id = str(payload.get("request_id", "")).strip()
+            try:
+                after_seq = int(payload.get("after_seq", 0) or 0)
+            except Exception:
+                after_seq = 0
+            if not request_id:
+                return
+            rows: list[dict[str, Any]] = []
+            for item in list(self._chat_messages):
+                if str(item.get("request_id", "")).strip() != request_id:
+                    continue
+                try:
+                    seq = int(item.get("stream_seq", 0) or 0)
+                except Exception:
+                    seq = 0
+                if seq > after_seq:
+                    rows.append(dict(item))
+            rows.sort(key=lambda m: int(m.get("stream_seq", 0) or 0))
+            await _send_ws_json(
+                {
+                    "type": "chat_stream_replay",
+                    "request_id": request_id,
+                    "after_seq": int(after_seq),
+                    "messages": rows,
+                }
+            )
+            return
+
         if msg_type == "chat_new" and self._on_chat_new:
             try:
                 await self._on_chat_new(client_id)
@@ -2510,6 +2694,55 @@ class EmbeddedVoiceWebService:
                         )
                     except Exception:
                         pass
+            return
+
+        if msg_type == "chat_steer_now" and self._on_chat_steer_now:
+            action_id = str(payload.get("action_id", "")).strip()
+            queue_item_id = str(payload.get("queue_item_id", "")).strip()
+            text = str(payload.get("text", "")).strip()
+            if not text:
+                if action_id:
+                    await _send_ws_json(
+                        {
+                            "type": "chat_steer_error",
+                            "action_id": action_id,
+                            "queue_item_id": queue_item_id,
+                            "error": "Missing steer text",
+                        }
+                    )
+                return
+            try:
+                await self._on_chat_steer_now(text, queue_item_id, client_id)
+                if action_id:
+                    await _send_ws_json(
+                        {
+                            "type": "chat_steer_ack",
+                            "action_id": action_id,
+                            "queue_item_id": queue_item_id,
+                            "ok": True,
+                        }
+                    )
+            except Exception as exc:
+                logger.warning("chat_steer_now handler error: %s", exc)
+                if action_id:
+                    await _send_ws_json(
+                        {
+                            "type": "chat_steer_error",
+                            "action_id": action_id,
+                            "queue_item_id": queue_item_id,
+                            "ok": False,
+                            "error": str(exc),
+                        }
+                    )
+            return
+
+        if msg_type == "chat_stop" and self._on_chat_stop:
+            try:
+                await self._on_chat_stop(client_id)
+                await _send_ws_json({"type": "chat_stop_ack", "ok": True})
+            except Exception as exc:
+                logger.warning("chat_stop handler error: %s", exc)
+                await _send_ws_json({"type": "chat_stop_error", "ok": False, "error": str(exc)})
             return
 
         if msg_type == "chat_delete":

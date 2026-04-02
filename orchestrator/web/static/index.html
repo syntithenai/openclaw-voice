@@ -77,6 +77,22 @@
         <span id="continuousModeLabel" class="text-xs text-gray-300">Continuous mode</span>
         <button id="continuousModeToggle" data-action="toggle-continuous-mode" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
       </div>
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="chatVerboseLabel" class="text-xs text-gray-300">Verbose</span>
+        <button id="chatVerboseBtn" data-action="chat-verbose-cycle" class="px-2 py-1 rounded text-xs bg-gray-700 border border-gray-600 hover:bg-gray-600 transition-colors">off</button>
+      </div>
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="chatReasoningLabel" class="text-xs text-gray-300">Reasoning</span>
+        <button id="chatReasoningBtn" data-action="chat-reasoning-cycle" class="px-2 py-1 rounded text-xs bg-gray-700 border border-gray-600 hover:bg-gray-600 transition-colors">off</button>
+      </div>
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="chatLifecyclePolicyLabel" class="text-xs text-gray-300">Lifecycle detail</span>
+        <button id="chatLifecyclePolicyBtn" data-action="chat-lifecycle-policy-cycle" class="px-2 py-1 rounded text-xs bg-gray-700 border border-gray-600 hover:bg-gray-600 transition-colors">both</button>
+      </div>
+      <div class="flex items-center justify-between px-2 py-1">
+        <span id="chatInterimLabel" class="text-xs text-gray-300">Interim lifecycle rows</span>
+        <button id="chatInterimToggle" data-action="toggle-chat-interim" class="relative w-11 h-6 rounded-full bg-gray-700 border border-gray-600 transition-colors"><span class="absolute top-1 left-1 w-4 h-4 rounded-full bg-gray-200 transition-transform"></span></button>
+      </div>
     </div>
   </div>
   <div id="msgToastContainer" class="absolute right-0 top-14 pr-3 pointer-events-none z-40" style="max-width:320px;"></div>
@@ -98,8 +114,23 @@
     <button id="scrollDownBtn" data-action="chat-scroll-down" type="button" class="px-3 py-1.5 rounded-lg text-xs bg-gray-800 hover:bg-gray-700 transition-colors" title="Jump to latest" aria-label="Jump to latest">Latest</button>
   </div>
   <div id="timerBar" class="hidden mb-2 px-3 py-2 bg-amber-950/60 border border-amber-800/50 rounded-lg flex gap-2 flex-wrap items-center text-sm"></div>
-  <form id="chatComposer" class="flex items-center gap-2">
-    <input id="chatInput" type="text" placeholder="Type a message" class="flex-1 min-w-0 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600" />
+  <div id="chatRunStatusRow" class="hidden mb-2 px-3 py-2 rounded-lg border border-gray-700 bg-gray-800/50 text-xs text-gray-200">
+    <span id="chatRunStatusChip" class="inline-flex items-center px-2 py-0.5 rounded-full bg-gray-700 text-gray-100">Idle</span>
+    <span id="chatRunStatusText" class="ml-2 text-gray-300">No active request</span>
+    <span id="chatRunElapsed" class="ml-2 text-gray-500">0:00</span>
+  </div>
+  <div id="chatQueuePanel" class="hidden mb-2 px-3 py-2 rounded-lg border border-gray-700 bg-gray-800/50">
+    <div class="text-xs text-gray-300 mb-1">Queued messages</div>
+    <div id="chatQueueEmpty" class="text-xs text-gray-500">Queue is empty</div>
+    <div id="chatQueueList" class="flex flex-col gap-1"></div>
+  </div>
+  <form id="chatComposer" class="flex items-end gap-2">
+    <div class="flex items-center gap-1">
+      <button id="chatModeQueueBtn" data-action="chat-mode-queue" type="button" class="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600" title="Queue mode">Queue</button>
+      <button id="chatModeSteerBtn" data-action="chat-mode-steer" type="button" class="px-2 py-1 rounded text-xs bg-gray-800 hover:bg-gray-700" title="Steer mode">Steer</button>
+    </div>
+    <textarea id="chatInput" rows="1" placeholder="Type a message" class="flex-1 min-w-0 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600 resize-none overflow-hidden" style="min-height:40px;max-height:160px"></textarea>
+    <button id="chatStopBtn" data-action="chat-stop" type="button" class="hidden px-3 py-2 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors">Stop</button>
     <button id="chatSendBtn" type="submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Send</button>
   </form>
 </div>
