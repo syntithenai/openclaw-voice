@@ -244,32 +244,56 @@ function handleMsg(msg){
             if(msg.task){
                 upsertTaskById(S.sandboxTasks, S.sandboxTaskById, msg.task);
                 renderTimerBar();
+                if(S.page==='home'){
+                    if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                    else renderChatMessages(S.selectedChatId||'active');
+                }
             }
             break;
         case 'sandbox_exec_log_append':
             appendSandboxTaskLog(msg);
             if(S.sandboxTaskPanelOpen && String(S.sandboxTaskPanelId||'')===String(msg.task_id||'')) renderTimerBar();
+            if(S.page==='home'){
+                if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                else renderChatMessages(S.selectedChatId||'active');
+            }
             break;
         case 'sandbox_task_logs':
             if(msg.task_id){
                 S.sandboxTaskLogEntriesById[String(msg.task_id)] = Array.isArray(msg.entries)?msg.entries:[];
                 if(S.sandboxTaskPanelOpen && String(S.sandboxTaskPanelId||'')===String(msg.task_id||'')) renderTimerBar();
+                if(S.page==='home'){
+                    if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                    else renderChatMessages(S.selectedChatId||'active');
+                }
             }
             break;
         case 'subagent_task_update':
             if(msg.task){
                 upsertTaskById(S.subagentTasks, S.subagentTaskById, msg.task);
                 renderTimerBar();
+                if(S.page==='home'){
+                    if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                    else renderChatMessages(S.selectedChatId||'active');
+                }
             }
             break;
         case 'subagent_thinking_append':
             appendSubagentThinking(msg);
             if(S.subagentTaskPanelOpen && String(S.subagentTaskPanelId||'')===String(msg.run_id||'')) renderTimerBar();
+            if(S.page==='home'){
+                if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                else renderChatMessages(S.selectedChatId||'active');
+            }
             break;
         case 'subagent_task_thinking':
             if(msg.run_id){
                 S.subagentThinkingEntriesById[String(msg.run_id)] = Array.isArray(msg.entries)?msg.entries:[];
                 if(S.subagentTaskPanelOpen && String(S.subagentTaskPanelId||'')===String(msg.run_id||'')) renderTimerBar();
+                if(S.page==='home'){
+                    if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                    else renderChatMessages(S.selectedChatId||'active');
+                }
             }
             break;
         case 'subagent_task_terminal':
@@ -278,6 +302,10 @@ function handleMsg(msg){
                 const task=S.subagentTaskById[runId]||{run_id:runId,task_id:runId};
                 upsertTaskById(S.subagentTasks, S.subagentTaskById, Object.assign({}, task, {status:String(msg.status||'completed'), summary:String(msg.summary||''), error_summary:String(msg.error||'')}));
                 renderTimerBar();
+                if(S.page==='home'){
+                    if(typeof scheduleChatMessagesRender==='function') scheduleChatMessagesRender(S.selectedChatId||'active');
+                    else renderChatMessages(S.selectedChatId||'active');
+                }
             }
             break;
 

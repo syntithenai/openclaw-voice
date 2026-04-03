@@ -1070,6 +1070,7 @@ document.addEventListener('submit', e => {
     if (!text) return;
     handleChatComposerSubmitText(text);
     input.value = '';
+    clearChatComposerDraft();
     autoResizeChatInput(input);
     if (S.selectedChatId !== 'active') {
         S.selectedChatId = 'active';
@@ -1111,8 +1112,18 @@ document.addEventListener('keydown', e => {
     }
 });
 
-autoResizeChatInput(document.getElementById('chatInput'));
+const chatInputBootEl = document.getElementById('chatInput');
+if(chatInputBootEl){
+    chatInputBootEl.value = readChatComposerDraft();
+    autoResizeChatInput(chatInputBootEl);
+}
 restoreChatSendModePref();
+
+window.addEventListener('pagehide', ()=>{
+    const input = document.getElementById('chatInput');
+    if(!input) return;
+    persistChatComposerDraft(String(input.value||''));
+});
 
 function hasMusicPlaylistNameConflict(name){
     const modalName = String(name||'').trim().toLowerCase();
@@ -1228,6 +1239,7 @@ function renderMusicPagePreservingInput(inputId){
 function handleTextInputChange(t){
     if(!t) return;
     if(t.id==='chatInput'){
+        persistChatComposerDraft(String(t.value||''));
         autoResizeChatInput(t);
         return;
     }
@@ -1393,6 +1405,145 @@ function formatTaskAge(ts){
     return mm+':'+ss;
 }
 
+function parseRequestIdFromRunId(runId){
+    const m=String(runId||'').match(/req-(\d+)/i);
+    return m ? String(m[1]) : '';
+}
+
+const TASK_STREAM_REFRESH_INTERVAL_MS=1200;
+const sandboxTaskStreamRefreshById=Object.create(null);
+const subagentTaskStreamRefreshById=Object.create(null);
+
+function isTerminalTaskStatus(status){
+    const s=String(status||'').trim().toLowerCase();
+    return s==='completed' || s==='failed' || s==='cancelled' || s==='canceled' || s==='succeeded' || s==='done';
+}
+
+function maybeRefreshTaskStreams(sandbox, subagent){
+    const now=Date.now();
+    sandbox.forEach((task)=>{
+        const taskId=String((task&&task.task_id)||'').trim();
+        if(!taskId || isTerminalTaskStatus(task&&task.status)) return;
+        const lastTs=Number(sandboxTaskStreamRefreshById[taskId]||0);
+        if((now-lastTs)<TASK_STREAM_REFRESH_INTERVAL_MS) return;
+        sandboxTaskStreamRefreshById[taskId]=now;
+        sendAction({type:'sandbox_task_logs_get', task_id: taskId});
+    });
+    subagent.forEach((task)=>{
+        const runId=String((task&&task.run_id)||task&&task.task_id||'').trim();
+        if(!runId || isTerminalTaskStatus(task&&task.status)) return;
+        const lastTs=Number(subagentTaskStreamRefreshById[runId]||0);
+        if((now-lastTs)<TASK_STREAM_REFRESH_INTERVAL_MS) return;
+        subagentTaskStreamRefreshById[runId]=now;
+        sendAction({type:'subagent_task_thinking_get', run_id: runId});
+    });
+}
+
+function renderSandboxLogTail(entries){
+    const rows=[];
+    (Array.isArray(entries)?entries:[]).forEach((entry)=>{
+        const seq=String((entry&&entry.seq)||'');
+        const stream=String((entry&&entry.stream)||'stdout').toLowerCase();
+        const lines=Array.isArray(entry&&entry.lines)?entry.lines:[String((entry&&entry.lines)||'')];
+        lines.forEach((line)=>rows.push({seq, stream, line:String(line||'')}));
+    });
+    const tail=rows.slice(-80);
+    if(!tail.length) return '<div class="text-gray-400">No logs yet</div>';
+    return '<div class="max-h-44 overflow-auto space-y-0.5">'
+        +tail.map((row)=>{
+            const isErr=row.stream==='stderr';
+            const badgeTone=isErr?'bg-red-900/70 text-red-200 border-red-700/70':'bg-gray-800 text-gray-200 border-gray-700';
+            const textTone=isErr?'text-red-200':'text-gray-200';
+            return '<div class="font-mono text-[11px] leading-relaxed '+textTone+'">'
+                +'<span class="inline-block min-w-[42px] px-1 mr-1 rounded border '+badgeTone+'">'+esc(row.stream)+'</span>'
+                +'<span class="text-gray-500 mr-1">#'+esc(row.seq||'?')+'</span>'
+                +'<span>'+esc(row.line)+'</span>'
+            +'</div>';
+        }).join('')
+    +'</div>';
+}
+
+function getTasksForRequest(reqKey){
+    const requestId=String(reqKey||'').trim();
+    if(!requestId) return {sandbox:[], subagent:[]};
+    const sandbox=(Array.isArray(S.sandboxTasks)?S.sandboxTasks:[])
+        .filter((t)=>String((t&&t.request_id)||'').trim()===requestId)
+        .slice()
+        .sort((a,b)=>Number((b&&b.updated_ts)||0)-Number((a&&a.updated_ts)||0));
+    const subagent=(Array.isArray(S.subagentTasks)?S.subagentTasks:[])
+        .filter((t)=>{
+            const direct=String((t&&t.request_id)||'').trim();
+            if(direct) return direct===requestId;
+            const rid=parseRequestIdFromRunId((t&&t.run_id)||'');
+            return rid===requestId;
+        })
+        .slice()
+        .sort((a,b)=>Number((b&&b.updated_ts)||0)-Number((a&&a.updated_ts)||0));
+    return {sandbox, subagent};
+}
+
+function renderRequestTasksBlock(reqKey){
+    const {sandbox, subagent}=getTasksForRequest(reqKey);
+    const total=sandbox.length+subagent.length;
+    if(!total) return '';
+
+    maybeRefreshTaskStreams(sandbox, subagent);
+    const hasActiveTasks=[...sandbox, ...subagent].some((t)=>!isTerminalTaskStatus(t&&t.status));
+    const stateKey=hasActiveTasks ? 'active' : 'done';
+
+    const sandboxRows=sandbox.map((task, idx)=>{
+        const taskId=String((task&&task.task_id)||'').trim();
+        const status=String((task&&task.status)||'running').toLowerCase();
+        const tone=status==='failed'?'text-red-200 border-red-700/60 bg-red-950/30':(status==='completed'?'text-emerald-200 border-emerald-700/60 bg-emerald-950/30':'text-amber-100 border-amber-700/60 bg-amber-950/25');
+        const logs=((S.sandboxTaskLogEntriesById&&S.sandboxTaskLogEntriesById[taskId])||[])
+            .map((entry)=>{
+                const seq=String((entry&&entry.seq)||'');
+                const stream=String((entry&&entry.stream)||'stdout');
+                const lines=Array.isArray(entry&&entry.lines)?entry.lines:[String((entry&&entry.lines)||'')];
+                return '['+seq+'] ['+stream+'] '+lines.join('\n');
+            })
+            .join('\n');
+        const entries=(S.sandboxTaskLogEntriesById&&S.sandboxTaskLogEntriesById[taskId])||[];
+        const stderrCount=(Array.isArray(entries)?entries:[]).reduce((acc, entry)=>acc+(String((entry&&entry.stream)||'').toLowerCase()==='stderr'?1:0), 0);
+        const label=String((task&&task.command)||task&&task.label||task&&task.exec_id||'exec');
+        const detailKey='req:'+String(reqKey)+':task:sandbox:'+String(idx)+':'+taskId+':'+stateKey;
+        const openAttr=isTerminalTaskStatus(status)?'':' open';
+        return '<details data-detail-key="'+esc(detailKey)+'" class="rounded border '+tone+'"'+openAttr+'>'
+            +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-amber-800/80 text-amber-100 text-[10px]">Exec</span><span class="truncate">'+esc(label)+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
+            +'<div class="px-2 pb-2 text-[11px] text-gray-200">'
+                +'<div class="mb-1">container='+esc(String((task&&task.container_name)||task&&task.container_id||'unknown'))+' exec='+esc(String((task&&task.exec_id)||''))+'</div>'
+                +'<div class="mb-1 text-[10px] text-gray-400">log chunks='+String((Array.isArray(entries)?entries:[]).length)+(stderrCount?(' | stderr='+String(stderrCount)):'')+'</div>'
+                +'<div class="bg-black/40 border border-gray-800 rounded p-2">'+renderSandboxLogTail(entries)+'</div>'
+                +(logs?'<details class="mt-1 rounded border border-gray-800/80 bg-black/30"><summary class="px-1.5 py-1 cursor-pointer text-[10px] text-gray-400">raw combined log</summary><pre class="px-1.5 pb-1.5 max-h-32 overflow-auto whitespace-pre-wrap break-words text-[10px] text-gray-400">'+esc(logs)+'</pre></details>':'')
+            +'</div>'
+        +'</details>';
+    }).join('');
+
+    const subagentRows=subagent.map((task, idx)=>{
+        const runId=String((task&&task.run_id)||task&&task.task_id||'').trim();
+        const status=String((task&&task.status)||'running').toLowerCase();
+        const tone=status==='failed'?'text-red-200 border-red-700/60 bg-red-950/30':(status==='completed'?'text-emerald-200 border-emerald-700/60 bg-emerald-950/30':'text-sky-100 border-sky-700/60 bg-sky-950/25');
+        const thinking=((S.subagentThinkingEntriesById&&S.subagentThinkingEntriesById[runId])||[])
+            .map((entry)=>String((entry&&entry.text_delta)||''))
+            .join('');
+        const step=String((task&&task.step)||'');
+        const detailKey='req:'+String(reqKey)+':task:subagent:'+String(idx)+':'+runId+':'+stateKey;
+        const openAttr=isTerminalTaskStatus(status)?'':' open';
+        return '<details data-detail-key="'+esc(detailKey)+'" class="rounded border '+tone+'"'+openAttr+'>'
+            +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-sky-800/80 text-sky-100 text-[10px]">Subagent</span><span class="truncate">'+esc(String((task&&task.label)||runId||'request'))+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
+            +'<div class="px-2 pb-2 text-[11px] text-gray-200">'
+                +'<div class="mb-1">run='+esc(runId)+' '+(step?('step='+esc(step)):'')+'</div>'
+                +'<pre class="max-h-40 overflow-auto whitespace-pre-wrap break-words bg-black/40 border border-gray-800 rounded p-2">'+esc(thinking||'No thinking yet')+'</pre>'
+            +'</div>'
+        +'</details>';
+    }).join('');
+
+    return '<details data-detail-key="'+esc('req:'+String(reqKey)+':tasks:'+stateKey)+'" class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden"'+(hasActiveTasks?' open':'')+'>'
+        +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Tasks ('+String(total)+')</summary>'
+        +'<div class="px-2 pb-2 pt-1 space-y-1">'+sandboxRows+subagentRows+'</div>'
+    +'</details>';
+}
+
 function mergeTaskStripItems(){
     const out=[];
     const sandbox=Array.isArray(S.sandboxTasks)?S.sandboxTasks:[];
@@ -1456,8 +1607,7 @@ function renderTimerBar(){
         if(kind==='timer' && rem<=0) return false;
         return true;
     });
-    const taskItems=mergeTaskStripItems();
-    if(!visibleTimers.length && !taskItems.length){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
+    if(!visibleTimers.length){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
   bar.classList.remove('hidden');
     const timerHtml=visibleTimers.map(t=>{
         const rem=Math.max(0,Math.round(t.remaining_seconds));
@@ -1486,26 +1636,7 @@ function renderTimerBar(){
         const ringingTxt=isRingingAlarm?' 🔔':'';
         return '<button type="button" class="'+baseCls+'"'+actionChunk+effectiveDisabledAttr+' title="'+esc(titleTxt)+'">'+icon+' '+esc(label)+ringingTxt+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
     }).join('');
-    const taskHtml=taskItems.map((item)=>{
-        const task=item.task||{};
-        const origin=item.origin;
-        const tid=String(task.task_id||task.run_id||'');
-        const status=String(task.status||'running').toLowerCase();
-        const tone=status==='failed'?'bg-red-800 hover:bg-red-700':(status==='completed'?'bg-emerald-800 hover:bg-emerald-700':'bg-sky-800 hover:bg-sky-700');
-        const icon=origin==='subagent'?'🤖':'🐳';
-        const label=origin==='subagent'?String(task.label||task.run_id||'subagent'):String(task.label||task.command||task.exec_id||'exec');
-        const age=formatTaskAge(task.started_ts);
-        const action=origin==='subagent'?'subagent-task-open':'sandbox-task-open';
-        return '<button type="button" class="flex items-center gap-1 px-2 py-1 rounded-full text-xs '+tone+'" data-action="'+action+'" data-task-id="'+esc(tid)+'" title="Open task details">'+icon+' '+esc(label)+' ['+esc(status)+'] '+age+'</button>';
-    }).join('');
-    const filter=String(S.taskStripFilter||'all');
-    const filterHtml=''
-        +'<div class="ml-auto flex items-center gap-1">'
-            +'<button type="button" data-action="task-strip-filter" data-filter="all" class="px-2 py-0.5 rounded text-xs '+(filter==='all'?'bg-gray-700':'bg-gray-800 hover:bg-gray-700')+'">All</button>'
-            +'<button type="button" data-action="task-strip-filter" data-filter="sandbox" class="px-2 py-0.5 rounded text-xs '+(filter==='sandbox'?'bg-gray-700':'bg-gray-800 hover:bg-gray-700')+'">Sandbox</button>'
-            +'<button type="button" data-action="task-strip-filter" data-filter="subagent" class="px-2 py-0.5 rounded text-xs '+(filter==='subagent'?'bg-gray-700':'bg-gray-800 hover:bg-gray-700')+'">Subagent</button>'
-        +'</div>';
-    bar.innerHTML=timerHtml+taskHtml+filterHtml+renderTaskDetailPanel();
+    bar.innerHTML=timerHtml;
 }
 
 function renderPage(){
@@ -1642,6 +1773,13 @@ function getSelectedMessages(selectedId){
     const t=(S.chatThreads||[]).find(x=>x.id===selectedId);
     return (t&&Array.isArray(t.messages)) ? t.messages : [];
 }
+function fmtThreadDate(ts){
+    if(!ts) return '';
+    const d=new Date(Number(ts)*1000);
+    const now=new Date();
+    const sameYear=d.getFullYear()===now.getFullYear();
+    return d.toLocaleDateString(undefined,sameYear?{month:'short',day:'numeric'}:{month:'short',day:'numeric',year:'numeric'});
+}
 function renderThreadList(selectedId){
     const list=document.getElementById('chatThreadList');
     if(!list) return;
@@ -1649,13 +1787,22 @@ function renderThreadList(selectedId){
     const threads = (S.chatThreads||[]).filter(t=>{
         if(String(t.id||'')==='active') return false;
         if(!query) return true;
-        return String((t.title||'')).toLowerCase().includes(query);
+        return (String(t.summary||'')+' '+String(t.title||'')).toLowerCase().includes(query);
     });
     const items = [];
     threads.forEach(t=>{
-        const title = esc((t.title||'Untitled').trim()||'Untitled');
+        const mainTitle = esc(((t.summary||t.title||'Untitled').trim())||'Untitled');
         const activeCls = (t.id===selectedId) ? 'bg-blue-800 text-white' : 'bg-gray-800 text-gray-200 hover:bg-gray-700';
-        items.push('<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="w-full text-left px-3 py-2 rounded-none transition-colors border-b border-gray-800 '+activeCls+'"><div class="flex items-center gap-2"><div class="text-sm truncate flex-1">'+title+'</div><span data-action="chat-delete-open" data-thread-id="'+esc(t.id)+'" data-thread-title="'+title+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete chat history" aria-label="Delete chat history">✕</span></div></button>');
+        const subCls = (t.id===selectedId) ? 'text-blue-200' : 'text-gray-500';
+        const filename = esc(t.filename||t.id||'');
+        const created = fmtThreadDate(t.created_ts);
+        const updated = fmtThreadDate(t.updated_ts);
+        const dateStr = created ? (updated && updated!==created ? created+' · '+updated : created) : '';
+        const metaParts = [];
+        if(filename) metaParts.push('<span>'+filename+'</span>');
+        if(dateStr) metaParts.push('<span>'+dateStr+'</span>');
+        const metaHtml = metaParts.length ? '<div class="text-xs '+subCls+' mt-0.5 truncate leading-tight">'+metaParts.join('<span class="mx-1">·</span>')+'</div>' : '';
+        items.push('<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="w-full text-left px-3 py-2 rounded-none transition-colors border-b border-gray-800 '+activeCls+'"><div class="flex items-center gap-2"><div class="flex-1 min-w-0"><div class="text-sm truncate">'+mainTitle+'</div>'+metaHtml+'</div><span data-action="chat-delete-open" data-thread-id="'+esc(t.id)+'" data-thread-title="'+mainTitle+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete chat history" aria-label="Delete chat history">✕</span></div></button>');
     });
     if(!items.length){
         items.push('<div class="px-3 py-2 text-sm text-gray-500 border-b border-gray-800">No chats found</div>');
@@ -3261,6 +3408,20 @@ function mkBubble(m){
                     attachPlainTriangleToDetails(debugDetails, debugDetails.querySelector('summary'));
                 }
                 wrap.appendChild(timeline);
+            }
+
+            const tasksBlockHtml=renderRequestTasksBlock(reqKey);
+            if(tasksBlockHtml){
+                const tasksWrap=document.createElement('div');
+                tasksWrap.innerHTML=tasksBlockHtml;
+                const tasksDetails=tasksWrap.querySelector('details[data-detail-key^="'+esc('req:'+reqKey+':tasks:')+'"]');
+                if(tasksDetails){
+                    attachPlainTriangleToDetails(tasksDetails, tasksDetails.querySelector('summary'));
+                    tasksDetails.querySelectorAll('details[data-detail-key]').forEach((inner)=>{
+                        attachPlainTriangleToDetails(inner, inner.querySelector('summary'));
+                    });
+                }
+                wrap.appendChild(tasksWrap);
             }
         }
 

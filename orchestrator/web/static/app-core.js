@@ -12,6 +12,7 @@ const PREF_CONTINUOUS = 'openclaw.ui.continuousMode';
 const PREF_MUSIC_QUEUE_FILTER = 'openclaw.ui.musicQueueFilter';
 const PREF_MUSIC_PLAYLIST_FILTER = 'openclaw.ui.musicPlaylistFilter';
 const PREF_CHAT_SEND_MODE = 'openclaw.ui.chatSendMode';
+const PREF_CHAT_DRAFT = 'openclaw.ui.chatDraft';
 const PREF_CHAT_VERBOSE_LEVEL = 'openclaw.ui.chatVerboseLevel';
 const PREF_CHAT_REASONING_LEVEL = 'openclaw.ui.chatReasoningLevel';
 const PREF_CHAT_LIFECYCLE_POLICY = 'openclaw.ui.chatLifecyclePolicy';
@@ -172,6 +173,18 @@ function normalizeChatLifecyclePolicy(policy){
 
 function persistChatSendMode(){
     writeStringPref(PREF_CHAT_SEND_MODE, normalizeChatSendMode(S.chatSendMode));
+}
+
+function readChatComposerDraft(){
+    return readStringPref(PREF_CHAT_DRAFT, '');
+}
+
+function persistChatComposerDraft(value){
+    writeStringPref(PREF_CHAT_DRAFT, String(value||''));
+}
+
+function clearChatComposerDraft(){
+    try { localStorage.removeItem(PREF_CHAT_DRAFT); } catch(_) {}
 }
 
 function restoreChatSendModePref(){
@@ -1233,10 +1246,10 @@ function updateChatComposerState(){
         modeSteerBtn.className = 'px-2 py-1 rounded text-xs ' + (mode==='steer' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700');
     }
     if(statusRow && statusChip && statusText){
-        const hasState = isRunning || S.chatStopPending || S.chatRunState==='failed' || S.chatRunState==='completed';
+        const hasState = isRunning || S.chatStopPending || isPending || S.chatRunState==='failed';
         statusRow.classList.toggle('hidden', !hasState);
-        const stateLabel = S.chatStopPending ? 'Stopping' : String(S.chatRunState||'idle').replace('_',' ');
-        const stateKey = S.chatStopPending ? 'stopping' : S.chatRunState;
+        const stateLabel = S.chatStopPending ? 'Stopping' : (isPending && !isRunning ? 'Sending' : String(S.chatRunState||'idle').replace('_',' '));
+        const stateKey = S.chatStopPending ? 'stopping' : ((isPending && !isRunning) ? 'sending' : S.chatRunState);
         const tone = stateKey==='failed' ? 'bg-red-700' : (stateKey==='completed' ? 'bg-emerald-700' : (stateKey==='waiting_tool' ? 'bg-amber-700' : 'bg-blue-700'));
         statusChip.className = 'inline-flex items-center px-2 py-0.5 rounded-full text-gray-100 ' + tone;
         statusChip.textContent = stateLabel.charAt(0).toUpperCase() + stateLabel.slice(1);

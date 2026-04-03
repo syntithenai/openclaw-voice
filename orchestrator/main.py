@@ -1993,6 +1993,10 @@ async def run_orchestrator() -> None:
                 file_manager_excluded_folders=config.web_ui_file_manager_excluded_folders,
                 file_manager_top_level_config_files=config.web_ui_file_manager_top_level_config_files,
                 file_manager_max_editable_bytes=config.web_ui_file_manager_max_editable_bytes,
+                quick_answer_llm_url=config.quick_answer_llm_url if config.quick_answer_enabled else "",
+                quick_answer_model=config.quick_answer_model,
+                quick_answer_api_key=config.quick_answer_api_key,
+                quick_answer_timeout_ms=config.quick_answer_timeout_ms,
             )
             await web_service.start()
             web_service.update_recordings_state(recordings_catalog.list_recordings())
@@ -2605,6 +2609,79 @@ async def run_orchestrator() -> None:
                 nonlocal web_chat_interim_enabled
                 web_chat_interim_enabled = bool(enabled)
 
+            def _map_gateway_session_to_chat_thread(session_obj: dict[str, Any]) -> dict[str, Any] | None:
+                if not isinstance(session_obj, dict):
+                    return None
+                thread_id = str(
+                    session_obj.get("key")
+                    or session_obj.get("sessionKey")
+                    or session_obj.get("id")
+                    or ""
+                ).strip()
+                if not thread_id:
+                    return None
+
+                title = str(
+                    session_obj.get("title")
+                    or session_obj.get("derivedTitle")
+                    or session_obj.get("name")
+                    or ""
+                ).strip() or "Untitled"
+
+                def _read_ts(*keys: str) -> float:
+                    for key in keys:
+                        val = session_obj.get(key)
+                        if val is None:
+                            continue
+                        try:
+                            num = float(val)
+                            if num > 1e12:
+                                num = num / 1000.0
+                            if num > 0:
+                                return num
+                        except Exception:
+                            continue
+                    return time.time()
+
+                created_ts = _read_ts("createdAt", "created_at", "createdTs", "created_ts")
+                updated_ts = _read_ts("updatedAt", "updated_at", "lastMessageAt", "last_message_at", "updatedTs", "updated_ts")
+
+                out: dict[str, Any] = {
+                    "id": thread_id,
+                    "title": title,
+                    "created_ts": created_ts,
+                    "updated_ts": updated_ts,
+                    "filename": f"{thread_id}.chat",
+                }
+
+                summary = str(
+                    session_obj.get("summary")
+                    or session_obj.get("preview")
+                    or session_obj.get("lastMessage")
+                    or ""
+                ).strip()
+                if summary:
+                    out["summary"] = summary[:240]
+                return out
+
+            async def _ui_chat_load_thread_messages(client_thread_id: str, client_id: str) -> list[dict[str, Any]] | None:
+                if not hasattr(gateway, "fetch_chat_history"):
+                    return None
+                thread_id = str(client_thread_id or "").strip()
+                if not thread_id or thread_id == "active":
+                    return None
+                try:
+                    from orchestrator.gateway.session_mapper import map_gateway_messages_to_voice_format
+
+                    rows = await gateway.fetch_chat_history(
+                        session_key=thread_id,
+                        limit=max(50, int(config.web_ui_chat_history_limit)),
+                    )
+                    return map_gateway_messages_to_voice_format(rows)
+                except Exception as exc:
+                    logger.warning("Web UI chat history load failed for %s: %s", thread_id, exc)
+                    return None
+
             async def _ui_recordings_list(client_id: str) -> list[dict[str, Any]]:
                 if not recordings_catalog:
                     return []
@@ -2667,10 +2744,97 @@ async def run_orchestrator() -> None:
                 on_chat_reasoning_set=_ui_chat_reasoning_set,
                 on_chat_lifecycle_policy_set=_ui_chat_lifecycle_policy_set,
                 on_chat_interim_set=_ui_chat_interim_set,
+                on_chat_load_thread_messages=_ui_chat_load_thread_messages,
                 on_tts_mute_set=_ui_tts_mute_set,
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,
             )
+
+            async def _web_ui_chat_session_sync() -> None:
+                if not hasattr(gateway, "list_sessions") or not hasattr(gateway, "fetch_chat_history"):
+                    return
+
+                last_threads_signature = ""
+                last_active_thread_signature = ""
+                sync_interval_s = 0.8
+
+                while True:
+                    await asyncio.sleep(sync_interval_s)
+                    if not web_service:
+                        break
+                    if not web_service.has_active_client():
+                        continue
+                    try:
+                        sessions = await gateway.list_sessions(
+                            agent_id=agent_id,
+                            limit=100,
+                            include_derived_titles=True,
+                            include_last_message=True,
+                        )
+                    except Exception as exc:
+                        logger.debug("Web UI chat session sync: sessions.list failed: %s", exc)
+                        continue
+
+                    synced_threads: list[dict[str, Any]] = []
+                    for session_obj in sessions:
+                        mapped = _map_gateway_session_to_chat_thread(session_obj)
+                        if mapped is not None:
+                            synced_threads.append(mapped)
+
+                    threads_signature = json.dumps(
+                        [
+                            (
+                                str(t.get("id", "")),
+                                str(t.get("title", "")),
+                                float(t.get("updated_ts", 0.0) or 0.0),
+                                str(t.get("summary", "")),
+                            )
+                            for t in synced_threads
+                        ],
+                        ensure_ascii=False,
+                    )
+                    if threads_signature != last_threads_signature:
+                        last_threads_signature = threads_signature
+                        web_service.replace_chat_threads(synced_threads)
+
+                    active_thread_id = str(web_service.get_active_chat_thread_id() or "").strip()
+                    if (
+                        (not active_thread_id or active_thread_id == "active")
+                        and synced_threads
+                        and not list(getattr(web_service, "_chat_messages", []) or [])
+                    ):
+                        active_thread_id = str(synced_threads[0].get("id", "")).strip()
+                    if not active_thread_id or active_thread_id == "active":
+                        continue
+                    if not any(str(t.get("id", "")).strip() == active_thread_id for t in synced_threads):
+                        continue
+
+                    try:
+                        mapped_messages = await _ui_chat_load_thread_messages(active_thread_id, "sync")
+                    except Exception as exc:
+                        logger.debug("Web UI chat session sync: history fetch failed for %s: %s", active_thread_id, exc)
+                        continue
+                    if mapped_messages is None:
+                        continue
+
+                    active_thread_signature = json.dumps(
+                        [
+                            (
+                                str(m.get("role", "")),
+                                str(m.get("text", "")),
+                                str(m.get("phase", "")),
+                                str(m.get("name", "")),
+                                str(m.get("tool_call_id", "")),
+                            )
+                            for m in mapped_messages
+                        ],
+                        ensure_ascii=False,
+                    )
+                    thread_sig_key = f"{active_thread_id}:{active_thread_signature}"
+                    if thread_sig_key == last_active_thread_signature:
+                        continue
+                    last_active_thread_signature = thread_sig_key
+                    web_service.select_chat_thread(active_thread_id, messages_override=mapped_messages)
 
             _sync_music_output_route("post_web_handler_init")
 
@@ -2878,6 +3042,7 @@ async def run_orchestrator() -> None:
                     pass
 
             asyncio.create_task(_web_ui_publisher())
+            asyncio.create_task(_web_ui_chat_session_sync())
 
         except Exception as exc:
             logger.error("Failed to start embedded web UI: %s", exc)
@@ -3538,6 +3703,9 @@ async def run_orchestrator() -> None:
             logger.info("📍 New user message [req#%d gen#%d]", current_request_id, req_generation)
             print(f"\033[93m→ USER: {combined_transcript}\033[0m", flush=True)
             is_music_query = bool(music_router and music_router.is_music_related(combined_transcript))
+            # Route prompts through quick-answer (Granite) first when enabled so the LLM
+            # decides tool-calling vs upstream escalation.
+            granite_quick_answer_first = bool(config.quick_answer_force_llm_routing)
             _safe_update_or_append_chat_message(
                 {
                     "role": "user",
@@ -3559,7 +3727,7 @@ async def run_orchestrator() -> None:
             # Hard local fast-path for timers/alarms before any QA bypass logic.
             # This guarantees deterministic timer handling stays local even if quick-answer
             # is unavailable or currently in a bypass window.
-            if timers_feature_enabled and tool_router:
+            if (not granite_quick_answer_first) and timers_feature_enabled and tool_router:
                 try:
                     direct_timer_result = await tool_router.try_deterministic_parse(combined_transcript)
                 except Exception as exc:
@@ -3620,7 +3788,7 @@ async def run_orchestrator() -> None:
             # Hard local fast-path for deterministic music commands before QA/upstream.
             # This prevents clear local music intents (e.g. "play some jazz music")
             # from leaking upstream when QA bypassing/escalation heuristics are active.
-            if should_send_to_gateway and config.music_enabled and music_router:
+            if (not granite_quick_answer_first) and should_send_to_gateway and config.music_enabled and music_router:
                 try:
                     direct_music_result = await music_router.handle_request(combined_transcript, use_fast_path=True)
                 except Exception as exc:
@@ -3688,6 +3856,8 @@ async def run_orchestrator() -> None:
                 and last_gateway_send_ts is not None
                 and (time.monotonic() - last_gateway_send_ts) * 1000 < bypass_window_ms
             )
+            if granite_quick_answer_first:
+                in_bypass_window = False
             local_skill_query = False
             if quick_answer_client:
                 try:
@@ -5428,12 +5598,31 @@ async def run_orchestrator() -> None:
                                 winning_signal="lifecycle_error",
                             )
                     if hasattr(web_service, "update_sandbox_exec_task"):
-                        step_payload: dict[str, Any] = {
-                            "tool_call_id": tool_call_id,
-                            "details": details if isinstance(details, dict) else None,
-                            "output": details_preview if isinstance(details, str) else "",
-                        }
-                        _publish_sandbox_exec_event(request_id, name, phase, step_payload)
+                        phase_l = phase.lower()
+                        exec_status = "running"
+                        if phase_l in {"result", "end", "done", "ok", "complete", "completed"}:
+                            exec_status = "completed"
+                        elif phase_l in {"error", "failed", "failure"}:
+                            exec_status = "failed"
+                        elif phase_l in {"cancelled", "canceled", "aborted"}:
+                            exec_status = "cancelled"
+
+                        task_id = tool_call_id or f"exec-{int(request_id)}"
+                        web_service.update_sandbox_exec_task(
+                            {
+                                "task_id": task_id,
+                                "label": name,
+                                "request_id": int(request_id),
+                                "tool_call_id": tool_call_id,
+                                "exec_id": tool_call_id,
+                                "command": name,
+                                "status": exec_status,
+                                "metadata_quality": "synthetic",
+                            }
+                        )
+                        if hasattr(web_service, "append_sandbox_exec_log") and details_preview:
+                            stream = "stderr" if exec_status == "failed" else "stdout"
+                            web_service.append_sandbox_exec_log(task_id, details_preview[:1200], exec_id=tool_call_id, stream=stream)
 
                     details_text = details if isinstance(details, str) else json.dumps(details, ensure_ascii=False)
                     if name.lower() in {"lifecycle", "compaction", "reasoning"}:

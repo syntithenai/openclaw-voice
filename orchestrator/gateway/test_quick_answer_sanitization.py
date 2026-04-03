@@ -25,12 +25,12 @@ def test_sanitize_quick_answer_text_handles_non_string() -> None:
     assert sanitize_quick_answer_text(None) == ""
 
 
-def test_truncate_to_target_words_caps_summary_at_50_words() -> None:
-    text = " ".join(f"word{i}" for i in range(1, 61))
-    truncated = _truncate_to_target_words(text, 50)
-    assert len(truncated.split()) == 50
+def test_truncate_to_target_words_caps_summary_at_70_words() -> None:
+    text = " ".join(f"word{i}" for i in range(1, 81))
+    truncated = _truncate_to_target_words(text, 70)
+    assert len(truncated.split()) == 70
     assert truncated.split()[0] == "word1"
-    assert truncated.split()[-1] == "word50"
+    assert truncated.split()[-1] == "word70"
 
 
 def test_sanitize_quick_answer_text_extracts_nested_tool_result_response() -> None:

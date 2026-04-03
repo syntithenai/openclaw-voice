@@ -262,6 +262,7 @@ class VoiceConfig(BaseSettings):
     quick_answer_timeout_ms: int = Field(5000)  # Timeout for quick answer requests
     quick_answer_mirror_enabled: bool = Field(False)  # Mirror QA turns to the openclaw session so they appear in web chat
     quick_answer_bypass_window_ms: int = Field(8000)  # After a transcript is sent to gateway, bypass quick answer for this many ms (0=disabled)
+    quick_answer_force_llm_routing: bool = Field(True)  # When true, disable deterministic pre-parsing and always evaluate prompts via quick-answer first
 
     # Quick Answer Model Tier Resolution
     quick_answer_model_tier_fast_id: str = Field("")  # Fast tier model ID (e.g., for deterministic local tasks)
@@ -279,7 +280,7 @@ class VoiceConfig(BaseSettings):
     # TTS long-response summary behavior (uses quick-answer endpoint for spoken compression)
     tts_long_response_summary_enabled: bool = Field(True)
     tts_long_response_summary_word_trigger: int = Field(50)
-    tts_long_response_summary_target_words: int = Field(50)
+    tts_long_response_summary_target_words: int = Field(70)
     tts_long_response_summary_timeout_ms: int = Field(3500)
     gateway_tts_streaming_enabled: bool = Field(False, validation_alias=AliasChoices("GATEWAY_TTS_STREAMING_ENABLED"))
 

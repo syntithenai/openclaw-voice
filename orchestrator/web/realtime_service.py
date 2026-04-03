@@ -26,6 +26,12 @@ try:
     _JWT_AVAILABLE = True
 except ImportError:
     _JWT_AVAILABLE = False
+try:
+    import httpx as _httpx
+    _HTTPX_AVAILABLE = True
+except ImportError:
+    _httpx = None  # type: ignore[assignment]
+    _HTTPX_AVAILABLE = False
 from orchestrator.observability.latency_trace import emit as emit_latency_trace
 from orchestrator.observability.latency_trace import scoped_action
 from orchestrator.web.file_manager_service import WorkspaceFileManager
@@ -74,6 +80,10 @@ class EmbeddedVoiceWebService:
         file_manager_excluded_folders: str = "recordings,playlists,timers,.media,.openclaw",
         file_manager_top_level_config_files: str = "SOUL.md,BOOTSTRAP.md,TOOLS.md,HEARTBEAT.md,IDENTITY.md,USER.md,AGENTS.md",
         file_manager_max_editable_bytes: int = 2_000_000,
+        quick_answer_llm_url: str = "",
+        quick_answer_model: str = "",
+        quick_answer_api_key: str = "",
+        quick_answer_timeout_ms: int = 5000,
     ):
         self.host = host
         self.ui_port = ui_port
@@ -165,6 +175,11 @@ class EmbeddedVoiceWebService:
         except Exception:
             logger.debug("Could not initialize chat debug frames directory", exc_info=True)
         self._load_chat_state()
+        self._qa_llm_url = str(quick_answer_llm_url or "").strip()
+        self._qa_model = str(quick_answer_model or "").strip()
+        self._qa_api_key = str(quick_answer_api_key or "").strip()
+        self._qa_timeout_s = max(1.0, float(quick_answer_timeout_ms or 5000) / 1000.0)
+        self._summary_tasks: dict[str, Any] = {}
         self._music_state: dict[str, Any] = {
             "state": "stop", "title": "", "artist": "", "album": "",
             "queue_length": 0, "elapsed": 0.0, "duration": 0.0, "position": -1,
@@ -785,22 +800,122 @@ class EmbeddedVoiceWebService:
             -1,
         )
         created_ts = now
+        existing_summary: str | None = None
+        existing_filename: str | None = None
         if existing_index >= 0:
             existing = self._chat_threads.pop(existing_index)
             try:
                 created_ts = float(existing.get("created_ts", now))
             except Exception:
                 created_ts = now
-        thread = {
+            existing_summary = existing.get("summary")
+            existing_filename = existing.get("filename")
+        filename = existing_filename or (
+            "chat-" + time.strftime("%Y%m%d", time.localtime(created_ts)) + "-" + thread_id[:8] + ".chat"
+        )
+        thread: dict[str, Any] = {
             "id": thread_id,
             "title": self._derive_chat_title(self._chat_messages),
             "messages": list(self._chat_messages),
             "created_ts": created_ts,
             "updated_ts": now,
+            "filename": filename,
         }
+        if existing_summary:
+            thread["summary"] = existing_summary
         self._chat_threads.insert(0, thread)
         if len(self._chat_threads) > self._chat_thread_limit:
             self._chat_threads = self._chat_threads[: self._chat_thread_limit]
+        self._schedule_thread_summary(thread_id, thread["messages"])
+
+    def _schedule_thread_summary(self, thread_id: str, messages: list[dict[str, Any]]) -> None:
+        """Schedule async LLM summary generation for this thread, cancelling any pending task."""
+        if not self._qa_llm_url or not _HTTPX_AVAILABLE:
+            return
+        has_user = any(str(m.get("role", "")).lower() == "user" for m in messages)
+        if not has_user:
+            return
+        existing = self._summary_tasks.get(thread_id)
+        if existing and not existing.done():
+            existing.cancel()
+        try:
+            self._summary_tasks[thread_id] = asyncio.create_task(
+                self._generate_thread_summary(thread_id, list(messages))
+            )
+        except RuntimeError:
+            pass
+
+    async def _generate_thread_summary(self, thread_id: str, messages: list[dict[str, Any]]) -> None:
+        """Call the quick-answer LLM to generate a concise session title for a thread."""
+        parts: list[str] = []
+        for m in messages[:20]:
+            role = str(m.get("role", "")).lower()
+            text = str(m.get("text", "")).strip()
+            if role in ("user", "assistant") and text:
+                parts.append(f"{role.capitalize()}: {text[:200]}")
+        if not parts:
+            return
+        excerpt = "\n".join(parts[:10])
+        payload = {
+            "model": self._qa_model or "default",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "Generate a concise, descriptive title (6-10 words) for this conversation. "
+                        "Reply with only the title text. No punctuation at the end. No quotes."
+                    ),
+                },
+                {"role": "user", "content": f"Conversation:\n{excerpt}\n\nTitle:"},
+            ],
+            "temperature": 0.3,
+            "max_tokens": 30,
+        }
+        headers: dict[str, str] = {"Content-Type": "application/json"}
+        if self._qa_api_key:
+            headers["Authorization"] = f"Bearer {self._qa_api_key}"
+        try:
+            async with _httpx.AsyncClient() as client:
+                response = await client.post(
+                    self._qa_llm_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=self._qa_timeout_s,
+                )
+            if response.status_code != 200:
+                return
+            data = response.json()
+            choices = data.get("choices") if isinstance(data, dict) else None
+            if not choices:
+                return
+            content = str(
+                (choices[0].get("message", {}) if isinstance(choices[0], dict) else {}).get("content", "") or ""
+            ).strip().strip('"\'').strip()
+            if not content or len(content) > 120:
+                return
+            found = False
+            for t in self._chat_threads:
+                if str(t.get("id", "")) == thread_id:
+                    t["summary"] = content
+                    found = True
+                    break
+            if not found:
+                return
+            self._persist_chat_state()
+            asyncio.create_task(
+                self.broadcast(
+                    {
+                        "type": "chat_threads_update",
+                        "active_chat_id": self._active_chat_id,
+                        "active_chat_thread_id": self._active_chat_thread_id,
+                        "chat_threads": list(self._chat_threads),
+                    }
+                )
+            )
+        except Exception:
+            logger.debug("Chat summary generation failed for thread %s", thread_id, exc_info=True)
+        finally:
+            self._summary_tasks.pop(thread_id, None)
 
     def _archive_active_chat_if_needed(self) -> None:
         if not self._chat_messages:
@@ -812,22 +927,33 @@ class EmbeddedVoiceWebService:
             -1,
         )
         created_ts = now
+        existing_summary: str | None = None
+        existing_filename: str | None = None
         if existing_index >= 0:
             existing = self._chat_threads.pop(existing_index)
             try:
                 created_ts = float(existing.get("created_ts", now))
             except Exception:
                 created_ts = now
-        archived = {
+            existing_summary = existing.get("summary")
+            existing_filename = existing.get("filename")
+        filename = existing_filename or (
+            "chat-" + time.strftime("%Y%m%d", time.localtime(created_ts)) + "-" + thread_id[:8] + ".chat"
+        )
+        archived: dict[str, Any] = {
             "id": thread_id,
             "title": self._derive_chat_title(self._chat_messages),
             "messages": list(self._chat_messages),
             "created_ts": created_ts,
             "updated_ts": now,
+            "filename": filename,
         }
+        if existing_summary:
+            archived["summary"] = existing_summary
         self._chat_threads.insert(0, archived)
         if len(self._chat_threads) > self._chat_thread_limit:
             self._chat_threads = self._chat_threads[: self._chat_thread_limit]
+        self._schedule_thread_summary(thread_id, archived["messages"])
         self._persist_chat_state()
 
     def start_new_chat(self) -> None:
