@@ -410,6 +410,7 @@ function fmtDurationLong(seconds){
 
 function renderRecordingsPage(main){
   main.dataset.page='recordings';
+  const totalRecordings=(S.recordings||[]).length;
   const selectedCount=Object.keys(S.recordingsSelectionByIds||{}).filter(k=>S.recordingsSelectionByIds[k]).length;
   const detail=S.recordingsDetail;
   const loading=!!S.recordingsDetailLoading;
@@ -481,16 +482,19 @@ function renderRecordingsPage(main){
   const starting=!!S.recorderStartPending;
   const stopping=!!S.recorderStopPending;
   const recActive=!!S.recorderActive;
+  const allSelected=totalRecordings>0 && selectedCount>=totalRecordings;
   const recBtn = recActive
     ? '<button data-action="recordings-stop-recording" class="px-3 py-1.5 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors" '+(stopping?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(stopping?'Stopping…':'Stop Recording')+'</button>'
     : '<button data-action="recordings-start-recording" class="px-3 py-1.5 rounded-lg text-sm bg-green-700 hover:bg-green-600 transition-colors" '+(starting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(starting?'Starting…':'Start Recording')+'</button>';
   main.innerHTML='<div class="max-w-5xl mx-auto px-2 py-4 space-y-3">'
     +'<div class="flex items-center justify-between gap-2 px-2 flex-wrap">'
-      +'<h2 class="font-semibold text-lg">Recordings <span class="text-gray-400 font-normal text-sm ml-1">'+(S.recordings||[]).length+'</span></h2>'
+      +'<h2 class="font-semibold text-lg">Recordings <span class="text-gray-400 font-normal text-sm ml-1">'+totalRecordings+'</span></h2>'
       +'<div class="flex items-center gap-2">'
         +(selectedCount>0
           ? '<button data-action="recordings-delete-selected" class="px-3 py-1.5 rounded-lg text-sm bg-red-800 hover:bg-red-700 transition-colors" '+(deleting?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>'+(deleting?'Deleting…':'Delete Selected Recordings ('+selectedCount+')')+'</button>'
           : '')
+        +'<button type="button" data-action="recordings-select-all" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors" '+((!totalRecordings || allSelected)?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>Select All</button>'
+        +'<button type="button" data-action="recordings-select-none" class="px-3 py-1.5 rounded-lg text-sm bg-gray-700 hover:bg-gray-600 transition-colors" '+(selectedCount===0?'disabled style="opacity:.6;cursor:not-allowed"':'')+'>Select None</button>'
         +recBtn
       +'</div>'
     +'</div>'
@@ -771,6 +775,8 @@ function connectWs(){
   S.ws=new WebSocket(wsUrl()); S.ws.binaryType='arraybuffer';
     S.ws.onopen=()=>{
             S.wsConnected=true;
+            S.chatThreadLoadPendingId='';
+            S.chatThreadBootstrapRequested=false;
             S.wsDebug.status='open';
                 S.wsDebug.lastError='';
                 updateWsDebugBanner();
@@ -783,6 +789,8 @@ function connectWs(){
     };
     S.ws.onclose=(evt)=>{
         S.wsConnected=false;
+      S.chatThreadLoadPendingId='';
+      S.chatThreadBootstrapRequested=false;
         S.wsDebug.status='closed';
         S.wsDebug.lastCloseCode=(evt&&evt.code!==undefined)?evt.code:null;
         S.wsDebug.lastCloseReason=(evt&&evt.reason)?String(evt.reason):'';

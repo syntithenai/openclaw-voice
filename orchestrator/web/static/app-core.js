@@ -64,6 +64,7 @@ const S = {
   voice_state:'idle', wake_state:'asleep', tts_playing:false, mic_rms:0,
     chat:[], music:{state:'stop',title:'',artist:'',queue_length:0,elapsed:0,duration:0,position:-1,loaded_playlist:''},
     chatThreads:[], activeChatId:'active', activeChatThreadId:'', selectedChatId:'active', chatSidebarOpen:!isMobileChatViewport(), chatSidebarTouched:false,
+    chatThreadLoadPendingId:'', chatThreadBootstrapRequested:false,
                 chatThreadFilter:'',
     chatReloadTargetId:'', chatReloadTargetThreadId:'',
     chatReloadInFlight:null,
@@ -122,6 +123,7 @@ const S = {
     chatStatusText:'No active request',
     chatLastActivityTs:0,
     chatLastTerminal:{reason:'', ts:0},
+    chatTerminalStateByRequest:{},
     chatStreamCursorByRequest:{},
     chatReconcilePendingByRequest:{},
     pendingChatSteerNowByAction:{},
@@ -193,6 +195,11 @@ function restoreChatSendModePref(){
 
 function inferChatRunState(){
     const msgs = Array.isArray(S.chat) ? S.chat : [];
+    const explicitReqId = String(S.chatActiveRequestId||'').trim();
+    const explicitStateRaw = String(S.chatRunState||'').trim().toLowerCase();
+    const explicitState = explicitStateRaw === 'in_progress' ? 'streaming' : explicitStateRaw;
+    const explicitStatus = String(S.chatStatusText||'').trim();
+    const explicitRunning = explicitState==='streaming' || explicitState==='waiting_tool';
     let latestReqId = '';
     for(let i=msgs.length-1;i>=0;i--){
         const rid = String((msgs[i]&&msgs[i].request_id)||'').trim();
@@ -202,6 +209,22 @@ function inferChatRunState(){
         }
     }
     if(!latestReqId){
+        if(explicitReqId && explicitRunning){
+            return {
+                state: explicitState,
+                requestId: explicitReqId,
+                statusText: explicitStatus || (explicitState==='waiting_tool' ? 'Waiting for tool execution' : 'Streaming response'),
+                running: true,
+            };
+        }
+        if(explicitReqId && (explicitState==='failed' || explicitState==='completed' || explicitState==='superseded' || explicitState==='cancelled')){
+            return {
+                state: explicitState,
+                requestId: explicitReqId,
+                statusText: explicitStatus || (explicitState==='failed' ? 'Request failed' : 'Request completed'),
+                running: false,
+            };
+        }
         return {state:'idle', requestId:'', statusText:'No active request', running:false};
     }
 
@@ -211,6 +234,9 @@ function inferChatRunState(){
     let hasLifecycleTerminal = false;
     let hasLifecycleError = false;
     let hasToolWaiting = false;
+    const terminalByRequest = (S.chatTerminalStateByRequest && typeof S.chatTerminalStateByRequest==='object')
+        ? S.chatTerminalStateByRequest
+        : {};
     for(let i=0;i<msgs.length;i++){
         const msg = msgs[i]||{};
         const rid = String(msg.request_id||'').trim();
@@ -238,7 +264,9 @@ function inferChatRunState(){
         }
     }
 
-    const running = !hasFinal && !hasLifecycleTerminal && (hasStream || hasLifecycleStart || hasToolWaiting);
+    const terminalState = latestReqId ? String(((terminalByRequest[latestReqId]||{}).state)||'').trim().toLowerCase() : '';
+    const hasTerminalOverride = terminalState==='completed' || terminalState==='failed' || terminalState==='superseded' || terminalState==='cancelled';
+    const running = !hasTerminalOverride && !hasFinal && !hasLifecycleTerminal && (hasStream || hasLifecycleStart || hasToolWaiting);
     if(running){
         return {
             state: hasToolWaiting ? 'waiting_tool' : 'streaming',
@@ -246,6 +274,25 @@ function inferChatRunState(){
             statusText: hasToolWaiting ? 'Waiting for tool execution' : 'Streaming response',
             running: true,
         };
+    }
+    if(explicitReqId===latestReqId && explicitRunning){
+        return {
+            state: explicitState,
+            requestId: latestReqId,
+            statusText: explicitStatus || (explicitState==='waiting_tool' ? 'Waiting for tool execution' : 'Streaming response'),
+            running: true,
+        };
+    }
+    if(hasTerminalOverride){
+        const reason = String(((terminalByRequest[latestReqId]||{}).reason)||'').trim();
+        let statusText = reason;
+        if(!statusText){
+            if(terminalState==='superseded') statusText = 'Request stopped';
+            else if(terminalState==='cancelled') statusText = 'Request cancelled';
+            else if(terminalState==='failed') statusText = 'Request failed';
+            else statusText = 'Request completed';
+        }
+        return {state:terminalState, requestId:latestReqId, statusText, running:false};
     }
     if(hasLifecycleError){
         return {state:'failed', requestId:latestReqId, statusText:'Request failed', running:false};
@@ -964,32 +1011,14 @@ function stripRawGatewayForCache(messages){
 
 function persistChatCache(){
     try {
-        const payload = {
-            version: CHAT_CACHE_VERSION,
-            saved_ts: Date.now()/1000,
-            activeChatId: String(S.activeChatId||'active'),
-            selectedChatId: String(S.selectedChatId||'active'),
-            chat: stripRawGatewayForCache(S.chat),
-            chatThreads: (Array.isArray(S.chatThreads)?S.chatThreads:[])
-                .map(normalizeChatThread)
-                .filter(Boolean)
-                .map((thread)=>Object.assign({}, thread, {messages: stripRawGatewayForCache(thread.messages)})),
-        };
-        localStorage.setItem(getChatCacheKey(), JSON.stringify(payload));
+        // Chat session/thread state is server-authoritative. Keep no local cache copy
+        // so stale browser data cannot override fresh server selections or ordering.
+        localStorage.removeItem(getChatCacheKey());
     } catch(_) {}
 }
 
 function hydrateChatCache(){
-    try {
-        const raw = localStorage.getItem(getChatCacheKey());
-        if(!raw) return;
-        const data = JSON.parse(raw);
-        if(!data || typeof data!=='object') return;
-        if(Array.isArray(data.chat)) S.chat = data.chat.map(normalizeChatMessage).filter(Boolean);
-        if(Array.isArray(data.chatThreads)) S.chatThreads = data.chatThreads.map(normalizeChatThread).filter(Boolean);
-        if(data.activeChatId) S.activeChatId = String(data.activeChatId);
-        if(data.selectedChatId) S.selectedChatId = String(data.selectedChatId);
-    } catch(_) {}
+    // Intentionally no-op: chat state is loaded from websocket state snapshots.
 }
 
 function applyServerChatState(chat, chatThreads, activeChatId, activeChatThreadId){
@@ -1001,22 +1030,32 @@ function applyServerChatState(chat, chatThreads, activeChatId, activeChatThreadI
     if(activeChatThreadId!==undefined){
         S.activeChatThreadId = String(activeChatThreadId||'').trim();
     }
+    const pendingTid = String(S.chatThreadLoadPendingId||'').trim();
     const activeTid = String(S.activeChatThreadId||'').trim();
-    if(activeTid && (S.chatThreads||[]).some(t=>String(t.id||'')===activeTid)){
-        S.selectedChatId = activeTid;
-    } else if(activeChatThreadId!==undefined){
-        // Server explicitly reported no active thread (e.g. after New), so show active session.
-        S.selectedChatId = 'active';
+    if(pendingTid && activeTid && pendingTid===activeTid){
+        S.chatThreadLoadPendingId = '';
     }
+
+    const selectedBefore = String(S.selectedChatId||'active').trim() || 'active';
+    const selectedExists = selectedBefore!=='active' && (S.chatThreads||[]).some(t=>String(t.id||'')===selectedBefore);
+    const activeExists = !!activeTid && (S.chatThreads||[]).some(t=>String(t.id||'')===activeTid);
+    const pendingExists = !!pendingTid && (S.chatThreads||[]).some(t=>String(t.id||'')===pendingTid);
+
+    let nextSelected = selectedBefore;
+    if(nextSelected!=='active' && !selectedExists){
+        if(pendingExists) nextSelected = pendingTid;
+        else if(activeExists) nextSelected = activeTid;
+        else nextSelected = 'active';
+    }
+
+    // Keep explicit user selection during in-flight thread load.
+    if(nextSelected==='active' && pendingExists){
+        nextSelected = pendingTid;
+    }
+
+    S.selectedChatId = nextSelected || 'active';
     if(!S.selectedChatId) S.selectedChatId = 'active';
-    
-    // If we're about to hide the active session which contains raw_gateway (debug) messages,
-    // keep showing active session so debug blocks remain visible.
-    const hasRawGatewayInActive = (Array.isArray(S.chat)) && S.chat.some(m => m && m.role === 'raw_gateway');
-    if(hasRawGatewayInActive && S.selectedChatId !== 'active'){
-        S.selectedChatId = 'active';
-    }
-    
+
     const selected = String(S.selectedChatId||'active');
     if(selected!=='active' && !(S.chatThreads||[]).some(t=>String(t.id||'')===selected)) S.selectedChatId = 'active';
     persistChatCache();
@@ -1206,6 +1245,8 @@ function stopWsPingTimer(){
 function updateChatComposerState(){
     const input=document.getElementById('chatInput');
     const sendBtn=document.getElementById('chatSendBtn');
+    const sendDropdownBtn=document.getElementById('chatSendDropdownBtn');
+    const sendDropdown=document.getElementById('chatSendDropdown');
     const stopBtn=document.getElementById('chatStopBtn');
     const modeQueueBtn=document.getElementById('chatModeQueueBtn');
     const modeSteerBtn=document.getElementById('chatModeSteerBtn');
@@ -1223,15 +1264,34 @@ function updateChatComposerState(){
     S.chatStatusText = inferred.statusText;
     const isRunning = inferred.running;
     const isPending=S.pendingChatSends.size>0;
+    const showModeControls = isRunning || S.chatStopPending;
+    const hasInputText = !!(input && String(input.value||'').trim());
+    const sendDisabled = isPending || S.chatStopPending || !hasInputText;
     if(input){
         input.disabled=isPending || S.chatStopPending;
         input.placeholder=isPending?'Sending...':(S.chatStopPending?'Stopping...':'Type a message');
     }
     if(sendBtn){
-        sendBtn.disabled=isPending || S.chatStopPending;
-        sendBtn.classList.toggle('opacity-60',isPending);
-        sendBtn.classList.toggle('cursor-not-allowed',isPending);
-        sendBtn.textContent=isPending?'Sending...':'Send';
+        sendBtn.disabled=sendDisabled;
+        sendBtn.classList.toggle('opacity-60',sendDisabled);
+        sendBtn.classList.toggle('cursor-not-allowed',sendDisabled);
+        if(isPending){
+            sendBtn.textContent='Sending...';
+        }else if(showModeControls){
+            const mode = normalizeChatSendMode(S.chatSendMode);
+            sendBtn.textContent = mode==='steer' ? 'Send to Steer' : 'Send to Queue';
+        }else{
+            sendBtn.textContent='Send';
+        }
+    }
+    if(sendDropdownBtn){
+        sendDropdownBtn.disabled=sendDisabled;
+        sendDropdownBtn.classList.toggle('opacity-60',sendDisabled);
+        sendDropdownBtn.classList.toggle('cursor-not-allowed',sendDisabled);
+        sendDropdownBtn.classList.toggle('hidden', !showModeControls);
+    }
+    if(sendDropdown && (sendDisabled || !showModeControls)){
+        sendDropdown.classList.add('hidden');
     }
     if(stopBtn){
         const showStop = isRunning || S.chatStopPending;
@@ -1242,8 +1302,10 @@ function updateChatComposerState(){
     }
     if(modeQueueBtn && modeSteerBtn){
         const mode = normalizeChatSendMode(S.chatSendMode);
-        modeQueueBtn.className = 'px-2 py-1 rounded text-xs ' + (mode==='queue' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700');
-        modeSteerBtn.className = 'px-2 py-1 rounded text-xs ' + (mode==='steer' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700');
+        modeQueueBtn.disabled = sendDisabled;
+        modeSteerBtn.disabled = sendDisabled;
+        modeQueueBtn.className = 'w-full text-left px-3 py-2 text-xs ' + (mode==='queue' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700') + (sendDisabled ? ' opacity-60 cursor-not-allowed' : '');
+        modeSteerBtn.className = 'w-full text-left px-3 py-2 text-xs border-t border-gray-700 ' + (mode==='steer' ? 'bg-blue-700 text-blue-100' : 'bg-gray-800 hover:bg-gray-700') + (sendDisabled ? ' opacity-60 cursor-not-allowed' : '');
     }
     if(statusRow && statusChip && statusText){
         const hasState = isRunning || S.chatStopPending || isPending || S.chatRunState==='failed';

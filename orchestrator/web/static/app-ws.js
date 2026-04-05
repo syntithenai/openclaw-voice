@@ -96,6 +96,21 @@ function applyRecoveredChatMessages(messages){
     if(S.page==='home') renderChatMessages('active');
 }
 
+function requestSelectedChatThreadLoad(force){
+    const tid=String(S.selectedChatId||'active').trim();
+    if(!tid || tid==='active') return false;
+    const thread=(S.chatThreads||[]).find((item)=>String((item&&item.id)||'').trim()===tid);
+    if(!thread) return false;
+    if(!force){
+        const activeTid=String(S.activeChatThreadId||'').trim();
+        const hasMessages=Array.isArray(thread.messages) && thread.messages.length>0;
+        if(activeTid===tid && hasMessages) return false;
+        if(String(S.chatThreadLoadPendingId||'').trim()===tid) return false;
+    }
+    S.chatThreadLoadPendingId=tid;
+    return sendAction({type:'chat_select', thread_id: tid});
+}
+
 function handleMsg(msg){
   // Debug logging for music actions
   if(msg.type && msg.type.startsWith('music_')) console.log(`📥 Received message type="${msg.type}"`, {queue_len: Array.isArray(msg.music_queue) ? msg.music_queue.length : 'N/A', rev: msg.music_rev, action_ack: msg.action_ack});
@@ -159,6 +174,10 @@ function handleMsg(msg){
         msg.subagent_tasks.forEach((task)=>upsertTaskById(S.subagentTasks, S.subagentTaskById, task));
     }
             applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
+            if(!S.chatThreadBootstrapRequested){
+                S.chatThreadBootstrapRequested=true;
+                requestSelectedChatThreadLoad(true);
+            }
             if(S.page==='music' && (!Array.isArray(S.musicPlaylists) || S.musicPlaylists.length===0)){
                 sendAction({type:'music_list_playlists'});
             }
@@ -355,11 +374,22 @@ function handleMsg(msg){
 
         case 'chat_threads_update':
             applyServerChatState(undefined, msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
+            requestSelectedChatThreadLoad(false);
             if(S.page==='home') renderPage();
             break;
         case 'chat_reset':
             S.chat=[];
-            applyServerChatState([], msg.chat_threads, msg.active_chat_id, msg.active_chat_thread_id);
+            applyServerChatState(
+                Array.isArray(msg.chat) ? msg.chat : [],
+                msg.chat_threads,
+                msg.active_chat_id,
+                msg.active_chat_thread_id,
+            );
+            {
+                const pendingTid=String(S.chatThreadLoadPendingId||'').trim();
+                const activeTid=String(S.activeChatThreadId||'').trim();
+                if(pendingTid && activeTid && pendingTid===activeTid) S.chatThreadLoadPendingId='';
+            }
             persistChatCache();
             if(S.page==='home') renderPage();
             break;
@@ -377,6 +407,13 @@ function handleMsg(msg){
             }
             S.chatStopPending = false;
             S.chatQueuedItems = [];
+            if(S.chatActiveRequestId){
+                const rid = String(S.chatActiveRequestId||'').trim();
+                if(rid){
+                    if(!S.chatTerminalStateByRequest || typeof S.chatTerminalStateByRequest!=='object') S.chatTerminalStateByRequest = {};
+                    S.chatTerminalStateByRequest[rid] = {state:'superseded', reason:'Stopped by user', ts:Date.now(), source:'chat_stop_ack'};
+                }
+            }
             updateChatComposerState();
             break;
         case 'chat_stop_error':
@@ -385,6 +422,10 @@ function handleMsg(msg){
                 S.chatStopTimer = null;
             }
             S.chatStopPending = false;
+            if(S.chatActiveRequestId){
+                const rid = String(S.chatActiveRequestId||'').trim();
+                if(rid && S.chatTerminalStateByRequest && typeof S.chatTerminalStateByRequest==='object') delete S.chatTerminalStateByRequest[rid];
+            }
             recordInlineError('setting', 'chat_stop', String(msg.error||'Failed to stop chat'));
             updateChatComposerState();
             break;
@@ -418,6 +459,9 @@ function handleMsg(msg){
             const rid = String(msg.request_id||'').trim();
             const reason = String(msg.reason||'').trim();
             if(rid) S.chatActiveRequestId = rid;
+            if(rid && state==='streaming' && S.chatTerminalStateByRequest && typeof S.chatTerminalStateByRequest==='object'){
+                delete S.chatTerminalStateByRequest[rid];
+            }
             if(state){
                 if(state==='in_progress') S.chatRunState='streaming';
                 else S.chatRunState=state;
@@ -428,6 +472,10 @@ function handleMsg(msg){
             if(reason) S.chatStatusText = reason;
             if(state==='completed' || state==='failed' || state==='superseded' || state==='cancelled'){
                 S.chatStopPending = false;
+                if(rid){
+                    if(!S.chatTerminalStateByRequest || typeof S.chatTerminalStateByRequest!=='object') S.chatTerminalStateByRequest = {};
+                    S.chatTerminalStateByRequest[rid] = {state, reason, ts:Date.now(), source:'chat_run_state'};
+                }
             }
             if(S.page==='home') updateChatComposerState();
             break;

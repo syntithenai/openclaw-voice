@@ -17,6 +17,7 @@ import logging
 import math
 import platform
 import re
+import secrets
 import threading
 import time
 import unicodedata
@@ -744,6 +745,9 @@ async def run_orchestrator() -> None:
     last_wake_conf_log_ts = 0.0
     last_timeout_progress_log_ts = 0.0  # Rate-limit for inactivity progress logs
     warned_missing_playerctl = False
+    # Add a 1s trailing silence pad to STT chunks so very fast manual stops
+    # still preserve end-of-utterance context for Whisper.
+    stt_trailing_silence_pcm = b"\x00\x00" * max(0, int(config.audio_sample_rate))
 
     wake_detector = None
     active_wake_engine = None
@@ -847,11 +851,14 @@ async def run_orchestrator() -> None:
     
     # Native media backend runs in-process and does not require external daemon startup.
     
-    # Use the session prefix directly as a stable session name rather than appending a
-    # timestamp.  A stable name means all voice interactions accumulate in one persistent
-    # session (e.g. agent:voice:main) so the web chat UI always shows the full history.
+    # Keep a mutable gateway session id. We rotate it on explicit "new chat" so each
+    # conversation has its own canonical gateway session key and can be loaded later.
     session_id = config.gateway_session_prefix
     agent_id = config.gateway_agent_id or "assistant"
+
+    def _new_gateway_session_id() -> str:
+        base = str(config.gateway_session_prefix or "voice").strip() or "voice"
+        return f"{base}-{secrets.token_hex(6)}"
     
     # Tool System (timers/alarms)
     tool_router = None
@@ -1907,6 +1914,7 @@ async def run_orchestrator() -> None:
         nonlocal pending_transcripts, debounce_task, processing_request, current_request_id
         nonlocal suppress_gateway_messages_for_new_session
         nonlocal new_session_reset_task
+        nonlocal session_id
         if client_id:
             logger.info("🆕 New session requested by %s (client=%s)", source, client_id)
         else:
@@ -1926,6 +1934,15 @@ async def run_orchestrator() -> None:
 
             if web_service:
                 web_service.start_new_chat()
+
+            previous_session_id = str(session_id or "").strip()
+            session_id = _new_gateway_session_id()
+            if hasattr(gateway, "set_session_id"):
+                try:
+                    gateway.set_session_id(session_id)
+                except Exception:
+                    logger.debug("Gateway set_session_id failed for %s", session_id, exc_info=True)
+            logger.info("🧭 Rotated gateway session id: %s -> %s", previous_session_id, session_id)
 
             if new_session_reset_task and not new_session_reset_task.done():
                 new_session_reset_task.cancel()
@@ -2621,14 +2638,26 @@ async def run_orchestrator() -> None:
                 if not thread_id:
                     return None
 
-                title = str(
-                    session_obj.get("title")
-                    or session_obj.get("derivedTitle")
-                    or session_obj.get("name")
-                    or ""
-                ).strip() or "Untitled"
+                def _is_placeholder_title(value: str) -> bool:
+                    v = str(value or "").strip().lower()
+                    if not v:
+                        return True
+                    return v.startswith("a new session") or v in {"new session", "untitled"}
 
-                def _read_ts(*keys: str) -> float:
+                derived_title = str(session_obj.get("derivedTitle") or "").strip()
+                base_title = str(session_obj.get("title") or "").strip()
+                fallback_name = str(session_obj.get("name") or "").strip()
+
+                if derived_title:
+                    title = derived_title
+                elif not _is_placeholder_title(base_title):
+                    title = base_title
+                elif fallback_name and not _is_placeholder_title(fallback_name):
+                    title = fallback_name
+                else:
+                    title = "New Chat"
+
+                def _read_ts(*keys: str, fallback: float | None = None) -> float:
                     for key in keys:
                         val = session_obj.get(key)
                         if val is None:
@@ -2641,10 +2670,18 @@ async def run_orchestrator() -> None:
                                 return num
                         except Exception:
                             continue
-                    return time.time()
+                    return float(fallback or 0.0)
 
-                created_ts = _read_ts("createdAt", "created_at", "createdTs", "created_ts")
-                updated_ts = _read_ts("updatedAt", "updated_at", "lastMessageAt", "last_message_at", "updatedTs", "updated_ts")
+                created_ts = _read_ts("createdAt", "created_at", "createdTs", "created_ts", fallback=time.time())
+                updated_ts = _read_ts(
+                    "updatedAt",
+                    "updated_at",
+                    "lastMessageAt",
+                    "last_message_at",
+                    "updatedTs",
+                    "updated_ts",
+                    fallback=created_ts,
+                )
 
                 out: dict[str, Any] = {
                     "id": thread_id,
@@ -2682,6 +2719,154 @@ async def run_orchestrator() -> None:
                     logger.warning("Web UI chat history load failed for %s: %s", thread_id, exc)
                     return None
 
+            async def _refresh_web_ui_chat_threads_from_gateway(
+                reason: str,
+                *,
+                apply_update: bool = True,
+            ) -> list[dict[str, Any]]:
+                if not web_service or not hasattr(gateway, "list_sessions"):
+                    return []
+                try:
+                    sessions = await gateway.list_sessions(
+                        agent_id=agent_id,
+                        limit=100,
+                        include_derived_titles=True,
+                        include_last_message=True,
+                    )
+                except Exception as exc:
+                    logger.debug("Web UI chat thread refresh failed (%s): %s", reason, exc)
+                    return []
+
+                # Exclude the undeletable main session (agent:{agent_id}:main) from
+                # the Voice UI thread list — it is used by heartbeat/system tasks and
+                # cannot be deleted via sessions.delete.
+                main_session_key = f"agent:{agent_id}:main"
+                synced_threads: list[dict[str, Any]] = []
+                for session_obj in sessions:
+                    raw_key = str(session_obj.get("key") or "").strip().lower()
+                    if raw_key == main_session_key.lower():
+                        continue
+                    mapped = _map_gateway_session_to_chat_thread(session_obj)
+                    if mapped is not None:
+                        synced_threads.append(mapped)
+                if apply_update:
+                    web_service.replace_chat_threads(synced_threads)
+                return synced_threads
+
+            async def _wait_for_new_session_reset_completion(timeout_s: float = 2.0) -> None:
+                if not new_session_reset_task:
+                    return
+                if new_session_reset_task.done():
+                    return
+                try:
+                    await asyncio.wait_for(asyncio.shield(new_session_reset_task), timeout=timeout_s)
+                except Exception:
+                    # Best-effort: deletion retry logic can still proceed.
+                    pass
+
+            async def _delete_gateway_session_with_retry(
+                *,
+                session_key: str,
+                client_id: str,
+                source: str,
+                ensure_reset_before_retry: bool = True,
+            ) -> bool:
+                if not hasattr(gateway, "delete_session"):
+                    return False
+
+                target = str(session_key or "").strip()
+                if not target:
+                    return False
+
+                for attempt in range(2):
+                    try:
+                        deleted = await gateway.delete_session(
+                            session_key=target,
+                            delete_transcript=True,
+                        )
+                        if deleted:
+                            logger.info(
+                                "Web UI %s delete succeeded for %s (attempt=%d)",
+                                source,
+                                target,
+                                attempt + 1,
+                            )
+                            return True
+                        logger.warning(
+                            "Web UI %s delete returned deleted=false for %s (attempt=%d)",
+                            source,
+                            target,
+                            attempt + 1,
+                        )
+                    except Exception as exc:
+                        err_text = str(exc)
+                        logger.warning(
+                            "Web UI %s delete failed for %s (attempt=%d): %s",
+                            source,
+                            target,
+                            attempt + 1,
+                            err_text,
+                        )
+                        # Undeletable main session — no point retrying.
+                        if "cannot delete the main session" in err_text.lower():
+                            return False
+                        active_retry_hint = (
+                            "still active" in err_text.lower()
+                            or "try again" in err_text.lower()
+                            or "unavailable" in err_text.lower()
+                        )
+                        if not active_retry_hint:
+                            return False
+
+                    if attempt == 0:
+                        # On the first failed attempt always wait before retrying.
+                        # Optionally reset the current session if the caller requested it
+                        # (e.g. to unblock a session that is still active).
+                        if ensure_reset_before_retry:
+                            await _start_new_session(source=f"web ui {source} retry", client_id=client_id)
+                            await _wait_for_new_session_reset_completion()
+                        await asyncio.sleep(0.5)
+                        continue
+                    return False
+                return False
+
+            async def _ui_chat_delete(thread_id: str, client_id: str) -> None:
+                target_thread_id = str(thread_id or "").strip()
+                if not target_thread_id or target_thread_id == "active":
+                    return
+                active_thread_id = str(web_service.get_active_chat_thread_id() or "").strip() if web_service else ""
+                if active_thread_id == target_thread_id:
+                    await _start_new_session(source="web ui chat_delete", client_id=client_id)
+                    await _wait_for_new_session_reset_completion()
+                await _delete_gateway_session_with_retry(
+                    session_key=target_thread_id,
+                    client_id=client_id,
+                    source="chat_delete",
+                    ensure_reset_before_retry=True,
+                )
+                synced_threads = await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete:{client_id}")
+                if not synced_threads:
+                    await _start_new_session(source="web ui chat_delete post", client_id=client_id)
+                    await _wait_for_new_session_reset_completion()
+                    await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete_post:{client_id}")
+
+            async def _ui_chat_clear_all(thread_ids: list[str], client_id: str) -> None:
+                clearable_ids = [
+                    str(thread_id or "").strip()
+                    for thread_id in (thread_ids or [])
+                    if str(thread_id or "").strip() and str(thread_id or "").strip() != "active"
+                ]
+                for target_thread_id in clearable_ids:
+                    await _delete_gateway_session_with_retry(
+                        session_key=target_thread_id,
+                        client_id=client_id,
+                        source="chat_clear_all",
+                        ensure_reset_before_retry=True,
+                    )
+                await _start_new_session(source="web ui chat_clear_all", client_id=client_id)
+                await _wait_for_new_session_reset_completion()
+                await _refresh_web_ui_chat_threads_from_gateway(f"chat_clear_all:{client_id}")
+
             async def _ui_recordings_list(client_id: str) -> list[dict[str, Any]]:
                 if not recordings_catalog:
                     return []
@@ -2707,6 +2892,9 @@ async def run_orchestrator() -> None:
                     return {"success": False, "response": "Recording is not enabled on this device."}
                 result = await recorder_tool.stop_recording(reason="ui")
                 return {"success": True, "response": result.response}
+
+            async def _ui_client_connect(client_id: str) -> None:
+                await _refresh_web_ui_chat_threads_from_gateway(f"client_connect:{client_id}")
 
             web_service.set_action_handlers(
                 on_mic_toggle=_ui_mic_toggle,
@@ -2745,6 +2933,9 @@ async def run_orchestrator() -> None:
                 on_chat_lifecycle_policy_set=_ui_chat_lifecycle_policy_set,
                 on_chat_interim_set=_ui_chat_interim_set,
                 on_chat_load_thread_messages=_ui_chat_load_thread_messages,
+                on_chat_delete=_ui_chat_delete,
+                on_chat_clear_all=_ui_chat_clear_all,
+                on_client_connect=_ui_client_connect,
                 on_tts_mute_set=_ui_tts_mute_set,
                 on_browser_audio_set=_ui_browser_audio_set,
                 on_continuous_mode_set=_ui_continuous_mode_set,
@@ -2753,6 +2944,23 @@ async def run_orchestrator() -> None:
             async def _web_ui_chat_session_sync() -> None:
                 if not hasattr(gateway, "list_sessions") or not hasattr(gateway, "fetch_chat_history"):
                     return
+
+                def _canonical_sync_messages(rows: list[dict[str, Any]] | None) -> list[tuple[str, str]]:
+                    out: list[tuple[str, str]] = []
+                    for message in list(rows or []):
+                        if not isinstance(message, dict):
+                            continue
+                        role = str(message.get("role", "")).strip().lower()
+                        if role in {"raw_gateway", "step", "interim"}:
+                            continue
+                        seg_kind = str(message.get("segment_kind", "")).strip().lower()
+                        if role == "assistant" and seg_kind == "stream":
+                            continue
+                        text = str(message.get("text", "")).strip()
+                        if not text:
+                            continue
+                        out.append((role, text))
+                    return out
 
                 last_threads_signature = ""
                 last_active_thread_signature = ""
@@ -2764,22 +2972,9 @@ async def run_orchestrator() -> None:
                         break
                     if not web_service.has_active_client():
                         continue
-                    try:
-                        sessions = await gateway.list_sessions(
-                            agent_id=agent_id,
-                            limit=100,
-                            include_derived_titles=True,
-                            include_last_message=True,
-                        )
-                    except Exception as exc:
-                        logger.debug("Web UI chat session sync: sessions.list failed: %s", exc)
+                    synced_threads = await _refresh_web_ui_chat_threads_from_gateway("sync", apply_update=False)
+                    if not synced_threads:
                         continue
-
-                    synced_threads: list[dict[str, Any]] = []
-                    for session_obj in sessions:
-                        mapped = _map_gateway_session_to_chat_thread(session_obj)
-                        if mapped is not None:
-                            synced_threads.append(mapped)
 
                     threads_signature = json.dumps(
                         [
@@ -2833,6 +3028,22 @@ async def run_orchestrator() -> None:
                     thread_sig_key = f"{active_thread_id}:{active_thread_signature}"
                     if thread_sig_key == last_active_thread_signature:
                         continue
+
+                    # Guard against stale gateway snapshots that arrive behind local UI state.
+                    # Local state can temporarily lead while streaming/finalizing, and applying
+                    # an older snapshot would wipe visible messages via chat_reset.
+                    local_messages = list(getattr(web_service, "_chat_messages", []) or [])
+                    local_canonical = _canonical_sync_messages(local_messages)
+                    mapped_canonical = _canonical_sync_messages(mapped_messages)
+
+                    if not mapped_canonical and local_canonical:
+                        continue
+                    if local_canonical and len(mapped_canonical) < len(local_canonical):
+                        if mapped_canonical == local_canonical[: len(mapped_canonical)]:
+                            continue
+
+                    # The snapshot is at least as complete as local canonical content.
+                    # Apply it to keep thread history authoritative once gateway catches up.
                     last_active_thread_signature = thread_sig_key
                     web_service.select_chat_thread(active_thread_id, messages_override=mapped_messages)
 
@@ -3468,6 +3679,11 @@ async def run_orchestrator() -> None:
     def _safe_append_chat_message(message: dict[str, Any], context: str) -> None:
         if not web_service:
             return
+        if str(message.get("role") or "").strip().lower() == "assistant":
+            txt = str(message.get("text") or "").strip().upper()
+            if txt in {"NO_REPLY", "NO_RE", "NO", "_RE", "NO _RE"}:
+                logger.info("🚫 Suppressed NO_REPLY assistant message (%s)", context)
+                return
         try:
             web_service.append_chat_message(message)
         except Exception as exc:
@@ -3477,6 +3693,11 @@ async def run_orchestrator() -> None:
         """Append or update user message if it's a prefix extension of the last one."""
         if not web_service:
             return
+        if str(message.get("role") or "").strip().lower() == "assistant":
+            txt = str(message.get("text") or "").strip().upper()
+            if txt in {"NO_REPLY", "NO_RE", "NO", "_RE", "NO _RE"}:
+                logger.info("🚫 Suppressed NO_REPLY assistant update (%s)", context)
+                return
         try:
             web_service.update_or_append_chat_message(message)
         except Exception as exc:
@@ -4514,7 +4735,8 @@ async def run_orchestrator() -> None:
         active_transcriptions += 1
         state = VoiceState.SENDING
         try:
-            wav_bytes = pcm_to_wav_bytes(pcm, config.audio_sample_rate)
+            stt_pcm = pcm + stt_trailing_silence_pcm if stt_trailing_silence_pcm else pcm
+            wav_bytes = pcm_to_wav_bytes(stt_pcm, config.audio_sample_rate)
             
             # STT phase
             logger.info("→ STT: Sending %d bytes to Whisper", len(wav_bytes))
@@ -4936,6 +5158,8 @@ async def run_orchestrator() -> None:
             if not web_service or request_id <= 0:
                 return
             if not chunk_text:
+                return
+            if str(chunk_text).strip().upper() in {"NO_REPLY", "NO_RE", "NO", "_RE", "NO _RE"}:
                 return
 
             stream_state = ui_stream_state_by_request_id.get(request_id)

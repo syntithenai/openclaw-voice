@@ -2,8 +2,9 @@ document.addEventListener('click', e=>{
     closeMenu();
     const target = (e.target && typeof e.target.closest==='function') ? e.target : (e.target && e.target.parentElement ? e.target.parentElement : null);
     if(!target || !target.closest('#micControlWrap')) closeMicControlMenu();
+    if(!target || !target.closest('#chatSendGroup')){ const d=document.getElementById('chatSendDropdown'); if(d) d.classList.add('hidden'); }
 });
-document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(); closeMicControlMenu(); } });
+document.addEventListener('keydown', e=>{ if(e.key==='Escape'){ closeMenu(); closeMicControlMenu(); const d=document.getElementById('chatSendDropdown'); if(d) d.classList.add('hidden'); } });
 document.querySelectorAll('[data-nav]').forEach(el=>el.addEventListener('click',e=>{
     e.preventDefault();
     const nav = String(el.dataset.nav || '').trim();
@@ -81,14 +82,17 @@ function updateCachedThreadMessages(threadId, messages){
     const tid = String(threadId || '').trim();
     if(!tid || tid==='active') return;
     const nextMessages = Array.isArray(messages) ? messages.map(normalizeChatMessage).filter(Boolean) : [];
-    const now = Date.now() / 1000;
     S.chatThreads = (S.chatThreads || []).map((thread)=>{
         if(String((thread&&thread.id)||'').trim()!==tid) return thread;
         return Object.assign({}, thread, {
             messages: nextMessages,
-            updated_ts: now,
         });
     });
+}
+
+function isNoReplyMarkerText(value){
+    const txt = String(value||'').trim().toUpperCase();
+    return txt==='NO_REPLY' || txt==='NO_RE' || txt==='NO' || txt==='_RE' || txt==='NO _RE';
 }
 
 function truncateChatLocallyAfterMessage(selectedId, messageId){
@@ -248,6 +252,25 @@ function handleChatComposerSubmitText(rawText){
     else enqueueChatText(text, 'steer');
 }
 
+function submitChatComposer(modeOverride){
+    const input = document.getElementById('chatInput');
+    if (!input || input.disabled) return false;
+    const text = String(input.value || '').trim();
+    if (!text) return false;
+    if (modeOverride) setChatSendMode(modeOverride);
+    handleChatComposerSubmitText(text);
+    input.value = '';
+    clearChatComposerDraft();
+    autoResizeChatInput(input);
+    updateChatComposerState();
+    if (S.selectedChatId !== 'active') {
+        S.selectedChatId = 'active';
+        persistChatCache();
+        renderPage();
+    }
+    return true;
+}
+
 function requestChatStop(){
     if(S.chatStopPending) return;
     S.chatStopPending = true;
@@ -258,8 +281,19 @@ function requestChatStop(){
     S.chatStopTimer = setTimeout(()=>{
         S.chatStopPending = false;
         S.chatStopTimer = null;
+        const rid = String(S.chatActiveRequestId||'').trim();
+        if(rid){
+            if(!S.chatTerminalStateByRequest || typeof S.chatTerminalStateByRequest!=='object') S.chatTerminalStateByRequest = {};
+            S.chatTerminalStateByRequest[rid] = {
+                state: 'cancelled',
+                reason: 'Stop requested; waiting for server confirmation',
+                ts: Date.now(),
+                source: 'local_timeout',
+            };
+            sendAction({type:'chat_request_reconcile', request_id:rid, last_seq:Number((((S.chatStreamCursorByRequest||{})[rid]||{}).seq)||0)});
+        }
         updateChatComposerState();
-    }, 5000);
+    }, 12000);
     updateChatComposerState();
     sendAction({type:'chat_stop'});
 }
@@ -342,17 +376,30 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const sendDropdownToggleBtn = target.closest('[data-action="chat-send-dropdown-toggle"]');
+    if(sendDropdownToggleBtn){
+        e.preventDefault();
+        e.stopPropagation();
+        const dropdown = document.getElementById('chatSendDropdown');
+        if(dropdown) dropdown.classList.toggle('hidden');
+        return;
+    }
+
     const modeQueueBtn = target.closest('[data-action="chat-mode-queue"]');
     if(modeQueueBtn){
         e.preventDefault();
-        setChatSendMode('queue');
+        submitChatComposer('queue');
+        const dropdown = document.getElementById('chatSendDropdown');
+        if(dropdown) dropdown.classList.add('hidden');
         return;
     }
 
     const modeSteerBtn = target.closest('[data-action="chat-mode-steer"]');
     if(modeSteerBtn){
         e.preventDefault();
-        setChatSendMode('steer');
+        submitChatComposer('steer');
+        const dropdown = document.getElementById('chatSendDropdown');
+        if(dropdown) dropdown.classList.add('hidden');
         return;
     }
 
@@ -459,6 +506,13 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const copyChatBtn = target.closest('[data-action="chat-copy-thread-export"]');
+    if (copyChatBtn) {
+        e.preventDefault();
+        void copySelectedChatThreadExport(copyChatBtn);
+        return;
+    }
+
     const newChatBtn = target.closest('[data-action="chat-new"]');
     if (newChatBtn) {
         clearChatReloadTarget();
@@ -518,10 +572,7 @@ document.addEventListener('click', e => {
     if (deleteThreadConfirmBtn) {
         const tid = String(S.chatDeleteTargetId || '').trim();
         if(tid && tid!=='active'){
-            S.chatThreads = (S.chatThreads||[]).filter(t=>String((t&&t.id)||'')!==tid);
-            if(String(S.selectedChatId||'active')===tid) S.selectedChatId='active';
-            if(S.chatReloadTargetThreadId===tid) clearChatReloadTarget();
-            persistChatCache();
+            S.chatThreadLoadPendingId = '';
             sendAction({type:'chat_delete', thread_id: tid});
         }
         S.chatDeleteModalOpen = false;
@@ -533,12 +584,10 @@ document.addEventListener('click', e => {
 
     const clearAllConfirmBtn = target.closest('[data-action="chat-clear-all-confirm"]');
     if (clearAllConfirmBtn) {
-        S.chatThreads = [];
-        S.selectedChatId = 'active';
+        S.chatThreadLoadPendingId = '';
         clearChatReloadTarget();
         clearChatReloadInFlight();
         S.chatClearAllModalOpen = false;
-        persistChatCache();
         sendAction({type:'chat_clear_all'});
         renderPage();
         return;
@@ -550,6 +599,10 @@ document.addEventListener('click', e => {
         clearChatReloadTarget();
         clearChatReloadInFlight();
         S.selectedChatId = tid;
+        if(tid && tid!=='active'){
+            S.chatThreadLoadPendingId = String(tid);
+            sendAction({type:'chat_select', thread_id: tid});
+        }
         if(isMobileChatViewport()) S.chatSidebarOpen=false;
         persistChatCache();
         renderPage();
@@ -1028,6 +1081,29 @@ document.addEventListener('click', e => {
         return;
     }
 
+    const recordingsSelectAllBtn = target.closest('[data-action="recordings-select-all"]');
+    if (recordingsSelectAllBtn) {
+        const recordingIds = (Array.isArray(S.recordings) ? S.recordings : [])
+            .map((item)=>String((item&&item.id)||'').trim())
+            .filter(Boolean);
+        if(!recordingIds.length) return;
+        recordingIds.forEach((recordingId)=>{
+            S.recordingsSelectionByIds[recordingId]=true;
+        });
+        S.recordingsLastCheckedId=recordingIds[recordingIds.length-1]||'';
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
+    const recordingsSelectNoneBtn = target.closest('[data-action="recordings-select-none"]');
+    if (recordingsSelectNoneBtn) {
+        if(!Object.keys(S.recordingsSelectionByIds||{}).length) return;
+        S.recordingsSelectionByIds={};
+        S.recordingsLastCheckedId='';
+        renderRecordingsPage(document.getElementById('main'));
+        return;
+    }
+
     const recordingsStartBtn = target.closest('[data-action="recordings-start-recording"]');
     if (recordingsStartBtn) {
         if(S.recorderStartPending) return;
@@ -1064,19 +1140,7 @@ document.addEventListener('submit', e => {
     const form = e.target;
     if (!form || form.id !== 'chatComposer') return;
     e.preventDefault();
-    const input = document.getElementById('chatInput');
-    if (!input) return;
-    const text = String(input.value || '').trim();
-    if (!text) return;
-    handleChatComposerSubmitText(text);
-    input.value = '';
-    clearChatComposerDraft();
-    autoResizeChatInput(input);
-    if (S.selectedChatId !== 'active') {
-        S.selectedChatId = 'active';
-        persistChatCache();
-        renderPage();
-    }
+    submitChatComposer();
 });
 
 document.addEventListener('keydown', e => {
@@ -1116,6 +1180,7 @@ const chatInputBootEl = document.getElementById('chatInput');
 if(chatInputBootEl){
     chatInputBootEl.value = readChatComposerDraft();
     autoResizeChatInput(chatInputBootEl);
+    updateChatComposerState();
 }
 restoreChatSendModePref();
 
@@ -1241,6 +1306,7 @@ function handleTextInputChange(t){
     if(t.id==='chatInput'){
         persistChatComposerDraft(String(t.value||''));
         autoResizeChatInput(t);
+        updateChatComposerState();
         return;
     }
     if(t.id==='musicQueueSearch'){
@@ -1489,9 +1555,8 @@ function renderRequestTasksBlock(reqKey){
 
     maybeRefreshTaskStreams(sandbox, subagent);
     const hasActiveTasks=[...sandbox, ...subagent].some((t)=>!isTerminalTaskStatus(t&&t.status));
-    const stateKey=hasActiveTasks ? 'active' : 'done';
 
-    const sandboxRows=sandbox.map((task, idx)=>{
+    const sandboxRows=sandbox.map((task)=>{
         const taskId=String((task&&task.task_id)||'').trim();
         const status=String((task&&task.status)||'running').toLowerCase();
         const tone=status==='failed'?'text-red-200 border-red-700/60 bg-red-950/30':(status==='completed'?'text-emerald-200 border-emerald-700/60 bg-emerald-950/30':'text-amber-100 border-amber-700/60 bg-amber-950/25');
@@ -1506,7 +1571,7 @@ function renderRequestTasksBlock(reqKey){
         const entries=(S.sandboxTaskLogEntriesById&&S.sandboxTaskLogEntriesById[taskId])||[];
         const stderrCount=(Array.isArray(entries)?entries:[]).reduce((acc, entry)=>acc+(String((entry&&entry.stream)||'').toLowerCase()==='stderr'?1:0), 0);
         const label=String((task&&task.command)||task&&task.label||task&&task.exec_id||'exec');
-        const detailKey='req:'+String(reqKey)+':task:sandbox:'+String(idx)+':'+taskId+':'+stateKey;
+        const detailKey='req:'+String(reqKey)+':task:sandbox:'+taskId;
         const openAttr=isTerminalTaskStatus(status)?'':' open';
         return '<details data-detail-key="'+esc(detailKey)+'" class="rounded border '+tone+'"'+openAttr+'>'
             +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-amber-800/80 text-amber-100 text-[10px]">Exec</span><span class="truncate">'+esc(label)+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
@@ -1519,7 +1584,7 @@ function renderRequestTasksBlock(reqKey){
         +'</details>';
     }).join('');
 
-    const subagentRows=subagent.map((task, idx)=>{
+    const subagentRows=subagent.map((task)=>{
         const runId=String((task&&task.run_id)||task&&task.task_id||'').trim();
         const status=String((task&&task.status)||'running').toLowerCase();
         const tone=status==='failed'?'text-red-200 border-red-700/60 bg-red-950/30':(status==='completed'?'text-emerald-200 border-emerald-700/60 bg-emerald-950/30':'text-sky-100 border-sky-700/60 bg-sky-950/25');
@@ -1527,7 +1592,7 @@ function renderRequestTasksBlock(reqKey){
             .map((entry)=>String((entry&&entry.text_delta)||''))
             .join('');
         const step=String((task&&task.step)||'');
-        const detailKey='req:'+String(reqKey)+':task:subagent:'+String(idx)+':'+runId+':'+stateKey;
+        const detailKey='req:'+String(reqKey)+':task:subagent:'+runId;
         const openAttr=isTerminalTaskStatus(status)?'':' open';
         return '<details data-detail-key="'+esc(detailKey)+'" class="rounded border '+tone+'"'+openAttr+'>'
             +'<summary class="px-2 py-1 cursor-pointer text-xs flex items-center gap-2"><span class="inline-block px-1.5 py-0.5 rounded bg-sky-800/80 text-sky-100 text-[10px]">Subagent</span><span class="truncate">'+esc(String((task&&task.label)||runId||'request'))+'</span><span class="text-[10px] opacity-80">'+esc(status)+' '+esc(formatTaskAge(task&&task.started_ts))+'</span></summary>'
@@ -1538,7 +1603,7 @@ function renderRequestTasksBlock(reqKey){
         +'</details>';
     }).join('');
 
-    return '<details data-detail-key="'+esc('req:'+String(reqKey)+':tasks:'+stateKey)+'" class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden"'+(hasActiveTasks?' open':'')+'>'
+    return '<details data-detail-key="'+esc('req:'+String(reqKey)+':tasks')+'" class="rounded-xl bg-gray-900/60 border border-gray-700 text-xs overflow-hidden"'+(hasActiveTasks?' open':'')+'>'
         +'<summary class="px-3 py-1.5 cursor-pointer text-gray-200 hover:text-gray-100 select-none">Tasks ('+String(total)+')</summary>'
         +'<div class="px-2 pb-2 pt-1 space-y-1">'+sandboxRows+subagentRows+'</div>'
     +'</details>';
@@ -1607,7 +1672,21 @@ function renderTimerBar(){
         if(kind==='timer' && rem<=0) return false;
         return true;
     });
-    if(!visibleTimers.length){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
+    const inferred=(typeof inferChatRunState==='function') ? inferChatRunState() : {running:false,state:'idle',statusText:'',requestId:''};
+    const chatActive = !!(inferred.running || S.chatStopPending || S.pendingChatSends.size>0);
+    const chatStateLabel = S.chatStopPending
+        ? 'Stopping'
+        : (S.pendingChatSends.size>0 && !inferred.running)
+            ? 'Sending'
+            : String(inferred.state||'idle').replace('_',' ');
+    const chatTone = S.chatStopPending
+        ? 'bg-amber-700'
+        : ((S.pendingChatSends.size>0 && !inferred.running) ? 'bg-indigo-700' : (inferred.state==='failed' ? 'bg-red-700' : (inferred.running ? 'bg-blue-700' : 'bg-gray-700')));
+    const chatStatusTitle = String((inferred&&inferred.statusText)||S.chatStatusText||'').trim();
+    const chatIndicator = chatActive
+        ? '<span class="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs '+chatTone+' text-gray-100" title="'+esc(chatStatusTitle||'Chat request activity')+'"><span class="inline-block w-2 h-2 rounded-full bg-white/90 '+(inferred.running?'animate-pulse':'')+'"></span>Chat '+esc(chatStateLabel.charAt(0).toUpperCase()+chatStateLabel.slice(1))+'</span>'
+        : '';
+    if(!visibleTimers.length && !chatActive){ bar.classList.add('hidden'); bar.innerHTML=''; return; }
   bar.classList.remove('hidden');
     const timerHtml=visibleTimers.map(t=>{
         const rem=Math.max(0,Math.round(t.remaining_seconds));
@@ -1636,7 +1715,7 @@ function renderTimerBar(){
         const ringingTxt=isRingingAlarm?' 🔔':'';
         return '<button type="button" class="'+baseCls+'"'+actionChunk+effectiveDisabledAttr+' title="'+esc(titleTxt)+'">'+icon+' '+esc(label)+ringingTxt+' '+mm+':'+ss+pendingTxt+errTxt+'</button>';
     }).join('');
-    bar.innerHTML=timerHtml;
+    bar.innerHTML=(chatIndicator?chatIndicator:'')+timerHtml;
 }
 
 function renderPage(){
@@ -1690,6 +1769,115 @@ function renderPage(){
     renderTimerBar();
     applyMusicHeader();
     updateScrollUpButton();
+}
+
+function buildChatExportPayload(selectedId){
+    const selected = String(selectedId || S.selectedChatId || 'active').trim() || 'active';
+    const activeThreadId = String(S.activeChatThreadId || '').trim();
+    const selectedThread = selected !== 'active'
+        ? (Array.isArray(S.chatThreads) ? S.chatThreads.find((t)=>String((t&&t.id)||'').trim()===selected) : null)
+        : null;
+
+    const selectedMessagesRaw = Array.isArray(getSelectedMessages(selected)) ? getSelectedMessages(selected) : [];
+    const selectedMessages = selectedMessagesRaw.map((m)=>Object.assign({}, m));
+
+    const requestIds = [];
+    const seenReqIds = new Set();
+    selectedMessages.forEach((m)=>{
+        const rid = String((m&&m.request_id)||'').trim();
+        if(!rid || seenReqIds.has(rid)) return;
+        seenReqIds.add(rid);
+        requestIds.push(rid);
+    });
+
+    const streamCursorByRequest = {};
+    const terminalStateByRequest = {};
+    const allStreamCursor = (S.chatStreamCursorByRequest && typeof S.chatStreamCursorByRequest==='object') ? S.chatStreamCursorByRequest : {};
+    const allTerminal = (S.chatTerminalStateByRequest && typeof S.chatTerminalStateByRequest==='object') ? S.chatTerminalStateByRequest : {};
+    requestIds.forEach((rid)=>{
+        if(allStreamCursor[rid]) streamCursorByRequest[rid] = Object.assign({}, allStreamCursor[rid]);
+        if(allTerminal[rid]) terminalStateByRequest[rid] = Object.assign({}, allTerminal[rid]);
+    });
+
+    const sandboxTasks = (Array.isArray(S.sandboxTasks) ? S.sandboxTasks : [])
+        .filter((t)=>requestIds.includes(String((t&&t.request_id)||'').trim()))
+        .map((t)=>Object.assign({}, t));
+    const subagentTasks = (Array.isArray(S.subagentTasks) ? S.subagentTasks : [])
+        .filter((t)=>{
+            const rid = String((t&&t.request_id)||'').trim();
+            if(rid) return requestIds.includes(rid);
+            const runId = String((t&&t.run_id)||'').trim();
+            const parsed = parseRequestIdFromRunId(runId);
+            return !!parsed && requestIds.includes(parsed);
+        })
+        .map((t)=>Object.assign({}, t));
+
+    const sandboxTaskLogs = {};
+    const allSandboxLogs = (S.sandboxTaskLogEntriesById && typeof S.sandboxTaskLogEntriesById==='object') ? S.sandboxTaskLogEntriesById : {};
+    sandboxTasks.forEach((t)=>{
+        const tid = String((t&&t.task_id)||'').trim();
+        if(!tid || !Array.isArray(allSandboxLogs[tid])) return;
+        sandboxTaskLogs[tid] = allSandboxLogs[tid].map((entry)=>Object.assign({}, entry));
+    });
+
+    const subagentThinking = {};
+    const allSubagentThinking = (S.subagentThinkingEntriesById && typeof S.subagentThinkingEntriesById==='object') ? S.subagentThinkingEntriesById : {};
+    subagentTasks.forEach((t)=>{
+        const runId = String((t&&t.run_id)||'').trim();
+        if(!runId || !Array.isArray(allSubagentThinking[runId])) return;
+        subagentThinking[runId] = allSubagentThinking[runId].map((entry)=>Object.assign({}, entry));
+    });
+
+    return {
+        schema: 'openclaw.voice.chat-export.v1',
+        exported_at: new Date().toISOString(),
+        selection: {
+            selected_chat_id: selected,
+            active_chat_thread_id: activeThreadId,
+            active_chat_id: String(S.activeChatId||'active'),
+            selected_thread: selectedThread ? Object.assign({}, selectedThread) : null,
+        },
+        thread_list: (Array.isArray(S.chatThreads) ? S.chatThreads : []).map((t)=>Object.assign({}, t)),
+        messages: selectedMessages,
+        request_ids: requestIds,
+        debug: {
+            run_state: {
+                state: String(S.chatRunState||''),
+                status_text: String(S.chatStatusText||''),
+                active_request_id: String(S.chatActiveRequestId||''),
+                last_activity_ts: Number(S.chatLastActivityTs||0),
+            },
+            stream_cursor_by_request: streamCursorByRequest,
+            terminal_state_by_request: terminalStateByRequest,
+            chat_reconcile_pending_by_request: Object.assign({}, (S.chatReconcilePendingByRequest&&typeof S.chatReconcilePendingByRequest==='object') ? S.chatReconcilePendingByRequest : {}),
+            sandbox_tasks: sandboxTasks,
+            sandbox_task_logs: sandboxTaskLogs,
+            subagent_tasks: subagentTasks,
+            subagent_thinking: subagentThinking,
+        },
+    };
+}
+
+async function copySelectedChatThreadExport(copyBtn){
+    const payload = buildChatExportPayload(String(S.selectedChatId||'active'));
+    const text = JSON.stringify(payload, null, 2);
+    const original = copyBtn ? String(copyBtn.textContent||'Copy') : 'Copy';
+    try{
+        await navigator.clipboard.writeText(text);
+        if(copyBtn){
+            copyBtn.textContent='Copied!';
+            copyBtn.disabled=true;
+            setTimeout(()=>{
+                copyBtn.textContent=original;
+                copyBtn.disabled=false;
+            }, 1400);
+        }
+    }catch{
+        if(copyBtn){
+            copyBtn.textContent='Failed';
+            setTimeout(()=>{ copyBtn.textContent=original; }, 1400);
+        }
+    }
 }
 
 function renderHomePage(main){
@@ -1746,7 +1934,10 @@ function renderHomePage(main){
                 +'<div class="flex items-center gap-2">'
                     +'<button data-action="chat-sidebar-toggle" title="'+sidebarToggleTitle+'" aria-label="'+sidebarToggleTitle+'" class="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-gray-800 hover:bg-gray-700 transition-colors">'+sidebarToggleIcon+'</button>'
                 +'</div>'
-                +'<button data-action="chat-new" class="px-3 py-1.5 rounded-lg text-xs bg-blue-700 hover:bg-blue-600 transition-colors">New</button>'
+                +'<div class="flex items-center gap-2">'
+                    +'<button data-action="chat-copy-thread-export" title="Copy selected conversation as JSON (messages + debug)" class="px-3 py-1.5 rounded-lg text-xs bg-gray-700 hover:bg-gray-600 transition-colors">Copy</button>'
+                    +'<button data-action="chat-new" class="px-3 py-1.5 rounded-lg text-xs bg-blue-700 hover:bg-blue-600 transition-colors">New</button>'
+                +'</div>'
             +'</div>'
             +'<div id="chatArea" class="flex-1 overflow-y-auto px-4 py-4 space-y-3 min-h-0"></div>'
         +'</div>'
@@ -1794,6 +1985,10 @@ function renderThreadList(selectedId){
         const mainTitle = esc(((t.summary||t.title||'Untitled').trim())||'Untitled');
         const activeCls = (t.id===selectedId) ? 'bg-blue-800 text-white' : 'bg-gray-800 text-gray-200 hover:bg-gray-700';
         const subCls = (t.id===selectedId) ? 'text-blue-200' : 'text-gray-500';
+        const isPending = String(S.chatThreadLoadPendingId||'').trim()===String(t.id||'').trim();
+        const pendingBadge = isPending
+            ? '<span class="inline-flex items-center gap-1 text-[10px] uppercase tracking-wide text-blue-200"><span class="inline-block w-2.5 h-2.5 border-2 border-blue-300 border-t-transparent rounded-full animate-spin"></span>loading</span>'
+            : '';
         const filename = esc(t.filename||t.id||'');
         const created = fmtThreadDate(t.created_ts);
         const updated = fmtThreadDate(t.updated_ts);
@@ -1802,7 +1997,7 @@ function renderThreadList(selectedId){
         if(filename) metaParts.push('<span>'+filename+'</span>');
         if(dateStr) metaParts.push('<span>'+dateStr+'</span>');
         const metaHtml = metaParts.length ? '<div class="text-xs '+subCls+' mt-0.5 truncate leading-tight">'+metaParts.join('<span class="mx-1">·</span>')+'</div>' : '';
-        items.push('<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="w-full text-left px-3 py-2 rounded-none transition-colors border-b border-gray-800 '+activeCls+'"><div class="flex items-center gap-2"><div class="flex-1 min-w-0"><div class="text-sm truncate">'+mainTitle+'</div>'+metaHtml+'</div><span data-action="chat-delete-open" data-thread-id="'+esc(t.id)+'" data-thread-title="'+mainTitle+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete chat history" aria-label="Delete chat history">✕</span></div></button>');
+        items.push('<button data-action="chat-select" data-thread-id="'+esc(t.id)+'" class="w-full text-left px-3 py-2 rounded-none transition-colors border-b border-gray-800 '+activeCls+'"><div class="flex items-center gap-2"><div class="flex-1 min-w-0"><div class="text-sm truncate">'+mainTitle+'</div>'+metaHtml+'</div>'+pendingBadge+'<span data-action="chat-delete-open" data-thread-id="'+esc(t.id)+'" data-thread-title="'+mainTitle+'" class="shrink-0 w-6 h-6 inline-flex items-center justify-center rounded text-sm bg-gray-700 hover:bg-red-700 transition-colors" title="Delete chat history" aria-label="Delete chat history">✕</span></div></button>');
     });
     if(!items.length){
         items.push('<div class="px-3 py-2 text-sm text-gray-500 border-b border-gray-800">No chats found</div>');
@@ -1823,7 +2018,17 @@ function renderChatMessages(selectedId){
         }
     });
     area.innerHTML='';
-    const msgs = getSelectedMessages(selectedId);
+    const selected = String(selectedId||'active').trim() || 'active';
+    const pendingTid = String(S.chatThreadLoadPendingId||'').trim();
+    const threadObj = selected!=='active' ? (S.chatThreads||[]).find(x=>String((x&&x.id)||'').trim()===selected) : null;
+    const waitingForThread = !!threadObj && pendingTid===selected && (!Array.isArray(threadObj.messages) || threadObj.messages.length===0);
+    if(waitingForThread){
+        area.innerHTML = '<div class="w-full h-full flex items-center justify-center text-sm text-gray-400"><span class="inline-flex items-center gap-2"><span class="inline-block w-3.5 h-3.5 border-2 border-gray-500 border-t-transparent rounded-full animate-spin"></span>Loading chat history...</span></div>';
+        updateScrollDownButton();
+        updateScrollUpButton();
+        return;
+    }
+    const msgs = getSelectedMessages(selected);
         const collated = collateChatMessages(msgs);
         collated.forEach(m=>area.appendChild(mkBubble(m)));
     area.querySelectorAll('details[data-detail-key]').forEach((el)=>{
@@ -2340,6 +2545,9 @@ function collateChatMessages(msgs){
             return;
         }
         if(role==='assistant'){
+            if(isNoReplyMarkerText(m&&m.text)){
+                return;
+            }
             const bucket=ensureActiveBucket(reqId);
             const segKind=String((m&&m.segment_kind)||'final').toLowerCase();
             if(segKind==='stream') bucket.streams.push(m);
@@ -2716,12 +2924,12 @@ function renderAssistantContent(target, raw){
 function makeResponseCopyButton(getText){
     const btn=document.createElement('button');
     btn.type='button';
-    btn.className='absolute px-2 py-0.5 rounded text-[10px] bg-gray-900/70 hover:bg-gray-800 text-gray-200 border border-gray-600 transition-colors';
+    btn.className='absolute inline-flex items-center justify-center w-6 h-6 rounded text-[11px] bg-gray-900/70 hover:bg-gray-800 text-gray-200 border border-gray-600 transition-colors';
     btn.style.top='6px';
     btn.style.right='6px';
     btn.style.left='auto';
     btn.style.zIndex='2';
-    btn.textContent='Copy';
+    btn.textContent='⧉';
     btn.title='Copy response';
     btn.addEventListener('click', async (e)=>{
         e.preventDefault();
@@ -2730,13 +2938,15 @@ function makeResponseCopyButton(getText){
         if(!text) return;
         try{
             await navigator.clipboard.writeText(text);
-            const prev=btn.textContent;
-            btn.textContent='Copied';
-            setTimeout(()=>{ btn.textContent=prev; }, 1200);
+            btn.textContent='✓';
+            btn.disabled=true;
+            setTimeout(()=>{
+                btn.textContent='⧉';
+                btn.disabled=false;
+            }, 1200);
         }catch(_){
-            const prev=btn.textContent;
-            btn.textContent='Failed';
-            setTimeout(()=>{ btn.textContent=prev; }, 1200);
+            btn.textContent='!';
+            setTimeout(()=>{ btn.textContent='⧉'; }, 1200);
         }
     });
     return btn;
@@ -3200,7 +3410,29 @@ function mkBubble(m){
                 } else {
                     details=String(payload.details||'').trim();
                 }
-                lifecycleItems.push({name:String(payload.text||payload.name||payload.phase||'lifecycle'), details});
+                const lifecycleName=(()=>{
+                    const parsedObj=(parsed&&typeof parsed==='object')?parsed:{};
+                    const phaseKey=String(payload.phase||parsedObj.phase||'').toLowerCase();
+                    if(phaseKey==='session') return 'Session metadata';
+                    if(phaseKey==='model_change'){
+                        const modelName=String(parsedObj.modelId||parsedObj.model||parsedObj.toModel||parsedObj.targetModel||'').trim();
+                        const providerName=String(parsedObj.provider||parsedObj.modelProvider||'').trim();
+                        if(modelName && providerName) return 'Model changed to '+providerName+'/'+modelName;
+                        if(modelName) return 'Model changed to '+modelName;
+                        return 'Model changed';
+                    }
+                    if(phaseKey==='thinking_level_change'){
+                        const thinkingLevel=String(parsedObj.thinkingLevel||parsedObj.level||parsedObj.value||'').trim();
+                        return thinkingLevel ? ('Thinking level set to '+thinkingLevel) : 'Thinking level changed';
+                    }
+                    if(phaseKey==='compaction') return 'Compaction marker';
+                    if(phaseKey==='custom'){
+                        const customType=String(parsedObj.customType||parsedObj.type||'').trim();
+                        return customType ? ('Custom event: '+customType) : 'Custom event';
+                    }
+                    return String(payload.text||payload.name||payload.phase||'lifecycle');
+                })();
+                lifecycleItems.push({name:lifecycleName, details});
                 const parsedPhase=(parsed&&typeof parsed==='object'&&parsed.phase!==undefined)?String(parsed.phase).toLowerCase():'';
                 const lifecycleErrText=(parsed&&typeof parsed==='object')
                     ? String(parsed.error!==undefined?parsed.error:(parsed.message!==undefined?parsed.message:details))
@@ -3237,7 +3469,10 @@ function mkBubble(m){
                 || lastLifecyclePhase === 'result'
                 || allToolsTerminal
             );
-            const waiting=(hasLifecycleStart && !hasLifecycleError && !hasToolError && !m.hasFinal && !hasCompletionSignal);
+            const terminalByReq=(S.chatTerminalStateByRequest && typeof S.chatTerminalStateByRequest==='object') ? S.chatTerminalStateByRequest : {};
+            const runTerminalState=String(((terminalByReq[reqKey]||{}).state)||'').trim().toLowerCase();
+            const hasRunTerminal=runTerminalState==='completed' || runTerminalState==='failed' || runTerminalState==='superseded' || runTerminalState==='cancelled';
+            const waiting=(hasLifecycleStart && !hasLifecycleError && !hasToolError && !m.hasFinal && !hasCompletionSignal && !hasRunTerminal);
             const waitingRow=waiting
                 ? '<div class="px-2 py-1 border-b border-gray-800/60 text-[11px] text-yellow-300 flex items-center gap-2">'
                     +'<span class="inline-block w-3 h-3 border-2 border-yellow-300/80 border-t-transparent rounded-full animate-spin"></span>'
@@ -3469,8 +3704,11 @@ function mkBubble(m){
         }
     }else if(role==='user'){
         b.classList.add('relative');
+        b.style.minWidth='84px';
+        b.style.paddingRight='3rem';
+        b.style.paddingInlineEnd='3rem';
         const textWrap=document.createElement('div');
-        textWrap.className='pr-8';
+        textWrap.className='max-w-full';
         textWrap.textContent=m.text||'';
         b.appendChild(textWrap);
         b.appendChild(makeUserMessageCopyButton(m.text||''));

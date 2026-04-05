@@ -2,100 +2,103 @@ from pathlib import Path
 
 
 def test_chat_select_routes_to_server_activation() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+    ws_source = Path("orchestrator/web/static/app-ws.js").read_text(encoding="utf-8")
+    realtime_source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
 
-    assert "sendAction({{type:'chat_select', thread_id: tid}});" in source
-    assert "def activate_chat_thread(self, thread_id: str) -> None:" in source
-    assert "if msg_type == \"chat_select\":" in source
-    assert "self.activate_chat_thread(str(payload.get(\"thread_id\", \"active\")))" in source
-
-
-def test_chat_reset_uses_server_chat_payload() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
-
-    assert "applyServerChatState(msg.chat, msg.chat_threads, msg.active_chat_id, true);" in source
-    assert "S.chat=[];" not in source
+    assert "sendAction({type:'chat_select', thread_id: tid});" in ws_source
+    assert "if msg_type == \"chat_select\":" in realtime_source
+    assert "self.select_chat_thread(thread_id, messages_override=loaded_messages)" in realtime_source
 
 
-def test_historic_thread_is_duplicated_not_removed() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+def test_chat_reset_uses_server_payload_and_selection_pending_guard() -> None:
+    ws_source = Path("orchestrator/web/static/app-ws.js").read_text(encoding="utf-8")
 
-    assert "self._active_chat_source_thread_id = target_id" in source
-    assert "self._chat_threads.pop(selected_index)" not in source
-
-
-def test_active_edits_are_mirrored_back_to_source_thread() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
-
-    assert "if self._active_chat_source_thread_id:" in source
-    assert "thread_messages.append(dict(msg))" in source
-    assert "\"type\": \"chat_threads_update\"" in source
+    assert "case 'chat_reset':" in ws_source
+    assert "applyServerChatState(" in ws_source
+    assert "Array.isArray(msg.chat) ? msg.chat : []" in ws_source
+    assert "if(pendingTid && activeTid && pendingTid===activeTid) S.chatThreadLoadPendingId='';" in ws_source
 
 
-def test_loaded_historic_session_stays_selected_while_editing() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+def test_historic_thread_load_applies_messages_override() -> None:
+    realtime_source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
 
-    assert "S.selectedChatId=String(msg.active_chat_id || S.selectedChatId || 'active');" in source
-    assert "const selected = S.selectedChatId || S.activeChatId || 'active';" in source
-    assert "if (S.selectedChatId !== 'active')" not in source
-
-
-def test_backend_marks_loaded_thread_as_active_chat() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
-
-    assert "self._active_chat_id = target_id" in source
+    assert "def select_chat_thread(self, thread_id: str, messages_override: list[dict[str, Any]] | None = None) -> bool:" in realtime_source
+    assert "if messages_override is not None:" in realtime_source
+    assert "selected[\"messages\"] = list(messages_override)" in realtime_source
 
 
-def test_new_session_promotes_to_history_on_first_user_message() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+def test_active_edits_update_active_thread_and_broadcast_threads() -> None:
+    realtime_source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
 
-    assert "def _promote_active_chat_to_thread_if_needed(self, now_ts: float | None = None) -> bool:" in source
-    assert '"title": self._derive_chat_title(self._chat_messages),' in source
-    assert "self._active_chat_id = str(promoted[\"id\"])" in source
-    assert "promoted = self._promote_active_chat_to_thread_if_needed(now_ts)" in source
-
-
-def test_frontend_selects_promoted_active_thread() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
-
-    assert "if(String(S.selectedChatId||'active')==='active' && String(S.activeChatId||'active')!=='active')" in source
-    assert "S.selectedChatId = String(S.activeChatId||'active');" in source
+    assert "def append_chat_message(self, message: dict[str, Any]) -> None:" in realtime_source
+    assert "def upsert_chat_message(self, message: dict[str, Any]) -> None:" in realtime_source
+    assert "self._upsert_active_chat_thread()" in realtime_source
+    assert '"chat_threads": list(self._chat_threads)' in realtime_source
 
 
-def test_chat_threads_are_sorted_recent_first() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+def test_loaded_historic_session_selection_is_preserved_on_server_updates() -> None:
+    core_source = Path("orchestrator/web/static/app-core.js").read_text(encoding="utf-8")
 
-    assert "def _sorted_chat_threads(self, threads: list[dict[str, Any]]) -> list[dict[str, Any]]:" in source
-    assert "reverse=True" in source
+    assert "const selectedBefore = String(S.selectedChatId||'active').trim() || 'active';" in core_source
+    assert "let nextSelected = selectedBefore;" in core_source
+    assert "if(nextSelected!=='active' && !selectedExists){" in core_source
 
 
-def test_chat_persistence_is_debounced_and_user_message_gated() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+def test_backend_marks_loaded_thread_as_active_chat_thread() -> None:
+    realtime_source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
 
-    assert "def _schedule_chat_state_persist(self) -> None:" in source
-    assert "if not self._chat_state_persistable():" in source
-    assert "self._chat_persist_timer = loop.call_later(" in source
+    assert "self._active_chat_id = \"active\"" in realtime_source
+    assert "self._active_chat_thread_id = tid" in realtime_source
+
+
+def test_new_session_archives_previous_active_chat() -> None:
+    realtime_source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+
+    assert "def start_new_chat(self) -> None:" in realtime_source
+    assert "self._archive_active_chat_if_needed()" in realtime_source
+    assert "self._active_chat_thread_id = None" in realtime_source
+
+
+def test_frontend_keeps_pending_thread_selected_during_load() -> None:
+    core_source = Path("orchestrator/web/static/app-core.js").read_text(encoding="utf-8")
+
+    assert "const pendingTid = String(S.chatThreadLoadPendingId||'').trim();" in core_source
+    assert "if(nextSelected==='active' && pendingExists){" in core_source
+    assert "nextSelected = pendingTid;" in core_source
+
+
+def test_chat_threads_are_sorted_recent_first_in_frontend_merge() -> None:
+    core_source = Path("orchestrator/web/static/app-core.js").read_text(encoding="utf-8")
+
+    assert "function mergeCachedRawGatewayThreads(serverThreads, cachedThreads){" in core_source
+    assert ".sort((a,b)=>Number(b.updated_ts||0)-Number(a.updated_ts||0));" in core_source
+
+
+def test_chat_state_is_server_authoritative_without_local_cache() -> None:
+    core_source = Path("orchestrator/web/static/app-core.js").read_text(encoding="utf-8")
+
+    assert "function persistChatCache(){" in core_source
+    assert "localStorage.removeItem(getChatCacheKey());" in core_source
+    assert "function hydrateChatCache(){" in core_source
+    assert "Intentionally no-op: chat state is loaded from websocket state snapshots." in core_source
 
 
 def test_session_list_does_not_render_current_chat_row() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+    events_source = Path("orchestrator/web/static/app-events.js").read_text(encoding="utf-8")
 
-    assert 'data-thread-id="active"' not in source
-    assert '>Current chat<' not in source
+    assert "if(String(t.id||'')==='active') return false;" in events_source
 
 
 def test_follow_latest_button_is_not_rendered() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+    events_source = Path("orchestrator/web/static/app-events.js").read_text(encoding="utf-8")
 
-    assert 'id="chatFollowToggle"' not in source
-    assert 'data-action="chat-follow-toggle"' not in source
-    assert "function updateChatFollowToggleState()" not in source
+    assert 'id="chatFollowToggle"' not in events_source
+    assert 'data-action="chat-follow-toggle"' not in events_source
+    assert "function updateChatFollowToggleState()" not in events_source
 
 
-def test_chat_delete_requires_confirmation_and_exact_title_match() -> None:
-    source = Path("orchestrator/web/realtime_service.py").read_text(encoding="utf-8")
+def test_chat_delete_uses_modal_confirmation_then_dispatches_action() -> None:
+    events_source = Path("orchestrator/web/static/app-events.js").read_text(encoding="utf-8")
 
-    assert "sendAction({type:'chat_delete', thread_id: tid, expected_title: title, confirmed: true});" in source
-    assert 'def delete_chat_thread(self, thread_id: str, expected_title: str = "", confirmed: bool = False) -> None:' in source
-    assert 'if not confirmed:' in source
-    assert 'and (not expected_title or str(thread.get("title", "")).strip() == expected_title)' in source
+    assert "const deleteThreadConfirmBtn = target.closest('[data-action=\"chat-delete-confirm\"]');" in events_source
+    assert "sendAction({type:'chat_delete', thread_id: tid});" in events_source

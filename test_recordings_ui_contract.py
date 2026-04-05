@@ -27,8 +27,13 @@ def test_recordings_audio_http_route_present() -> None:
 def test_recordings_ui_render_and_ws_handlers_present() -> None:
     events_source = Path("orchestrator/web/static/app-events.js").read_text(encoding="utf-8")
     ws_source = Path("orchestrator/web/static/app-ws.js").read_text(encoding="utf-8")
+    render_source = Path("orchestrator/web/static/app-render.js").read_text(encoding="utf-8")
 
     assert "renderRecordingsPage" in events_source
     assert "type:'recordings_list'" in events_source
+    assert "recordings-select-all" in events_source
+    assert "recordings-select-none" in events_source
+    assert "recordings-select-all" in render_source
+    assert "recordings-select-none" in render_source
     assert "case 'recordings_state':" in ws_source
     assert "case 'recording_detail':" in ws_source

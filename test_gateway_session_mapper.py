@@ -54,3 +54,43 @@ def test_history_mapper_ignores_hidden_tool_only_turn_without_result_text() -> N
     assert len(mapped) == 1
     assert mapped[0]["role"] == "step"
     assert mapped[0]["name"] == "read"
+
+
+def test_history_mapper_preserves_transcript_events_as_interim_rows() -> None:
+    mapped = map_gateway_messages_to_voice_format(
+        [
+            {"type": "session", "timestamp": 1, "id": "sess-1", "version": 1},
+            {"type": "model_change", "timestamp": 2, "modelId": "claude-sonnet-4-6"},
+            {
+                "role": "user",
+                "timestamp": 3,
+                "content": [{"type": "text", "text": "hello"}],
+            },
+        ]
+    )
+
+    assert [msg["role"] for msg in mapped] == ["interim", "interim", "user"]
+    assert mapped[0]["phase"] == "session"
+    assert mapped[1]["phase"] == "model_change"
+    assert '"modelId": "claude-sonnet-4-6"' in str(mapped[1]["details"])
+
+
+def test_history_mapper_populates_full_text_for_assistant_blocks() -> None:
+    mapped = map_gateway_messages_to_voice_format(
+        [
+            {
+                "role": "assistant",
+                "timestamp": 10,
+                "content": [
+                    {"type": "thinking", "thinking": "Plan steps"},
+                    {"type": "text", "text": "Short spoken summary."},
+                    {"type": "toolCall", "id": "call_1", "name": "read", "arguments": {"path": "README.md"}},
+                ],
+            }
+        ]
+    )
+
+    assistant = next(msg for msg in mapped if msg["role"] == "assistant")
+    assert assistant["text"] == "Short spoken summary."
+    assert "Reasoning:" in str(assistant.get("full_text", ""))
+    assert "Tool call (read):" in str(assistant.get("full_text", ""))

@@ -18,7 +18,8 @@ def test_realtime_service_routes_chat_clear_all_to_server_handler() -> None:
     assert "on_chat_delete: Callable[[str, str], Awaitable[None]] | None = None," in source
     assert "on_chat_clear_all: Callable[[list[str], str], Awaitable[None]] | None = None," in source
     assert "await self._on_chat_delete(thread_id, client_id)" in source
-    assert "await self._on_chat_clear_all(self.get_clearable_chat_thread_ids(), client_id)" in source
+    assert "all_thread_ids = [" in source
+    assert "await self._on_chat_clear_all(all_thread_ids, client_id)" in source
 
 
 def test_main_clear_all_deletes_upstream_sessions_and_refreshes_sidebar() -> None:
@@ -28,7 +29,9 @@ def test_main_clear_all_deletes_upstream_sessions_and_refreshes_sidebar() -> Non
     assert "async def _ui_chat_clear_all(thread_ids: list[str], client_id: str) -> None:" in source
     assert 'await _start_new_session(source="web ui chat_delete", client_id=client_id)' in source
     assert "await gateway.delete_session(" in source
-    assert 'await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete:{client_id}")' in source
+    assert 'synced_threads = await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete:{client_id}")' in source
+    assert 'await _refresh_web_ui_chat_threads_from_gateway(f"chat_delete_post:{client_id}")' in source
+    assert 'await _start_new_session(source="web ui chat_clear_all", client_id=client_id)' in source
     assert 'await _refresh_web_ui_chat_threads_from_gateway(f"chat_clear_all:{client_id}")' in source
     assert "on_chat_delete=_ui_chat_delete," in source
     assert "on_chat_clear_all=_ui_chat_clear_all," in source

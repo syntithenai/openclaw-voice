@@ -2899,7 +2899,12 @@ class EmbeddedVoiceWebService:
         if msg_type == "chat_clear_all":
             if self._on_chat_clear_all is not None:
                 try:
-                    await self._on_chat_clear_all(self.get_clearable_chat_thread_ids(), client_id)
+                    all_thread_ids = [
+                        str(t.get("id", "")).strip()
+                        for t in (self._chat_threads or [])
+                        if str(t.get("id", "")).strip()
+                    ]
+                    await self._on_chat_clear_all(all_thread_ids, client_id)
                 except Exception as exc:
                     logger.warning("chat_clear_all handler error: %s", exc)
             else:

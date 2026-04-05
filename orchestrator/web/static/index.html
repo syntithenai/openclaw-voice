@@ -125,13 +125,16 @@
     <div id="chatQueueList" class="flex flex-col gap-1"></div>
   </div>
   <form id="chatComposer" class="flex items-end gap-2">
-    <div class="flex items-center gap-1">
-      <button id="chatModeQueueBtn" data-action="chat-mode-queue" type="button" class="px-2 py-1 rounded text-xs bg-gray-700 hover:bg-gray-600" title="Queue mode">Queue</button>
-      <button id="chatModeSteerBtn" data-action="chat-mode-steer" type="button" class="px-2 py-1 rounded text-xs bg-gray-800 hover:bg-gray-700" title="Steer mode">Steer</button>
-    </div>
     <textarea id="chatInput" rows="1" placeholder="Type a message" class="flex-1 min-w-0 rounded-lg bg-gray-800 border border-gray-700 px-3 py-2 text-sm text-gray-100 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-600 resize-none overflow-hidden" style="min-height:40px;max-height:160px"></textarea>
     <button id="chatStopBtn" data-action="chat-stop" type="button" class="hidden px-3 py-2 rounded-lg text-sm bg-red-700 hover:bg-red-600 transition-colors">Stop</button>
-    <button id="chatSendBtn" type="submit" class="px-3 py-2 rounded-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Send</button>
+    <div id="chatSendGroup" class="relative flex">
+      <button id="chatSendBtn" type="submit" class="px-3 py-2 rounded-l-lg text-sm bg-blue-700 hover:bg-blue-600 transition-colors">Send</button>
+      <button id="chatSendDropdownBtn" type="button" data-action="chat-send-dropdown-toggle" class="px-1.5 py-2 rounded-r-lg text-sm bg-blue-700 hover:bg-blue-600 border-l border-blue-600 transition-colors" title="Send options">▾</button>
+      <div id="chatSendDropdown" class="hidden absolute right-0 w-28 rounded-lg bg-gray-800 border border-gray-700 shadow-lg z-50 overflow-hidden" style="bottom:calc(100% + 0.25rem)">
+        <button id="chatModeQueueBtn" data-action="chat-mode-queue" type="button" class="w-full text-left px-3 py-2 text-xs bg-gray-800 hover:bg-gray-700" title="Queue mode">Queue</button>
+        <button id="chatModeSteerBtn" data-action="chat-mode-steer" type="button" class="w-full text-left px-3 py-2 text-xs bg-gray-800 hover:bg-gray-700 border-t border-gray-700" title="Steer mode">Steer</button>
+      </div>
+    </div>
   </form>
 </div>
 
